@@ -1,11 +1,16 @@
 """Spatial settings for the Wuhan University prototype."""
 
-from dataclasses import dataclass
+import os
+from dataclasses import dataclass, field
 from pathlib import Path
 
-from backend.schemas import MissionType
+from dotenv import dotenv_values
 
-DATA_DIR = Path(__file__).resolve().parents[1] / "data"
+from backend.schemas import LLMMode, MissionType
+
+PROJECT_DIR = Path(__file__).resolve().parents[1]
+DATA_DIR = PROJECT_DIR / "data"
+FRONTEND_DIR = PROJECT_DIR / "frontend"
 STUDY_BOUNDS = (114.349, 30.524, 114.362, 30.533)
 ORIGIN_LON_LAT = (114.3555, 30.5285)
 
@@ -37,3 +42,23 @@ MISSION_LAYERS: dict[MissionType, AirspaceLayer] = {
     "delivery": DELIVERY_LAYER,
     "inspection": INSPECTION_LAYER,
 }
+
+
+@dataclass(frozen=True)
+class LLMSettings:
+    api_key: str = field(default="", repr=False)
+    base_url: str = "https://api.openai.com/v1"
+    model: str = ""
+
+    @classmethod
+    def from_environment(cls) -> "LLMSettings":
+        file_values = dotenv_values(PROJECT_DIR / ".env")
+        return cls(
+            api_key=(os.getenv("LLM_API_KEY", file_values.get("LLM_API_KEY")) or "").strip(),
+            base_url=(os.getenv("LLM_BASE_URL", file_values.get("LLM_BASE_URL")) or "").strip() or cls.base_url,
+            model=(os.getenv("LLM_MODEL", file_values.get("LLM_MODEL")) or "").strip(),
+        )
+
+    @property
+    def mode(self) -> LLMMode:
+        return "live_llm" if self.api_key and self.model else "fallback_mock"

@@ -6,15 +6,25 @@ from math import dist, hypot
 from statistics import mean
 from time import perf_counter
 
+import httpx
 import numpy as np
 import pytest
+from fastapi.testclient import TestClient
+from openai import OpenAI
 from shapely.geometry import LineString, Point, box, shape
 from shapely.ops import substring
 
-from backend.config import DATA_DIR, MISSION_LAYERS, ORIGIN_LON_LAT, STUDY_BOUNDS
+from backend.config import DATA_DIR, LLMSettings, MISSION_LAYERS, ORIGIN_LON_LAT, STUDY_BOUNDS
 from backend.core.airspace import Airspace, LocalENU, Obstacle, ObstacleField
 from backend.core.planner import NoRouteError, RoutePlanner
-from backend.schemas import BuildingProperties, DynamicHazard, NoFlyProperties, Position, VertiportProperties
+from backend.main import create_app
+from backend.schemas import (
+    BuildingProperties, DispatchResult, DynamicHazard, NoFlyProperties, Position, ReplanResult,
+    RoutePlan, VertiportProperties,
+)
+
+DELIVERY_QUERY = "中午高峰配送：将餐食从信息学部食堂送至测国重楼顶，避开图书馆静谧区"
+INSPECTION_QUERY = "夜间高空安防巡检：从信息学部起飞，沿 60–90m 巡检层前往图书馆西侧巡检点"
 
 
 @pytest.fixture(scope="module")
@@ -235,3 +245,192 @@ def test_plan_latency_for_all_campus_pairs_and_dynamic_detour(airspace, planner)
         field = airspace.with_hazards(hazards)[0] if hazards else airspace.field
         _verify_route(result, airspace, mission, end, start, field)
     print(f"\nRoute planning ({len(timings)} runs): mean {mean(timings):.2f} ms, max {max(timings):.2f} ms")
+
+
+@pytest.fixture(scope="module")
+def client():
+    with TestClient(create_app(LLMSettings())) as api:
+        yield api
+
+
+def _verify_api_route(result, airspace, start, target, field=None):
+    points = [airspace.frame.to_local(point) for point in result.waypoints]
+    length = sum(dist(a, b) for a, b in pairwise(points))
+    _verify_route(
+        RoutePlan(waypoints=result.waypoints, distance_m=length), airspace,
+        result.corridor, target, start, field,
+    )
+    assert result.kpis.distance_m == pytest.approx(length, abs=0.0051)
+    assert result.kpis.estimated_seconds > 0
+    assert result.kpis.min_clearance_m is not None
+    assert result.kpis.compliant and result.kpis.compliance_percent == 100
+    assert [event.step for event in result.thought_steps] == list(range(1, len(result.thought_steps) + 1))
+    assert {event.role for event in result.thought_steps} == {"thought", "action", "observation"}
+
+
+def test_service_metadata_geojson_and_preview_assets(client):
+    assert client.get("/api/health").json() == {
+        "service": "VoxAero", "status": "ok", "llm_mode": "fallback_mock"
+    }
+    assert client.get("/openapi.json").json()["info"] == {"title": "VoxAero API", "version": "1.0.0"}
+    response = client.get("/api/layers/all")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["bounds"] == list(STUDY_BOUNDS)
+    for key, count in [("buildings", 30), ("vertiports", 6), ("nofly_zones", 3)]:
+        assert data[key]["type"] == "FeatureCollection"
+        assert len(data[key]["features"]) == count
+    assert [(layer["min_alt"], layer["max_alt"]) for layer in data["airspace_layers"]] == [
+        (0, 30), (30, 60), (60, 90)
+    ]
+    page = client.get("/")
+    assert page.status_code == 200 and "text/html" in page.headers["content-type"]
+    assert "VoxAero — 低空三维数字孪生与智能体调度平台" in page.text
+    for path in ("/js/app.js", "/js/map3d.js", "/css/style.css"):
+        assert client.get(path).status_code == 200
+
+
+@pytest.mark.parametrize(("query", "target", "mission", "corridor", "zones", "priority"), [
+    (DELIVERY_QUERY, "VP03", "delivery", "delivery", ("NFZ01",), "normal"),
+    (INSPECTION_QUERY, "VP04", "inspection", "inspection", (), "normal"),
+    ("从 VP01 加急配送到图书馆西侧巡检点，优先高空", "VP04", "delivery", "inspection", (), "urgent"),
+    ("配送至 VP03，由 VP01 起飞", "VP03", "delivery", "delivery", (), "normal"),
+])
+def test_dispatch_fallback_contract(airspace, client, query, target, mission, corridor, zones, priority):
+    response = client.post("/api/agent/dispatch", json={"query": query})
+    assert response.status_code == 200, response.text
+    result = DispatchResult.model_validate(response.json())
+    assert result.mode == "fallback_mock" and result.corridor == corridor
+    assert result.intent.start_id == "VP01" and result.intent.end_id == target
+    assert result.intent.mission_type == mission
+    assert result.intent.avoid_zone_ids == zones and result.intent.priority == priority
+    assert result.kpis.time_saving_percent > 0
+    _verify_api_route(result, airspace, "VP01", target, airspace.with_hazards((), zones)[0])
+
+
+def test_explicit_avoidance_applies_over_a_low_altitude_restriction(airspace):
+    original = next(zone for zone in airspace.field.obstacles if zone.id == "NFZ03")
+    point = (*original.footprint.centroid.coords[0], 80)
+    assert airspace.field.segment_clear(point, point)
+    field, mask = airspace.with_hazards((), ("NFZ03",))
+    assert not field.segment_clear(point, point)
+    assert np.count_nonzero(mask) > np.count_nonzero(airspace.static_voxels)
+
+
+def test_dispatch_input_errors(client):
+    assert client.post("/api/agent/dispatch", json={"query": "   "}).status_code == 422
+    result = client.post("/api/agent/dispatch", json={"query": "帮忙配送"})
+    assert result.status_code == 422
+    assert result.json()["thought_steps"][-1]["role"] == "observation"
+    assert "起降坪" in result.json()["detail"]
+    unknown_zone = client.post("/api/agent/dispatch", json={"query": "从 VP01 配送至 VP03，避开 NFZ010 禁飞区"})
+    assert unknown_zone.status_code == 422
+    assert "禁飞区" in unknown_zone.json()["detail"]
+
+
+@pytest.mark.parametrize("emergency", ["wind_gust", "temp_nofly"])
+def test_airborne_replan_contract_and_temporary_geometry(airspace, planner, client, emergency):
+    original = planner.plan_3d_route("VP04", "VP05", "inspection")
+    current, hazard = _crossing_hazard(airspace, original)
+    response = client.post("/api/agent/replan", json={
+        "current_pos": current.model_dump(), "target_id": "VP05", "emergency_type": emergency,
+        "dynamic_hazard": hazard.model_dump(),
+    })
+    assert response.status_code == 200, response.text
+    result = ReplanResult.model_validate(response.json())
+    assert result.emergency_type == emergency and result.target_id == result.original_target_id == "VP05"
+    feature = result.temporary_nofly_zone
+    assert feature.properties.min_alt == hazard.min_alt and feature.properties.max_alt == hazard.max_alt
+    assert feature.geometry.coordinates[0][0] == feature.geometry.coordinates[0][-1]
+    polygon = shape(feature.geometry.model_dump())
+    assert polygon.is_valid and polygon.covers(Point(hazard.center_lon, hazard.center_lat))
+    _verify_api_route(result, airspace, current, "VP05", airspace.with_hazards((hazard,))[0])
+
+
+def test_replan_rejects_invalid_or_unflyable_emergency(airspace, client):
+    start = airspace.vertiports["VP04"].position.model_copy(update={"alt": 75})
+    params = {"current_pos": start.model_dump(), "target_id": "VP05", "emergency_type": "temp_nofly"}
+    assert client.post("/api/agent/replan", json=params).status_code == 422
+    params["dynamic_hazard"] = {
+        "center_lon": start.lon, "center_lat": start.lat, "radius_m": 35, "min_alt": 0, "max_alt": 100
+    }
+    response = client.post("/api/agent/replan", json=params)
+    assert response.status_code == 409
+    assert response.json()["thought_steps"][-1]["role"] == "observation"
+
+
+def test_low_battery_uses_shortest_reachable_emergency_route(airspace, planner, client):
+    origin = airspace.vertiports["VP04"].position.model_copy(update={"alt": 65})
+    response = client.post("/api/agent/replan", json={
+        "current_pos": origin.model_dump(), "target_id": "VP03", "emergency_type": "low_battery",
+    })
+    assert response.status_code == 200, response.text
+    result = ReplanResult.model_validate(response.json())
+    assert result.original_target_id == "VP03" and result.temporary_nofly_zone is None
+    candidates = [
+        (planner.plan_3d_route(origin, pad_id, layer).distance_m, pad_id, layer)
+        for pad_id in ("VP05", "VP06") for layer in MISSION_LAYERS
+    ]
+    distance, pad, layer = min(candidates)
+    assert (result.target_id, result.corridor) == (pad, layer)
+    assert result.kpis.distance_m == pytest.approx(distance, abs=0.0051)
+    _verify_api_route(result, airspace, origin, pad)
+
+
+def test_low_battery_can_use_regular_pad_when_emergency_pads_are_closed(airspace, client):
+    origin = airspace.vertiports["VP04"].position.model_copy(update={"alt": 65})
+    hazards = [
+        DynamicHazard(
+            center_lon=pad.position.lon, center_lat=pad.position.lat, radius_m=24, min_alt=0, max_alt=100
+        )
+        for pad in airspace.vertiports.values() if pad.properties.type == "emergency"
+    ]
+    response = client.post("/api/agent/replan", json={
+        "current_pos": origin.model_dump(), "target_id": "VP03", "emergency_type": "low_battery",
+        "active_hazards": [hazard.model_dump() for hazard in hazards],
+    })
+    assert response.status_code == 200, response.text
+    result = ReplanResult.model_validate(response.json())
+    assert airspace.vertiports[result.target_id].properties.type != "emergency"
+    _verify_api_route(result, airspace, origin, result.target_id, airspace.with_hazards(tuple(hazards))[0])
+
+
+@pytest.mark.parametrize("scenario", ["function_call", "timeout", "invalid_tool", "invalid_payload"])
+def test_openai_compatible_intent_and_fallback(scenario):
+    def respond(request):
+        assert request.url.path == "/v1/chat/completions"
+        body = json.loads(request.content)
+        assert body["model"] == "test-model"
+        assert body["tools"][0]["function"]["name"] == "parse_dispatch_intent"
+        assert body["tool_choice"]["function"]["name"] == "parse_dispatch_intent"
+        if scenario == "timeout":
+            raise httpx.ReadTimeout("mock provider timeout", request=request)
+        if scenario == "invalid_payload":
+            return httpx.Response(200, text="<html>Provider gateway</html>")
+        arguments = {
+            "start_id": "VP01", "end_id": "VP03" if scenario == "function_call" else "unknown",
+            "mission_type": "delivery",
+        }
+        return httpx.Response(200, json={
+            "id": "chatcmpl-test", "object": "chat.completion", "created": 0, "model": "test-model",
+            "choices": [{"index": 0, "finish_reason": "tool_calls", "message": {
+                "role": "assistant", "content": None, "tool_calls": [{
+                    "id": "call_test", "type": "function",
+                    "function": {"name": "parse_dispatch_intent", "arguments": json.dumps(arguments)},
+                }],
+            }}],
+        })
+
+    settings = LLMSettings(api_key="test-key", base_url="https://test.invalid/v1", model="test-model")
+    transport = httpx.MockTransport(respond)
+    with OpenAI(api_key=settings.api_key, base_url=settings.base_url, max_retries=0,
+                http_client=httpx.Client(transport=transport)) as sdk:
+        with TestClient(create_app(settings, llm_client=sdk)) as api:
+            assert api.get("/api/health").json()["llm_mode"] == "live_llm"
+            response = api.post("/api/agent/dispatch", json={"query": DELIVERY_QUERY})
+    assert response.status_code == 200, response.text
+    result = DispatchResult.model_validate(response.json())
+    assert result.mode == ("live_llm" if scenario == "function_call" else "fallback_mock")
+    assert result.intent.avoid_zone_ids == ("NFZ01",) and result.intent.end_id == "VP03"
+    if scenario != "function_call":
+        assert any("切换至本地规则" in event.content for event in result.thought_steps)

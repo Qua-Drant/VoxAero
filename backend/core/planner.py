@@ -40,6 +40,8 @@ class RoutePlanner:
         end_id: str,
         mission_type: MissionType,
         extra_nofly_zones: tuple[DynamicHazard, ...] = (),
+        *,
+        avoid_zone_ids: tuple[str, ...] = (),
     ) -> RoutePlan:
         """Plan from a vertiport ID or an airborne WGS84 position to a vertiport."""
         if mission_type not in MISSION_LAYERS:
@@ -71,7 +73,7 @@ class RoutePlanner:
             if not (west <= x <= east and south <= y <= north and 0 <= z <= CEILING_M):
                 raise NoRouteError("Route endpoints must be inside the planning volume")
 
-        field, blocked = self.airspace.with_hazards(extra_nofly_zones)
+        field, blocked = self.airspace.with_hazards(extra_nofly_zones, avoid_zone_ids)
         levels = tuple(
             k
             for k in range(self.grid.shape[2])

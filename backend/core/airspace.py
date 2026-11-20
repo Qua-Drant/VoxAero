@@ -2,7 +2,7 @@
 
 import json
 from dataclasses import dataclass
-from math import atan2, ceil, cos, degrees, floor, hypot, pi, radians, sin, sqrt
+from math import atan2, ceil, cos, degrees, dist, floor, hypot, pi, radians, sin, sqrt
 from pathlib import Path
 from typing import Iterator
 
@@ -141,6 +141,39 @@ class ObstacleField:
                 return False
         return True
 
+    def segment_clearance(
+        self, start: LocalPoint, end: LocalPoint, *, roof_access: Obstacle | None = None
+    ) -> float:
+        """Return a lower bound on distance to the buffered obstacle volumes, in meters."""
+        vertical = start[:2] == end[:2]
+        trace = Point(start[:2]) if vertical else LineString([start[:2], end[:2]])
+        low, high = sorted((start[2], end[2]))
+        spacing = 0.0
+        if not vertical and low != high:
+            length = dist(start, end)
+            divisions = ceil(length / 2)
+            spacing = length / divisions
+            positions = np.linspace(start, end, divisions + 1)
+            samples = shapely.points(positions[:, :2])
+            heights = positions[:, 2]
+
+        best = float("inf")
+        for obstacle in self.obstacles:
+            if vertical and obstacle is roof_access:
+                continue
+            horizontal = trace.distance(obstacle.footprint)
+            vertical_gap = max(obstacle.min_alt - high, low - obstacle.max_alt, 0)
+            lower_bound = hypot(horizontal, vertical_gap)
+            if lower_bound >= best:
+                continue
+            if spacing:
+                xy = shapely.distance(samples, obstacle.footprint)
+                z = np.maximum(np.maximum(obstacle.min_alt - heights, heights - obstacle.max_alt), 0)
+                # Distance to a volume is 1-Lipschitz along the segment.
+                lower_bound = max(lower_bound, float(np.hypot(xy, z).min()) - spacing / 2)
+            best = min(best, lower_bound)
+        return best
+
 
 @dataclass(frozen=True)
 class Vertiport:
@@ -149,34 +182,35 @@ class Vertiport:
     roof_obstacle: Obstacle | None
 
 
-def _features(path: Path, geometry_type: str) -> Iterator[tuple[dict, Point | Polygon]]:
-    document = json.loads(path.read_text(encoding="utf-8"))
+def _features(
+    document: dict, layer: str, geometry_type: str
+) -> Iterator[tuple[dict, Point | Polygon]]:
     if (
         not isinstance(document, dict)
         or document.get("type") != "FeatureCollection"
         or not isinstance(document.get("features"), list)
     ):
-        raise ValueError(f"{path.name} must be a GeoJSON FeatureCollection")
+        raise ValueError(f"{layer} must be a GeoJSON FeatureCollection")
     seen = set()
     for feature in document["features"]:
         if not isinstance(feature, dict) or feature.get("type") != "Feature":
-            raise ValueError(f"{path.name} contains an invalid GeoJSON Feature")
+            raise ValueError(f"{layer} contains an invalid GeoJSON Feature")
         raw_geometry = feature.get("geometry")
         if not isinstance(raw_geometry, dict) or raw_geometry.get("type") != geometry_type:
-            raise ValueError(f"{path.name} features must have {geometry_type} geometry")
+            raise ValueError(f"{layer} features must have {geometry_type} geometry")
         properties = feature.get("properties")
         if not isinstance(properties, dict):
-            raise ValueError(f"{path.name} features must have a properties object")
+            raise ValueError(f"{layer} features must have a properties object")
         feature_id = properties.get("id")
         if not isinstance(feature_id, str) or not feature_id or feature_id in seen:
-            raise ValueError(f"{path.name} feature IDs must be nonempty and unique")
+            raise ValueError(f"{layer} feature IDs must be nonempty and unique")
         seen.add(feature_id)
         geometry = shape(raw_geometry)
         if geometry.is_empty or not geometry.is_valid or shapely.get_coordinate_dimension(geometry) != 2:
-            raise ValueError(f"{path.name} contains an invalid 2D geometry for {feature_id}")
+            raise ValueError(f"{layer} contains an invalid 2D geometry for {feature_id}")
         min_lon, min_lat, max_lon, max_lat = geometry.bounds
         if not (-180 <= min_lon <= max_lon <= 180 and -90 <= min_lat <= max_lat <= 90):
-            raise ValueError(f"{path.name} has coordinates outside WGS84 bounds for {feature_id}")
+            raise ValueError(f"{layer} has coordinates outside WGS84 bounds for {feature_id}")
         yield properties, geometry
 
 
@@ -239,11 +273,13 @@ class Airspace:
         bounds: Bounds,
         field: ObstacleField,
         vertiports: dict[str, Vertiport],
+        geojson: dict[str, dict] | None = None,
     ) -> None:
         self.frame = frame
         self.grid = VoxelGrid(bounds)
         self.field = field
         self.vertiports = vertiports
+        self.geojson = {} if geojson is None else geojson
         self.static_voxels = self.grid.rasterize(field.obstacles)
         self.static_voxels.flags.writeable = False
 
@@ -252,8 +288,16 @@ class Airspace:
         frame = LocalENU(*ORIGIN_LON_LAT)
         west, south, east, north = STUDY_BOUNDS
         bounds = shapely.transform(shapely.box(west, south, east, north), frame.project_xy).bounds
+        layers = {
+            key: json.loads((directory / filename).read_text(encoding="utf-8"))
+            for key, filename in (
+                ("buildings", "whu_buildings.geojson"),
+                ("vertiports", "vertiports.geojson"),
+                ("nofly_zones", "nofly_zones.geojson"),
+            )
+        }
         buildings = []
-        for data, geometry in _features(directory / "whu_buildings.geojson", "Polygon"):
+        for data, geometry in _features(layers["buildings"], "whu_buildings.geojson", "Polygon"):
             properties = BuildingProperties.model_validate(data)
             footprint = shapely.transform(geometry, frame.project_xy)
             obstacle = Obstacle(
@@ -262,13 +306,13 @@ class Airspace:
             buildings.append((properties.height, footprint, obstacle))
 
         obstacles = [obstacle for _, _, obstacle in buildings]
-        for data, geometry in _features(directory / "nofly_zones.geojson", "Polygon"):
+        for data, geometry in _features(layers["nofly_zones"], "nofly_zones.geojson", "Polygon"):
             zone = NoFlyProperties.model_validate(data)
             footprint = shapely.transform(geometry, frame.project_xy)
             obstacles.append(Obstacle(zone.id, footprint, zone.min_alt, zone.max_alt))
 
         vertiports = {}
-        for data, geometry in _features(directory / "vertiports.geojson", "Point"):
+        for data, geometry in _features(layers["vertiports"], "vertiports.geojson", "Point"):
             properties = VertiportProperties.model_validate(data)
             position = Position(lon=geometry.x, lat=geometry.y, alt=properties.altitude)
             east, north, _ = frame.to_local(position)
@@ -281,17 +325,26 @@ class Airspace:
             roof = max(roofs, key=lambda match: match[0])[1] if roofs else None
             vertiports[properties.id] = Vertiport(properties, position, roof)
 
-        return cls(frame, bounds, ObstacleField(tuple(obstacles)), vertiports)
+        return cls(frame, bounds, ObstacleField(tuple(obstacles)), vertiports, layers)
 
     def with_hazards(
-        self, hazards: tuple[DynamicHazard, ...]
+        self, hazards: tuple[DynamicHazard, ...], avoid_zone_ids: tuple[str, ...] = ()
     ) -> tuple[ObstacleField, np.ndarray]:
-        if not hazards:
+        if not hazards and not avoid_zone_ids:
             return self.field, self.static_voxels
         dynamic = tuple(
             Obstacle.from_hazard(hazard, self.frame, index)
             for index, hazard in enumerate(hazards, start=1)
         )
-        field = ObstacleField(self.field.obstacles + dynamic)
-        blocked = self.static_voxels | self.grid.rasterize(dynamic)
+        static_by_id = {obstacle.id: obstacle for obstacle in self.field.obstacles}
+        full_height = tuple(
+            Obstacle(zone_id, static_by_id[zone_id].footprint, 0, CEILING_M)
+            for zone_id in dict.fromkeys(avoid_zone_ids)
+            if static_by_id[zone_id].min_alt > 0 or static_by_id[zone_id].max_alt < CEILING_M
+        )
+        extra = dynamic + full_height
+        if not extra:
+            return self.field, self.static_voxels
+        field = ObstacleField(self.field.obstacles + extra)
+        blocked = self.static_voxels | self.grid.rasterize(extra)
         return field, blocked
