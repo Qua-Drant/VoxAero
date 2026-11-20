@@ -13,60 +13,100 @@
 </head>
 <body>
   <header class="brand-bar">
-    <span class="brand-symbol" aria-hidden="true"></span>
     <div class="brand">
-      <strong>VoxAero</strong>
-      <span>维空智航 · 低空三维导航与智能体调度平台</span>
+      <span class="brand-symbol" aria-hidden="true"></span>
+      <div><strong>VoxAero</strong><p>维空智航 · 低空三维导航与智能体调度平台</p></div>
     </div>
-    <p class="brand-note">Spatial Agent &amp; 3D Airspace Twin</p>
+    <div class="view-switch segmented" role="group" aria-label="飞行视角">
+      <button type="button" data-view="overview" aria-pressed="true" disabled>全局总览</button>
+      <button type="button" data-view="follow" aria-pressed="false" disabled>第三人称跟随</button>
+      <button type="button" data-view="fpv" aria-pressed="false" disabled>FPV AR-HUD</button>
+    </div>
+    <div class="header-end">
+      <p class="brand-note">Spatial Agent &amp; 3D Airspace Twin</p>
+      <details id="emergency-menu" class="emergency">
+        <summary>突发应急</summary>
+        <div class="emergency-actions glass">
+          <p id="emergency-hint">进入巡航后可注入应急事件。</p>
+          <button id="wind" type="button" disabled>模拟突发阵风 / 临时禁飞区</button>
+          <button id="battery" type="button" disabled>低电量强制备降</button>
+        </div>
+      </details>
+    </div>
   </header>
   <main class="workspace">
     <section class="scene" aria-label="武汉大学信息学部三维空域地图">
       <div id="map"></div>
-      <div class="scene-heading">
+      <canvas id="hud" aria-hidden="true" hidden></canvas>
+      <div id="map-tooltip" class="map-tooltip glass" role="tooltip" hidden></div>
+    </section>
+    <aside class="left-rail" aria-label="空域图层与飞行状态">
+      <section class="glass panel layers">
+        <h2>空域图层</h2>
+        <label><i class="building-key"></i><span>建筑白模</span><input type="checkbox" data-layer="buildings" checked disabled></label>
+        <label><i class="pad-key"></i><span>起降坪</span><input type="checkbox" data-layer="vertiports" checked disabled></label>
+        <label><i class="zone-key"></i><span>静态禁飞区</span><input type="checkbox" data-layer="nofly_zones" checked disabled></label>
+        <label><i class="grid-key"></i><span>30 / 60 m 空域网格</span><input type="checkbox" data-layer="airspace" checked disabled></label>
+        <label title="青色起飞 · 绿色巡航 · 紫色降落 · 琥珀色应急航段"><i class="route-key"></i><span>规划航线</span><input type="checkbox" data-layer="route" checked disabled></label>
+        <label><i class="hazard-key"></i><span>临时禁飞区</span><input type="checkbox" data-layer="hazards" checked disabled></label>
+      </section>
+      <section class="glass panel flight-board" aria-label="实时飞行看板">
+        <div class="panel-heading"><h2>飞行看板</h2><span id="flight-state" class="pill">待命</span></div>
+        <div class="aircraft"><span class="aircraft-mark" aria-hidden="true">✣</span><strong>VOXAERO-01</strong></div>
+        <p id="mission-target" class="mission-target">等待调度</p>
+        <dl class="telemetry">
+          <div><dt>高度</dt><dd id="altitude">—</dd></div>
+          <div><dt>速度</dt><dd id="speed">—</dd></div>
+          <div><dt>电量</dt><dd id="charge">—</dd></div>
+          <div><dt title="距最近建筑或禁飞体积的模拟三维距离">当前净空</dt><dd id="clearance">—</dd></div>
+        </dl>
+        <dl class="metrics">
+          <div><dt id="distance-label">规划航程</dt><dd id="distance">—</dd></div>
+          <div><dt id="duration-label">预计飞行</dt><dd id="duration">—</dd></div>
+          <div><dt title="按模拟航速和步行速度估算">较地面节省</dt><dd id="saving">—</dd></div>
+          <div><dt>模拟空域合规</dt><dd id="compliance">—</dd></div>
+        </dl>
+      </section>
+    </aside>
+    <div class="map-overlay">
+      <div class="map-heading glass">
         <h1>武汉大学 · 信息学部</h1>
         <p id="scene-status" role="status">正在加载校园空域…</p>
-      </div>
-      <div class="map-toolbar" role="group" aria-label="地图图层控制">
-        <label><input type="checkbox" data-layer="buildings" checked disabled><span>建筑</span></label>
-        <label><input type="checkbox" data-layer="vertiports" checked disabled><span>起降坪</span></label>
-        <label><input type="checkbox" data-layer="nofly_zones" checked disabled><span>禁飞区</span></label>
-        <label><input type="checkbox" data-layer="airspace" checked disabled><span>30 / 60 m 空域网格</span></label>
         <button id="reset-view" type="button" disabled>重置视角</button>
       </div>
-    </section>
-    <aside class="dispatch" aria-labelledby="dispatch-heading">
-      <div class="panel-heading">
-        <h2 id="dispatch-heading">任务调度</h2>
-        <span id="mode" class="status-pill">连接中</span>
+      <div class="flight-dock glass" aria-label="仿真飞行控制">
+        <div class="flight-progress">
+          <span>当前航段</span>
+          <progress id="flight-progress" value="0" max="1" aria-label="航段进度"></progress>
+          <span id="flight-time">00:00 / 00:00</span>
+        </div>
+        <div class="flight-actions">
+          <button id="play-flight" type="button" class="primary" disabled>开始飞行</button>
+          <button id="reset-flight" type="button" disabled>重置飞行</button>
+          <div class="segmented speed-switch" role="group" aria-label="仿真倍速">
+            <button type="button" data-rate="1" aria-pressed="true" disabled>1×</button>
+            <button type="button" data-rate="2" aria-pressed="false" disabled>2×</button>
+            <button type="button" data-rate="4" aria-pressed="false" disabled>4×</button>
+          </div>
+        </div>
+      </div>
+    </div>
+    <aside class="dispatch glass panel" aria-labelledby="dispatch-heading">
+      <div class="panel-heading"><h2 id="dispatch-heading">Agent 调度</h2><span id="mode" class="pill">连接中</span></div>
+      <div class="presets" role="group" aria-label="一键演示">
+        <button type="button" data-preset="delivery" disabled>中午配送</button>
+        <button type="button" data-preset="inspection" disabled>夜间巡检</button>
+        <button type="button" data-preset="emergency" disabled>应急演示</button>
+      </div>
+      <div id="conversation" class="conversation" role="log" aria-label="调度对话">
+        <p class="chat-empty">输入起降坪和任务要求，或选择上方演示。</p>
       </div>
       <form id="dispatch-form">
         <label for="query">调度指令</label>
-        <textarea id="query" rows="3" maxlength="500" required placeholder="例如：从 VP01 配送至 VP03"></textarea>
-        <div class="form-actions">
-          <button id="sample" type="button" class="secondary">试跑配送示例</button>
-          <button id="submit" type="submit" class="primary">规划航线</button>
-        </div>
+        <textarea id="query" rows="2" maxlength="500" required placeholder="例如：从 VP01 巡检至 VP04"></textarea>
+        <p id="dispatch-status" class="feedback" role="status"></p>
+        <button id="submit" type="submit" class="primary" disabled>规划航线</button>
       </form>
-      <p id="dispatch-status" class="feedback" role="status">输入指令或试跑配送示例。</p>
-      <section class="metrics" aria-label="航线指标">
-        <div class="panel-heading">
-          <h3>航线指标</h3>
-          <span id="compliance" class="compliance"></span>
-        </div>
-        <dl class="metric-grid tabular-nums">
-          <div><dt>航线距离</dt><dd id="distance">—</dd></div>
-          <div><dt>预计飞行</dt><dd id="duration">—</dd></div>
-          <div><dt title="按模拟航速和步行速度估算">较地面节省</dt><dd id="saving">—</dd></div>
-          <div><dt title="距建筑缓冲体和禁飞区的最小距离下界">净空下界</dt><dd id="clearance">—</dd></div>
-        </dl>
-      </section>
-      <section aria-labelledby="trace-heading">
-        <h3 id="trace-heading">调度过程</h3>
-        <ol id="trace" class="trace" aria-live="polite">
-          <li class="empty-trace">规划后显示任务解析、空域校验和工具执行结果。</li>
-        </ol>
-      </section>
     </aside>
   </main>
 </body>
