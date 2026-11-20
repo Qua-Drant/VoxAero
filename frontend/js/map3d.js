@@ -166,12 +166,13 @@ export class CampusMap {
     this.flightEntity = this.viewer.entities.add({
       name: "VOXAERO-01",
       show: false,
+      orientation: new Cesium.ConstantProperty(),
       point: { pixelSize: 9, color: color("#96ffe1"), outlineColor: color("#124e48"), outlineWidth: 2 },
-      box: {
-        dimensions: new Cesium.Cartesian3(4.5, 3, 0.8),
-        material: color("#a4ffdf"),
-        outline: true,
-        outlineColor: color("#ffffff"),
+      model: {
+        uri: "/assets/voxaero-01.glb",
+        minimumPixelSize: 56,
+        maximumScale: 2.5,
+        runAnimations: true,
       },
       label: {
         text: "VOXAERO-01", font: "600 12px monospace", fillColor: color("#baffec"),

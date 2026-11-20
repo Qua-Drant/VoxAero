@@ -291,6 +291,8 @@ def test_service_metadata_geojson_and_preview_assets(client):
     assert "VoxAero — 低空三维数字孪生与智能体调度平台" in page.text
     for path in ("/js/app.js", "/js/map3d.js", "/css/style.css"):
         assert client.get(path).status_code == 200
+    model = client.get("/assets/voxaero-01.glb")
+    assert model.status_code == 200 and model.content.startswith(b"glTF\x02\x00\x00\x00")
 
 
 @pytest.mark.parametrize(("query", "target", "mission", "corridor", "zones", "priority"), [

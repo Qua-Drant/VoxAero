@@ -1,7 +1,7 @@
 const C = globalThis.Cesium;
 const SPEED = { delivery: 12, inspection: 15 };
 const CLIMB_SPEED = 3;
-const NOSE_OFFSET = 0.9;
+const NOSE_OFFSET = 0.42;
 
 function world({ lon, lat, alt }) {
   return C.Cartesian3.fromDegrees(lon, lat, alt);
@@ -96,10 +96,13 @@ export class DroneSim {
     this.track = track;
     this.targetId = target;
     this.elapsed = 0;
+    this.heading = undefined;
+    this.bank = 0;
     this.guideTime = -Infinity;
     this.battery = battery;
     this.map.flightEntity.position = track.property;
     this.map.flightEntity.show = this.view !== "fpv";
+    this.map.flightEntity.point.show = this.view === "overview";
     this.paint();
   }
 
@@ -109,12 +112,12 @@ export class DroneSim {
 
   setView(view) {
     this.view = view;
-    this.cameraHeading = undefined;
     this.guideTime = -Infinity;
     this.map.viewer.scene.screenSpaceCameraController.enableInputs = view === "overview";
     if (view === "overview") this.map.resetView();
     if (this.track) {
       this.map.flightEntity.show = view !== "fpv";
+      this.map.flightEntity.point.show = view === "overview";
       this.paint();
     }
   }
@@ -162,7 +165,8 @@ export class DroneSim {
   paint(delta = 0) {
     const frame = this.snapshot();
     this.map.viewer.clock.currentTime = this.track.time(this.elapsed);
-    if (this.view !== "overview") this.pointCamera(frame, delta);
+    const pose = this.updatePose(frame, delta);
+    if (this.view !== "overview") this.pointCamera(frame, pose);
     if (this.view !== "fpv") {
       this.map.showGuides([], null);
     } else if (this.elapsed - this.guideTime >= .18) {
@@ -173,8 +177,7 @@ export class DroneSim {
     this.onFrame(frame);
   }
 
-  pointCamera(frame, delta) {
-    const { position, leg, legIndex } = frame;
+  updatePose({ position, leg, legIndex, complete }, delta) {
     const ellipsoid = C.Ellipsoid.WGS84;
     const up = ellipsoid.geodeticSurfaceNormal(position, new C.Cartesian3());
     const lookLeg = leg.horizontal > 1 ? leg
@@ -185,28 +188,39 @@ export class DroneSim {
     const east = C.Matrix4.multiplyByPointAsVector(local, C.Cartesian3.UNIT_X, new C.Cartesian3());
     const preferred = lookLeg?.direction ?? north;
     const desired = Math.atan2(C.Cartesian3.dot(preferred, east), C.Cartesian3.dot(preferred, north));
-    const smooth = this.cameraHeading === undefined || delta === 0 ? 1 : 1 - Math.exp(-delta * 13);
-    const previous = this.cameraHeading ?? desired;
-    this.cameraHeading = previous + C.Math.negativePiToPi(desired - previous) * smooth;
-    const forward = unit(plus(plus(new C.Cartesian3(), north, Math.cos(this.cameraHeading)),
-      east, Math.sin(this.cameraHeading)));
+    const turn = C.Math.negativePiToPi(desired - (this.heading ?? desired));
+    const smooth = 1 - Math.exp(-delta * 9);
+    this.heading = this.heading === undefined ? desired : this.heading + turn * smooth;
+    const cruising = leg.phase === "cruise" && !complete;
+    this.bank = cruising ? C.Math.lerp(this.bank, C.Math.clamp(turn * .65, -.23, .23), smooth) : 0;
+    const pitch = cruising ? C.Math.clamp(Math.atan2(leg.dz, leg.horizontal), -.12, .12) : 0;
+    // Cesium maps the glTF forward axis (+Z) to local +X, which points east at zero heading.
+    const attitude = new C.HeadingPitchRoll(this.heading - Math.PI / 2, pitch, this.bank);
+    this.map.flightEntity.orientation.setValue(C.Transforms.headingPitchRollQuaternion(position, attitude));
+    const forward = unit(plus(plus(new C.Cartesian3(), north, Math.cos(this.heading)), east, Math.sin(this.heading)));
+    return { up, forward };
+  }
+
+  pointCamera(frame, { up, forward }) {
+    const { position, leg } = frame;
     const right = unit(cross(forward, up));
     let eye;
     let sight;
     if (this.view === "fpv") {
       const climb = Math.atan2(leg.dz, Math.max(leg.horizontal, .01));
       const pitch = Math.max(-.55, Math.min(.25, climb));
-      eye = plus(plus(position, forward, NOSE_OFFSET), up, 1.45);
+      eye = plus(plus(position, forward, NOSE_OFFSET), up, .47);
       sight = unit(plus(forward, up, Math.tan(pitch)));
     } else {
-      eye = plus(plus(plus(position, forward, -38), up, 17), right, 11);
-      sight = unit(C.Cartesian3.subtract(plus(position, forward, 11), eye, new C.Cartesian3()));
+      eye = plus(plus(plus(position, forward, -6.4), up, 3.9), right, 2.8);
+      const aim = plus(plus(position, forward, .65), up, .38);
+      sight = unit(C.Cartesian3.subtract(aim, eye, new C.Cartesian3()));
     }
     const cameraRight = unit(cross(sight, up));
     const cameraUp = unit(cross(cameraRight, sight));
     this.map.viewer.camera.setView({ destination: eye, orientation: { direction: sight, up: cameraUp } });
     frame.pitch = this.map.viewer.camera.pitch;
-    frame.heading = C.Math.toDegrees(C.Math.zeroToTwoPi(this.cameraHeading));
+    frame.heading = C.Math.toDegrees(C.Math.zeroToTwoPi(this.heading));
   }
 
   gates() {

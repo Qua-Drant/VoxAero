@@ -8,3 +8,4 @@ __pycache__/
 .idea/
 *.log
 third_party/
+/.agents/skills/modern-web-guidance/

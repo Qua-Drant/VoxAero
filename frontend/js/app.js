@@ -11,7 +11,7 @@ const playButton = element("play-flight");
 const resetButton = element("reset-flight");
 const windButton = element("wind");
 const batteryButton = element("battery");
-const emergencyMenu = element("emergency-menu");
+const closeEmergency = setupEmergencyMenu();
 const phaseNames = { takeoff: "起飞", cruise: "巡航", landing: "降落", transition: "调整高度" };
 const corridorNames = { delivery: "配送层 30–60 m", inspection: "巡检层 60–90 m" };
 const eventNames = { wind_gust: "突发阵风 / 临时禁飞区", low_battery: "低电量强制备降" };
@@ -28,6 +28,27 @@ let frame;
 let padNames;
 let clearance = null;
 let lastTelemetry = -Infinity;
+
+function setupEmergencyMenu() {
+  const fallback = element("emergency-menu");
+  const panel = element("emergency-actions");
+  if (!("popover" in HTMLElement.prototype)) return () => { fallback.open = false; };
+
+  const trigger = element("emergency-trigger");
+  if (!("command" in HTMLButtonElement.prototype)) {
+    trigger.removeAttribute("commandfor");
+    trigger.removeAttribute("command");
+    trigger.setAttribute("popovertarget", panel.id);
+  }
+  panel.setAttribute("popover", "auto");
+  fallback.replaceWith(panel);
+  trigger.hidden = false;
+  return () => {
+    const restoreFocus = panel.contains(document.activeElement);
+    panel.hidePopover();
+    if (restoreFocus) trigger.focus();
+  };
+}
 
 function text(id, value) {
   const target = element(id);
@@ -183,7 +204,7 @@ async function replan(type) {
 
   const before = sim.snapshot();
   busy = "replan";
-  emergencyMenu.open = false;
+  closeEmergency();
   if (type === "low_battery") sim.battery = Math.min(sim.battery, 14);
   sim.pause();
   refreshFlightState();

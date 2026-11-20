@@ -24,9 +24,10 @@
     </div>
     <div class="header-end">
       <p class="brand-note">Spatial Agent &amp; 3D Airspace Twin</p>
+      <button id="emergency-trigger" type="button" commandfor="emergency-actions" command="toggle-popover" hidden>突发应急</button>
       <details id="emergency-menu" class="emergency">
         <summary>突发应急</summary>
-        <div class="emergency-actions glass">
+        <div id="emergency-actions" class="emergency-actions glass" role="group" aria-label="突发应急操作">
           <p id="emergency-hint">进入巡航后可注入应急事件。</p>
           <button id="wind" type="button" disabled>模拟突发阵风 / 临时禁飞区</button>
           <button id="battery" type="button" disabled>低电量强制备降</button>
@@ -52,7 +53,7 @@
         <label><i class="hazard-key"></i><span>临时禁飞区</span><input type="checkbox" data-layer="hazards" checked disabled></label>
       </section>
       <section class="glass panel flight-board" aria-label="实时飞行看板">
-        <div class="panel-heading"><h2>飞行看板</h2><span id="flight-state" class="pill">待命</span></div>
+        <div class="panel-heading"><h2>飞行看板</h2><span id="flight-state" class="pill" role="status">待命</span></div>
         <div class="aircraft"><span class="aircraft-mark" aria-hidden="true">✣</span><strong>VOXAERO-01</strong></div>
         <p id="mission-target" class="mission-target">等待调度</p>
         <dl class="telemetry">
