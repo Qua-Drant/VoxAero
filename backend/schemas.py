@@ -23,13 +23,22 @@ class FeatureProperties(BaseModel, frozen=True):
 
 
 class BuildingProperties(FeatureProperties):
-    height: Annotated[FiniteFloat, Field(ge=12, le=65)]
-    category: Literal["teaching", "lab", "dorm", "canteen", "library"]
+    height: Annotated[FiniteFloat, Field(gt=0)]
+    category: Literal["teaching", "lab", "dorm", "canteen", "library", "other"]
+    base_alt: NonnegativeMeters = 0
+    collision_top_alt: NonnegativeMeters | None = None
+
+    @model_validator(mode="after")
+    def check_collision_height(self) -> BuildingProperties:
+        if self.collision_top_alt is not None and self.collision_top_alt < self.base_alt + self.height - 1e-8:
+            raise ValueError("The collision ceiling must cover the modeled roof")
+        return self
 
 
 class VertiportProperties(FeatureProperties):
     type: Literal["logistics", "inspection", "emergency"]
     altitude: NonnegativeMeters
+    host_building_id: NonemptyString | None = None
 
 
 class AltitudeRange(BaseModel, frozen=True):
@@ -72,6 +81,7 @@ class RoutePlan(BaseModel):
 
 class DispatchRequest(BaseModel):
     query: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=500)]
+    scene_version: str | None = None
 
 
 class DispatchIntent(BaseModel):
@@ -91,6 +101,7 @@ class ReplanRequest(BaseModel):
     dynamic_hazard: DynamicHazard | None = None
     active_hazards: Annotated[tuple[DynamicHazard, ...], Field(max_length=20)] = ()
     avoid_zone_ids: Annotated[tuple[str, ...], Field(max_length=20)] = ()
+    scene_version: str | None = None
 
     @model_validator(mode="after")
     def check_hazard(self) -> ReplanRequest:
@@ -124,6 +135,7 @@ class MissionResult(BaseModel):
     waypoints: list[Waypoint]
     kpis: RouteKPIs
     thought_steps: list[ThoughtStep]
+    scene_version: str | None = None
 
 
 class DispatchResult(MissionResult):

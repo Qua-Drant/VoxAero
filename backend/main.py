@@ -2,22 +2,27 @@
 
 from contextlib import asynccontextmanager
 from dataclasses import asdict
+from os import getenv
+from pathlib import Path
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from openai import OpenAI
 
-from backend.config import AIRSPACE_LAYERS, FRONTEND_DIR, LLMSettings, STUDY_BOUNDS
+from backend.config import AIRSPACE_LAYERS, DATA_DIR, FRONTEND_DIR, LLMSettings, STUDY_BOUNDS
 from backend.core.agent import AgentError, DispatchAgent
 from backend.core.airspace import Airspace
 from backend.schemas import DispatchRequest, DispatchResult, ReplanRequest, ReplanResult
 
 
-def create_app(settings: LLMSettings | None = None, *, llm_client: OpenAI | None = None) -> FastAPI:
+def create_app(
+    settings: LLMSettings | None = None, *, llm_client: OpenAI | None = None, directory: Path | None = None
+) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        airspace = Airspace.from_directory()
+        scene_directory = directory if directory is not None else Path(getenv("VOXAERO_SCENE_DIR") or DATA_DIR)
+        airspace = Airspace.from_directory(scene_directory)
         app.state.agent = DispatchAgent(airspace, settings or LLMSettings.from_environment(), llm_client)
         yield
 
@@ -43,15 +48,24 @@ def create_app(settings: LLMSettings | None = None, *, llm_client: OpenAI | None
             **request.app.state.agent.airspace.geojson,
             "airspace_layers": [asdict(layer) for layer in AIRSPACE_LAYERS],
             "bounds": STUDY_BOUNDS,
+            "scene_version": request.app.state.agent.airspace.scene_version,
         }
+
+    def current_version(request: Request, expected: str | None) -> str:
+        version = request.app.state.agent.airspace.scene_version
+        if expected is not None and expected != version:
+            raise HTTPException(status_code=409, detail="空域场景已更新，请刷新页面后重新调度。")
+        return version
 
     @app.post("/api/agent/dispatch")
     def dispatch(payload: DispatchRequest, request: Request) -> DispatchResult:
-        return request.app.state.agent.dispatch(payload.query)
+        version = current_version(request, payload.scene_version)
+        return request.app.state.agent.dispatch(payload.query).model_copy(update={"scene_version": version})
 
     @app.post("/api/agent/replan")
     def replan(payload: ReplanRequest, request: Request) -> ReplanResult:
-        return request.app.state.agent.replan_emergency(payload)
+        version = current_version(request, payload.scene_version)
+        return request.app.state.agent.replan_emergency(payload).model_copy(update={"scene_version": version})
 
     app.mount("/", StaticFiles(directory=FRONTEND_DIR, html=True), name="frontend")
     return app

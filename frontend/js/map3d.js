@@ -3,6 +3,50 @@ const Cesium = globalThis.Cesium;
 const color = (hex, opacity = 1) => Cesium.Color.fromCssColorString(hex).withAlpha(opacity);
 const degrees = ([lon, lat], alt = 0) => Cesium.Cartesian3.fromDegrees(lon, lat, alt);
 
+function campusTerrain(asset) {
+  if (!asset) return new Cesium.EllipsoidTerrainProvider();
+  const [west, south, east, north] = asset.bounds;
+  const grid = asset.elevations_m;
+  const rows = grid.length;
+  const cols = grid[0].length;
+  const size = 33;
+  const feather = .0008;
+  const tilingScheme = new Cesium.GeographicTilingScheme();
+  const clamp = (value, min, max) => Math.max(min, Math.min(max, value));
+  return new Cesium.CustomHeightmapTerrainProvider({
+    width: size,
+    height: size,
+    tilingScheme,
+    callback(x, y, level) {
+      const rectangle = tilingScheme.tileXYToRectangle(x, y, level);
+      const left = Cesium.Math.toDegrees(rectangle.west);
+      const right = Cesium.Math.toDegrees(rectangle.east);
+      const top = Cesium.Math.toDegrees(rectangle.north);
+      const bottom = Cesium.Math.toDegrees(rectangle.south);
+      const buffer = new Float32Array(size * size);
+      if (right < west - feather || left > east + feather || top < south - feather || bottom > north + feather) return buffer;
+      for (let row = 0; row < size; row += 1) {
+        const lat = top - (top - bottom) * row / (size - 1);
+        const gy = clamp((north - lat) * (rows - 1) / (north - south), 0, rows - 1);
+        const j = Math.min(rows - 2, Math.floor(gy));
+        for (let col = 0; col < size; col += 1) {
+          const lon = left + (right - left) * col / (size - 1);
+          const gx = clamp((lon - west) * (cols - 1) / (east - west), 0, cols - 1);
+          const i = Math.min(cols - 2, Math.floor(gx));
+          const u = gx - i;
+          const v = gy - j;
+          const blend = clamp(1 - Math.max(west - lon, lon - east, south - lat, lat - north) / feather, 0, 1);
+          buffer[row * size + col] = blend * (
+            (1 - v) * ((1 - u) * grid[j][i] + u * grid[j][i + 1])
+            + v * ((1 - u) * grid[j + 1][i] + u * grid[j + 1][i + 1])
+          );
+        }
+      }
+      return buffer;
+    },
+  });
+}
+
 function hierarchy(rings) {
   const [outer, ...holes] = rings;
   const ring = (coordinates) => coordinates.slice(0, -1).map((point) => degrees(point));
@@ -62,12 +106,18 @@ function footprintDistance(rings, x, y) {
 }
 
 export class CampusMap {
-  constructor(container, bounds) {
+  constructor(container, bounds, terrain) {
     if (!Cesium) throw new Error("Cesium 资源加载失败，请检查 CDN 连接。");
     this.bounds = bounds;
+    this.terrain = terrain;
+    const [west, south, east, north] = bounds;
+    const localOrigin = degrees([(west + east) / 2, (south + north) / 2]);
+    this.worldToLocal = Cesium.Matrix4.inverseTransformation(
+      Cesium.Transforms.eastNorthUpToFixedFrame(localOrigin), new Cesium.Matrix4(),
+    );
     this.viewer = new Cesium.Viewer(container, {
       baseLayer: false,
-      terrainProvider: new Cesium.EllipsoidTerrainProvider(),
+      terrainProvider: campusTerrain(terrain),
       animation: false,
       timeline: false,
       baseLayerPicker: false,
@@ -99,6 +149,11 @@ export class CampusMap {
     }));
     this.viewer.scene.globe.baseColor = color("#222d3b");
     this.viewer.scene.globe.enableLighting = false;
+    this.viewer.scene.globe.depthTestAgainstTerrain = Boolean(terrain);
+    if (terrain) {
+      this.viewer.scene.globe.maximumScreenSpaceError = 1.3;
+      this.viewer.creditDisplay.addStaticCredit(new Cesium.Credit("Elevation: NASA SRTM / Mapzen", true));
+    }
     this.viewer.scene.fog.enabled = false;
     this.viewer.scene.backgroundColor = color("#182b3c");
     this.viewer.scene.skyAtmosphere.show = false;
@@ -151,18 +206,23 @@ export class CampusMap {
   }
 
   async load(data) {
-    for (const key of ["buildings", "vertiports", "nofly_zones", "airspace", "route", "hazards"]) {
+    for (const key of ["buildings", "vertiports", "nofly_zones", "airspace", "route", "hazards", "roads"]) {
       this.layers.set(key, new Cesium.CustomDataSource(key));
     }
     const buildings = this.layers.get("buildings").entities;
     for (const feature of data.buildings.features) {
+      const { height, base_alt = 0, height_source, collision_top_alt } = feature.properties;
+      const top = base_alt + height;
+      const provenance = { osm_height: "OSM 标注", osm_levels_estimate: "楼层估算", footprint_estimate: "缺高估算" }[height_source];
       volume(buildings, feature, {
-        bottom: 0, top: feature.properties.height,
+        bottom: base_alt, top,
         fill: color("#bdcee0", 0.82), outline: color("#e8f4ff", 0.87),
-        hoverText: feature.properties.name + " · " + feature.properties.height + " m",
+        hoverText: feature.properties.name + " · " + height + " m" + (provenance ? " · " + provenance : ""),
       });
-      this.staticVolumes.push(this.asVolume(feature, 0, feature.properties.height));
+      this.staticVolumes.push(this.asVolume(feature, base_alt, collision_top_alt ?? top));
     }
+    this.roadFeatures = data.roads?.features ?? [];
+    this.layers.get("roads").show = false;
     const pads = this.layers.get("vertiports").entities;
     for (const feature of data.vertiports.features) {
       const { id, name, altitude, type } = feature.properties;
@@ -244,13 +304,26 @@ export class CampusMap {
   }
 
   showLayer(key, visible) {
+    if (key === "roads" && visible) {
+      const entities = this.layers.get("roads").entities;
+      if (!entities.values.length) {
+        for (const feature of this.roadFeatures) {
+          entities.add({ polyline: {
+            positions: feature.geometry.coordinates.map((point) => degrees(point)),
+            width: 2,
+            material: color("#62dacf", .78),
+            clampToGround: true,
+          } });
+        }
+      }
+    }
     this.layers.get(key).show = visible;
     this.viewer.scene.requestRender();
   }
 
   resetView() {
     const [west, south, east, north] = this.bounds;
-    const target = degrees([(west + east) / 2, (south + north) / 2], 20);
+    const target = degrees([(west + east) / 2, (south + north) / 2], this.terrain ? 35 : 20);
     const extent = Cesium.Cartesian3.distance(degrees([west, south]), degrees([east, north]));
     const aspect = this.viewer.canvas.clientWidth / this.viewer.canvas.clientHeight;
     const range = extent * Math.max(1.06, 1.1 / Math.max(.55, aspect));
@@ -293,12 +366,8 @@ export class CampusMap {
   }
 
   project(lon, lat) {
-    const [west, south, east, north] = this.bounds;
-    const originLat = (south + north) / 2;
-    return [
-      (lon - (west + east) / 2) * 111320 * Math.cos(Cesium.Math.toRadians(originLat)),
-      (lat - originLat) * 110860,
-    ];
+    const point = Cesium.Matrix4.multiplyByPoint(this.worldToLocal, degrees([lon, lat]), new Cesium.Cartesian3());
+    return [point.x, point.y];
   }
 
   asVolume(feature, bottom, top) {

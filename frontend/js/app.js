@@ -21,6 +21,7 @@ const hud = new FlightHUD(element("hud"));
 
 let map;
 let sim;
+let sceneVersion;
 let mission;
 let busy;
 let frame;
@@ -151,7 +152,7 @@ async function dispatch(query, autoPlay) {
   ui.status("正在校验空域并规划航线…");
   ui.message("user", query);
   try {
-    const result = await api("/api/agent/dispatch", { query });
+    const result = await api("/api/agent/dispatch", { query, scene_version: sceneVersion });
     mission = {
       original: result, hazards: [], volumes: [],
       avoid: new Set(result.intent.avoid_zone_ids), diverted: false, hold: false,
@@ -191,6 +192,7 @@ async function replan(type) {
   try {
     const result = await api("/api/agent/replan", {
       current_pos: before.coordinates,
+      scene_version: sceneVersion,
       target_id: mission.target,
       mission_type: mission.current.corridor,
       emergency_type: type,
@@ -223,15 +225,17 @@ async function replan(type) {
 async function launch() {
   try {
     const data = await api("/api/layers/all");
-    map = new CampusMap("map", data.bounds);
+    sceneVersion = data.scene_version;
+    map = new CampusMap("map", data.bounds, data.terrain);
     await map.load(data);
     padNames = new Map(data.vertiports.features.map(({ properties }) => [properties.id, properties.name]));
     sim = new DroneSim(map, onFrame);
     for (const toggle of layerToggles) {
-      toggle.disabled = false;
+      toggle.disabled = toggle.dataset.layer === "roads" && !data.roads;
       toggle.addEventListener("change", () => map.showLayer(toggle.dataset.layer, toggle.checked));
     }
-    text("scene-status", data.buildings.features.length + " 栋建筑 · " + padNames.size + " 个起降坪");
+    const heightDatum = data.terrain ? " · 地形高程已加载" : "";
+    text("scene-status", data.buildings.features.length + " 栋建筑 · " + padNames.size + " 个起降坪" + heightDatum);
     element("reset-view").disabled = false;
     refreshFlightState();
   } catch (error) {

@@ -1,4 +1,4 @@
-"""Phase 1 acceptance tests for the spatial data and planner."""
+"""Regression tests for the prototype's original controlled scenarios."""
 
 import json
 from itertools import combinations, pairwise, permutations
@@ -25,11 +25,12 @@ from backend.schemas import (
 
 DELIVERY_QUERY = "中午高峰配送：将餐食从信息学部食堂送至测国重楼顶，避开图书馆静谧区"
 INSPECTION_QUERY = "夜间高空安防巡检：从信息学部起飞，沿 60–90m 巡检层前往图书馆西侧巡检点"
+MOCK_DATA = DATA_DIR / "mock_backup"
 
 
 @pytest.fixture(scope="module")
 def airspace():
-    return Airspace.from_directory()
+    return Airspace.from_directory(MOCK_DATA)
 
 
 @pytest.fixture(scope="module")
@@ -45,7 +46,7 @@ def test_geojson_contracts_and_building_footprints():
         ("nofly_zones", NoFlyProperties, "Polygon", 3, ("min_alt", "max_alt")),
     )
     for name, schema, geometry_type, minimum_count, float_fields in layers:
-        document = json.loads((DATA_DIR / f"{name}.geojson").read_text(encoding="utf-8"))
+        document = json.loads((MOCK_DATA / f"{name}.geojson").read_text(encoding="utf-8"))
         assert document["type"] == "FeatureCollection"
         assert len(document["features"]) >= minimum_count
         ids, geometries = set(), []
@@ -115,6 +116,8 @@ def _verify_route(route, airspace, mission, end_id, start, field=None):
     assert route.distance_m == pytest.approx(sum(dist(a, b) for a, b in pairwise(positions)))
     field = field or airspace.field
     for index, ((a, b), waypoint) in enumerate(zip(pairwise(positions), waypoints[1:], strict=True)):
+        if field.terrain:
+            assert field.terrain.segment_clear(a, b)
         roof = None
         if waypoint.phase == "takeoff":
             assert index == 0 and is_pad and b[2] > a[2]
@@ -153,7 +156,7 @@ def test_building_buffers_are_applied_on_both_axes(airspace):
     roof_pad = airspace.vertiports["VP03"]
     obstacle = roof_pad.roof_obstacle
     assert obstacle.id == "BLD03" and obstacle.max_alt == 48
-    document = json.loads((DATA_DIR / "whu_buildings.geojson").read_text(encoding="utf-8"))
+    document = json.loads((MOCK_DATA / "whu_buildings.geojson").read_text(encoding="utf-8"))
     feature = next(item for item in document["features"] if item["properties"]["id"] == obstacle.id)
     ring = np.array(feature["geometry"]["coordinates"][0])
     footprint = shape({"type": "Polygon", "coordinates": [airspace.frame.project_xy(ring)]})
@@ -249,7 +252,7 @@ def test_plan_latency_for_all_campus_pairs_and_dynamic_detour(airspace, planner)
 
 @pytest.fixture(scope="module")
 def client():
-    with TestClient(create_app(LLMSettings())) as api:
+    with TestClient(create_app(LLMSettings(), directory=MOCK_DATA)) as api:
         yield api
 
 
@@ -425,7 +428,7 @@ def test_openai_compatible_intent_and_fallback(scenario):
     transport = httpx.MockTransport(respond)
     with OpenAI(api_key=settings.api_key, base_url=settings.base_url, max_retries=0,
                 http_client=httpx.Client(transport=transport)) as sdk:
-        with TestClient(create_app(settings, llm_client=sdk)) as api:
+        with TestClient(create_app(settings, llm_client=sdk, directory=MOCK_DATA)) as api:
             assert api.get("/api/health").json()["llm_mode"] == "live_llm"
             response = api.post("/api/agent/dispatch", json={"query": DELIVERY_QUERY})
     assert response.status_code == 200, response.text

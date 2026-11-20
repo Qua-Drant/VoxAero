@@ -2,6 +2,7 @@
 
 import json
 from dataclasses import dataclass
+from hashlib import sha256
 from math import atan2, ceil, cos, degrees, dist, floor, hypot, pi, radians, sin, sqrt
 from pathlib import Path
 from typing import Iterator
@@ -27,6 +28,7 @@ from backend.schemas import (
     Position,
     VertiportProperties,
 )
+from backend.core.terrain import CONTACT_TOLERANCE_M, TerrainSurface
 
 LocalPoint = tuple[float, float, float]
 Voxel = tuple[int, int, int]
@@ -105,9 +107,10 @@ class Obstacle:
 
 
 class ObstacleField:
-    def __init__(self, obstacles: tuple[Obstacle, ...]) -> None:
+    def __init__(self, obstacles: tuple[Obstacle, ...], terrain: TerrainSurface | None = None) -> None:
         self.obstacles = obstacles
         self.index = STRtree([obstacle.footprint for obstacle in obstacles])
+        self.terrain = terrain
 
     def segment_clear(
         self,
@@ -117,6 +120,8 @@ class ObstacleField:
         roof_access: Obstacle | None = None,
     ) -> bool:
         """Check a continuous segment against the closed 3D obstacle volumes."""
+        if self.terrain is not None and not self.terrain.segment_clear(start, end):
+            return False
         vertical = start[:2] == end[:2]
         projected = Point(start[:2]) if vertical else LineString([start[:2], end[:2]])
         z0, z1 = start[2], end[2]
@@ -274,13 +279,17 @@ class Airspace:
         field: ObstacleField,
         vertiports: dict[str, Vertiport],
         geojson: dict[str, dict] | None = None,
+        scene_version: str | None = None,
     ) -> None:
         self.frame = frame
         self.grid = VoxelGrid(bounds)
         self.field = field
         self.vertiports = vertiports
         self.geojson = {} if geojson is None else geojson
+        self.scene_version = scene_version
         self.static_voxels = self.grid.rasterize(field.obstacles)
+        if field.terrain is not None:
+            self.static_voxels |= field.terrain.voxel_mask(self.grid)
         self.static_voxels.flags.writeable = False
 
     @classmethod
@@ -288,22 +297,29 @@ class Airspace:
         frame = LocalENU(*ORIGIN_LON_LAT)
         west, south, east, north = STUDY_BOUNDS
         bounds = shapely.transform(shapely.box(west, south, east, north), frame.project_xy).bounds
-        layers = {
-            key: json.loads((directory / filename).read_text(encoding="utf-8"))
-            for key, filename in (
-                ("buildings", "whu_buildings.geojson"),
-                ("vertiports", "vertiports.geojson"),
-                ("nofly_zones", "nofly_zones.geojson"),
-            )
+        sources = {
+            "buildings": "whu_buildings.geojson",
+            "vertiports": "vertiports.geojson",
+            "nofly_zones": "nofly_zones.geojson",
         }
+        for key, filename in (("terrain", "whu_terrain.json"), ("roads", "whu_roads.geojson")):
+            if (directory / filename).is_file():
+                sources[key] = filename
+        version = sha256()
+        layers = {}
+        for key, filename in sources.items():
+            payload = (directory / filename).read_bytes()
+            version.update(key.encode() + b"\0" + payload)
+            layers[key] = json.loads(payload)
+        terrain = TerrainSurface(layers["terrain"], frame) if "terrain" in layers else None
         buildings = []
         for data, geometry in _features(layers["buildings"], "whu_buildings.geojson", "Polygon"):
             properties = BuildingProperties.model_validate(data)
             footprint = shapely.transform(geometry, frame.project_xy)
-            obstacle = Obstacle(
-                properties.id, footprint.buffer(BUILDING_BUFFER_M), 0, properties.height + BUILDING_BUFFER_M
-            )
-            buildings.append((properties.height, footprint, obstacle))
+            roof = properties.base_alt + properties.height
+            top = max(roof + BUILDING_BUFFER_M, properties.collision_top_alt or 0)
+            obstacle = Obstacle(properties.id, footprint.buffer(BUILDING_BUFFER_M), 0, top)
+            buildings.append((roof, footprint, obstacle))
 
         obstacles = [obstacle for _, _, obstacle in buildings]
         for data, geometry in _features(layers["nofly_zones"], "nofly_zones.geojson", "Polygon"):
@@ -317,15 +333,23 @@ class Airspace:
             position = Position(lon=geometry.x, lat=geometry.y, alt=properties.altitude)
             east, north, _ = frame.to_local(position)
             pad_point = Point(east, north)
+            if terrain and position.alt < terrain.elevation(east, north) - CONTACT_TOLERANCE_M:
+                raise ValueError(f"{properties.id} is below the terrain")
+            overlaps = [(height, obstacle) for height, footprint, obstacle in buildings if footprint.covers(pad_point)]
+            if any(position.alt < height - 1e-8 for height, _ in overlaps):
+                raise ValueError(f"{properties.id} is below an intersecting building roof")
             roofs = [
                 (height, obstacle)
-                for height, footprint, obstacle in buildings
-                if footprint.covers(pad_point) and 0 <= position.alt - height <= BUILDING_BUFFER_M
+                for height, obstacle in overlaps
+                if 0 <= position.alt - height <= BUILDING_BUFFER_M
+                and obstacle.max_alt <= height + BUILDING_BUFFER_M
             ]
             roof = max(roofs, key=lambda match: match[0])[1] if roofs else None
+            if properties.host_building_id and (roof is None or roof.id != properties.host_building_id):
+                raise ValueError(f"{properties.id} does not match its designated roof")
             vertiports[properties.id] = Vertiport(properties, position, roof)
 
-        return cls(frame, bounds, ObstacleField(tuple(obstacles)), vertiports, layers)
+        return cls(frame, bounds, ObstacleField(tuple(obstacles), terrain), vertiports, layers, version.hexdigest())
 
     def with_hazards(
         self, hazards: tuple[DynamicHazard, ...], avoid_zone_ids: tuple[str, ...] = ()
@@ -345,6 +369,6 @@ class Airspace:
         extra = dynamic + full_height
         if not extra:
             return self.field, self.static_voxels
-        field = ObstacleField(self.field.obstacles + extra)
+        field = ObstacleField(self.field.obstacles + extra, self.field.terrain)
         blocked = self.static_voxels | self.grid.rasterize(extra)
         return field, blocked

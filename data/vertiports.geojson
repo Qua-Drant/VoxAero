@@ -1,11 +1,8 @@
-{
-  "type": "FeatureCollection",
-  "features": [
-    {"type":"Feature","properties":{"id":"VP01","name":"信息学部食堂起降坪","type":"logistics","altitude":0.0},"geometry":{"type":"Point","coordinates":[114.351353,30.52614188]}},
-    {"type":"Feature","properties":{"id":"VP02","name":"菜鸟驿站物流站","type":"logistics","altitude":0.0},"geometry":{"type":"Point","coordinates":[114.35081116,30.52717918]}},
-    {"type":"Feature","properties":{"id":"VP03","name":"测国重楼顶停机坪","type":"inspection","altitude":43.0},"geometry":{"type":"Point","coordinates":[114.3582302,30.52938908]}},
-    {"type":"Feature","properties":{"id":"VP04","name":"图书馆西侧巡检点","type":"inspection","altitude":0.0},"geometry":{"type":"Point","coordinates":[114.3536975,30.52806314]}},
-    {"type":"Feature","properties":{"id":"VP05","name":"星湖应急备降坪","type":"emergency","altitude":0.0},"geometry":{"type":"Point","coordinates":[114.35272844,30.53009264]}},
-    {"type":"Feature","properties":{"id":"VP06","name":"操场东侧应急备降坪","type":"emergency","altitude":0.0},"geometry":{"type":"Point","coordinates":[114.3579176,30.5265117]}}
-  ]
-}
+{"type": "FeatureCollection", "source": "https://api.openstreetmap.org/api/0.6/map?bbox=114.3486,30.5236,114.3624,30.5334", "attribution": "© OpenStreetMap contributors (ODbL 1.0)", "sha256_source": "2a38eee4c602cfe3864305fe208a4415a8bf656532fd878ae1cc6b3a79bb5f5a", "features": [
+{"type":"Feature","properties":{"id":"VP01","name":"信息学部一食堂起降坪","type":"logistics","altitude":14.36,"osm_ref":"node/13513425337","placement":"simulated_ground_pad"},"geometry":{"type":"Point","coordinates":[114.35410380249796,30.530578745059664]}},
+{"type":"Feature","properties":{"id":"VP02","name":"菜鸟驿站物流站","type":"logistics","altitude":15.53,"osm_ref":"node/13266231640","placement":"simulated_ground_pad"},"geometry":{"type":"Point","coordinates":[114.35367992488688,30.530003912311745]}},
+{"type":"Feature","properties":{"id":"VP03","name":"测国重楼顶停机坪","type":"inspection","altitude":26.331,"osm_ref":"way/306407524","placement":"simulated_roof_pad","host_building_id":"osm-way-306407524-01","altitude_source":"osm_levels_estimate"},"geometry":{"type":"Point","coordinates":[114.35474130859654,30.529328649933035]}},
+{"type":"Feature","properties":{"id":"VP04","name":"图书馆西侧巡检点","type":"inspection","altitude":10.18,"osm_ref":"way/104108001","placement":"simulated_ground_pad"},"geometry":{"type":"Point","coordinates":[114.35509213786044,30.531417400296974]}},
+{"type":"Feature","properties":{"id":"VP05","name":"星湖运动场应急备降坪","type":"emergency","altitude":3.76,"osm_ref":"relation/19149478","placement":"simulated_ground_pad"},"geometry":{"type":"Point","coordinates":[114.352630430566,30.531323279846482]}},
+{"type":"Feature","properties":{"id":"VP06","name":"信息学部操场东侧应急备降坪","type":"emergency","altitude":13.65,"osm_ref":"way/1382683958","placement":"simulated_ground_pad"},"geometry":{"type":"Point","coordinates":[114.35594766215056,30.53001253093089]}}
+]}
