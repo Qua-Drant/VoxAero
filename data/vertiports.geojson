@@ -1,0 +1,11 @@
+{
+  "type": "FeatureCollection",
+  "features": [
+    {"type":"Feature","properties":{"id":"VP01","name":"信息学部食堂起降坪","type":"logistics","altitude":0.0},"geometry":{"type":"Point","coordinates":[114.351353,30.52614188]}},
+    {"type":"Feature","properties":{"id":"VP02","name":"菜鸟驿站物流站","type":"logistics","altitude":0.0},"geometry":{"type":"Point","coordinates":[114.35081116,30.52717918]}},
+    {"type":"Feature","properties":{"id":"VP03","name":"测国重楼顶停机坪","type":"inspection","altitude":43.0},"geometry":{"type":"Point","coordinates":[114.3582302,30.52938908]}},
+    {"type":"Feature","properties":{"id":"VP04","name":"图书馆西侧巡检点","type":"inspection","altitude":0.0},"geometry":{"type":"Point","coordinates":[114.3536975,30.52806314]}},
+    {"type":"Feature","properties":{"id":"VP05","name":"星湖应急备降坪","type":"emergency","altitude":0.0},"geometry":{"type":"Point","coordinates":[114.35272844,30.53009264]}},
+    {"type":"Feature","properties":{"id":"VP06","name":"操场东侧应急备降坪","type":"emergency","altitude":0.0},"geometry":{"type":"Point","coordinates":[114.3579176,30.5265117]}}
+  ]
+}
