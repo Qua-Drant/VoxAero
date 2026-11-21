@@ -436,6 +436,58 @@ def test_openai_compatible_intent_and_fallback(scenario):
     assert response.status_code == 200, response.text
     result = DispatchResult.model_validate(response.json())
     assert result.mode == ("live_llm" if scenario == "function_call" else "fallback_mock")
+    assert result.model_called and result.model_fallback == (scenario != "function_call")
     assert result.intent.avoid_zone_ids == ("NFZ01",) and result.intent.end_id == "VP03"
     if scenario != "function_call":
         assert any("切换至本地规则" in event.content for event in result.thought_steps)
+
+
+def test_dispatch_classification_and_grounded_one_turn_tool_workflow():
+    calls = []
+
+    def respond(request):
+        payload = json.loads(request.content)
+        calls.append(payload["messages"][-1]["content"])
+        # The provider guesses a plausible origin that the operator never supplied.
+        arguments = {"start_id": "VP01", "end_id": "VP03", "mission_type": "delivery"}
+        return httpx.Response(200, json={
+            "id": "mock-tool-call", "object": "chat.completion", "created": 0, "model": "test-model",
+            "choices": [{"index": 0, "finish_reason": "tool_calls", "message": {
+                "role": "assistant", "content": None, "tool_calls": [{
+                    "id": "call_test", "type": "function",
+                    "function": {"name": "parse_dispatch_intent", "arguments": json.dumps(arguments)},
+                }],
+            }}],
+        })
+
+    settings = LLMSettings(api_key="test-key", base_url="https://test.invalid/v1", model="test-model")
+    with OpenAI(api_key=settings.api_key, base_url=settings.base_url, max_retries=0,
+                http_client=httpx.Client(transport=httpx.MockTransport(respond))) as sdk:
+        with TestClient(create_app(settings, llm_client=sdk, directory=MOCK_DATA)) as api:
+            for query, status in (("你好！", "help"), ("讲个关于无人机配送的笑话", "out_of_scope"),
+                                  ("图书馆西侧巡检点", "needs_intent"), ("什么是无人机巡检？", "out_of_scope")):
+                body = api.post("/api/agent/dispatch", json={"query": query}).json()
+                assert body["status"] == status and not body["model_called"]
+                assert "waypoints" not in body and not calls
+
+            short = api.post("/api/agent/dispatch", json={"query": "食堂 → 测国重"})
+            assert short.status_code == 200 and short.json()["status"] == "planned"
+            query = "把午餐送到测国重，避开图书馆禁飞区，120 秒内送达"
+            response = api.post("/api/agent/dispatch", json={"query": query})
+            notice = response.json()
+            assert response.status_code == 422 and notice["status"] == "needs_clarification"
+            assert "起点" in notice["detail"] and "waypoints" not in notice
+            assert notice["mode"] == "live_llm" and notice["model_called"]
+            token = notice["clarification_token"]
+
+            chat = api.post("/api/agent/dispatch", json={"query": "讲个笑话", "clarification_token": token})
+            assert chat.json()["status"] == "out_of_scope" and len(calls) == 2
+            reply = {"query": "食堂", "clarification_token": token}
+            response = api.post("/api/agent/dispatch", json=reply)
+            assert response.status_code == 200, response.text
+            result = DispatchResult.model_validate(response.json())
+            assert result.mode == "live_llm" and not result.model_called and len(calls) == 2
+            assert result.intent.start_id == "VP01" and result.intent.end_id == "VP03"
+            assert result.intent.avoid_zone_ids == ("NFZ01",)
+            assert result.intent.constraints.deadline_seconds == 120
+            assert api.post("/api/agent/dispatch", json=reply).json()["status"] == "clarification_closed"

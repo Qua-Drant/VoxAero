@@ -16,7 +16,7 @@ const phaseNames = { takeoff: "起飞", cruise: "巡航", landing: "降落", tra
 const corridorNames = { delivery: "配送层 30–60 m", inspection: "巡检层 60–90 m" };
 const eventNames = { wind_gust: "突发阵风 / 临时禁飞区", low_battery: "低电量强制备降" };
 const format = new Intl.NumberFormat("zh-CN", { maximumFractionDigits: 1 });
-const ui = new AgentUI(dispatch);
+const ui = new AgentUI(dispatch, clearClarification);
 const hud = new FlightHUD(element("hud"));
 
 let map;
@@ -24,6 +24,7 @@ let sim;
 let sceneVersion;
 let mission;
 let busy;
+let clarificationToken;
 let frame;
 let padNames;
 let clearance = null;
@@ -66,6 +67,7 @@ async function api(path, payload) {
   if (!response.ok) {
     const error = new Error(typeof body.detail === "string" ? body.detail : "请求失败，请检查参数后重试。");
     error.steps = body.thought_steps;
+    error.dispatchNotice = body.status ? body : null;
     throw error;
   }
   return body;
@@ -87,7 +89,7 @@ function updateControls() {
   const planned = Boolean(mission);
   const cruising = planned && Boolean(frame) && frame.elapsed > 0 && !frame.complete
     && frame.leg.phase === "cruise" && frame.coordinates.alt >= 30;
-  ui.setAvailable(Boolean(sim) && !busy);
+  ui.setAvailable(Boolean(sim) && !busy && !isInFlight());
   playButton.disabled = !planned || Boolean(busy) || frame?.complete || mission?.hold;
   resetButton.disabled = !planned || Boolean(busy);
   windButton.disabled = !cruising || Boolean(busy) || mission.hazards.length >= 20;
@@ -105,6 +107,10 @@ function updateControls() {
   text("emergency-hint", busy === "replan" ? "仿真已暂停，正在计算新航线。"
     : cruising ? "应急事件将从当前飞行位置重新规划。"
       : "进入巡航后可注入应急事件。");
+}
+
+function isInFlight() {
+  return Boolean(frame && !frame.onGround);
 }
 
 function flightState() {
@@ -165,28 +171,65 @@ function installRoute(result, target, battery = 100, rerouted = false) {
   sim.load(result.waypoints, result.corridor, { battery, target });
 }
 
-async function dispatch(query, autoPlay) {
-  if (busy || !sim) return;
+function clearClarification() {
+  if (!clarificationToken) return;
+  clarificationToken = undefined;
+  ui.setClarification(false);
+  ui.status("请输入新的完整调度指令。");
+}
+
+function showDispatchNotice(result) {
+  if (result.status === "needs_clarification") {
+    clarificationToken = result.clarification_token;
+    ui.setClarification(true);
+    ui.input.value = "";
+  } else if (result.status === "constraint_conflict" || result.status === "clarification_closed") {
+    clearClarification();
+  }
+  const conflict = result.status === "constraint_conflict";
+  if (result.mode) ui.setMode(result.mode);
+  ui.status(result.detail, conflict);
+  ui.message(conflict ? "error" : "agent", result.detail, result.thought_steps);
+}
+
+async function dispatch(query, { autoPlay = false, newTask = false } = {}) {
+  if (busy || !sim || isInFlight()) return;
+  if (newTask) clearClarification();
   busy = "dispatch";
-  sim.pause();
   refreshFlightState();
   ui.status("正在校验空域并规划航线…");
   ui.message("user", query);
   try {
-    const result = await api("/api/agent/dispatch", { query, scene_version: sceneVersion });
+    const result = await api("/api/agent/dispatch", {
+      query, scene_version: sceneVersion, clarification_token: clarificationToken,
+    });
+    if (result.status !== "planned") {
+      showDispatchNotice(result);
+      return;
+    }
+    clearClarification();
+    ui.setMode(result.mode);
+    if (result.model_fallback && mission) {
+      const message = "模型暂不可用，已保留当前任务。模型恢复后可重试。";
+      ui.status(message, true);
+      ui.message("error", message, result.thought_steps);
+      return;
+    }
     mission = {
       original: result, hazards: [], volumes: [],
-      avoid: new Set(result.intent.avoid_zone_ids), diverted: false, hold: false,
+      avoid: new Set(result.intent.avoid_zone_ids), diverted: false, hold: false, elapsedBeforeSegment: 0,
     };
     installRoute(result, result.intent.end_id);
-    ui.setMode(result.mode);
     ui.message("agent", result.intent.start_id + " → " + result.intent.end_id + " · "
       + corridorNames[result.corridor] + " · 航线就绪", result.thought_steps);
     ui.status(autoPlay ? "应急演示航线已生成。" : "航线已生成。");
     if (autoPlay) sim.play();
   } catch (error) {
-    ui.status(error.message, true);
-    ui.message("error", error.message, error.steps);
+    if (error.dispatchNotice) showDispatchNotice(error.dispatchNotice);
+    else {
+      ui.status(error.message, true);
+      ui.message("error", error.message, error.steps);
+    }
   } finally {
     busy = null;
     refreshFlightState();
@@ -203,6 +246,9 @@ async function replan(type) {
   }
 
   const before = sim.snapshot();
+  const constraints = mission.original.intent.constraints;
+  const elapsed = mission.elapsedBeforeSegment + before.elapsed;
+  const deadline = mission.diverted ? null : constraints.deadline_seconds;
   busy = "replan";
   closeEmergency();
   if (type === "low_battery") sim.battery = Math.min(sim.battery, 14);
@@ -220,12 +266,15 @@ async function replan(type) {
       ...(hazard && { dynamic_hazard: hazard }),
       active_hazards: mission.hazards,
       avoid_zone_ids: [...mission.avoid],
+      cruise_limits: constraints.cruise,
+      remaining_deadline_seconds: deadline === null ? null : deadline - elapsed,
     });
     if (result.temporary_nofly_zone && hazard) {
       mission.hazards.push(hazard);
       mission.volumes.push(result.temporary_nofly_zone);
     }
     mission.diverted ||= type === "low_battery";
+    mission.elapsedBeforeSegment = elapsed;
     mission.hold = false;
     installRoute(result, result.target_id, sim.battery, true);
     const action = type === "low_battery" ? "备降" : "绕飞";
@@ -285,6 +334,7 @@ resetButton.addEventListener("click", () => {
   mission.volumes = [];
   mission.diverted = false;
   mission.hold = false;
+  mission.elapsedBeforeSegment = 0;
   installRoute(mission.original, mission.original.intent.end_id);
   ui.status("已返回起点。");
   refreshFlightState();

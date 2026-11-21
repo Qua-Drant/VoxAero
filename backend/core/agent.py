@@ -2,19 +2,28 @@
 
 import re
 import unicodedata
+from collections import OrderedDict
+from dataclasses import dataclass
 from itertools import pairwise
 from math import hypot, isfinite
+from secrets import token_urlsafe
+from threading import Lock
+from time import monotonic
 
 from openai import OpenAI, OpenAIError
 from shapely.geometry.polygon import orient
 
 from backend.config import LLMSettings, MISSION_LAYERS
 from backend.core.airspace import Airspace, Obstacle
+from backend.core.intent import (
+    CHAT, CLARIFY_INTENT_MESSAGE, DISPATCH_WORDS, HELP, HELP_MESSAGE, LOW_FLIGHT, ROUTE_WORDS,
+    SCOPE_MESSAGE, UNSUPPORTED_WAYPOINT, intersect_limits, parse_constraints,
+)
 from backend.core.planner import NoRouteError, RoutePlanner
 from backend.schemas import (
-    AssessedRoute, DispatchIntent, DispatchResult, DynamicHazard, HazardFeature, HazardPolygon, LLMMode,
-    MissionType, NoFlyProperties, Position, ReplanRequest, ReplanResult, RouteKPIs, RoutePlan,
-    ThoughtStep,
+    AssessedRoute, CruiseLimits, DispatchCandidate, DispatchConstraints, DispatchIntent, DispatchNotice,
+    DispatchNoticeType, DispatchResult, DynamicHazard, HazardFeature, HazardPolygon, LLMMode, MissionType,
+    NoFlyProperties, Position, ReplanRequest, ReplanResult, RouteKPIs, RoutePlan, ThoughtStep,
 )
 
 PAD_ALIASES = {
@@ -29,8 +38,9 @@ AVOID_PATTERN = re.compile(
     r"(?:避开|绕开|绕过|\bavoid\b)\s*([^，。；,;]+?)(?=[，。；,;]|从|由|\bfrom\b|$)", re.IGNORECASE
 )
 SOURCE_PREFIX = re.compile(r"(?:从|由|\bfrom)\s*$", re.IGNORECASE)
-TARGET_PREFIX = re.compile(r"(?:到|至|前往|飞往|抵达|送往|→|\bto)\s*$", re.IGNORECASE)
+TARGET_PREFIX = re.compile(r"(?:到|至|前往|飞往|抵达|送往|去|→|->|\bto)\s*$", re.IGNORECASE)
 INSPECTION_PATTERN = re.compile(r"巡检|巡逻|安防|\b(?:inspection|inspect|patrol)\b", re.IGNORECASE)
+DELIVERY_PATTERN = re.compile(r"配送|送(?:到|往|至|餐|件|货)|投送|\bdeliver\w*\b", re.IGNORECASE)
 HIGH_PATTERN = re.compile(r"优先高空|高空|60\s*[-–—~至]\s*90|high.altitude", re.IGNORECASE)
 URGENT_PATTERN = re.compile(r"加急|紧急|\burgent\b", re.IGNORECASE)
 GENERIC_AVOIDANCE = re.compile(r"(?:所有|全部|已知|静态|周边|附近)*(?:建筑物?|障碍物?|禁飞区|no-fly zones?)")
@@ -39,6 +49,22 @@ FLIGHT_SPEED_MPS = {"delivery": 12.0, "inspection": 15.0}
 VERTICAL_SPEED_MPS = 3.0
 GROUND_SPEED_MPS = 1.35
 GROUND_DETOUR_FACTOR = 1.3
+PENDING_TTL_SECONDS = 600
+PENDING_LIMIT = 128
+
+
+class ModelDispatchIntent(DispatchCandidate):
+    cruise_requirement: str | None = None
+    deadline_requirement: str | None = None
+
+
+@dataclass(frozen=True)
+class PendingDispatch:
+    candidate: DispatchCandidate
+    constraints: DispatchConstraints
+    mode: LLMMode
+    model_fallback: bool
+    expires_at: float
 
 
 class AgentError(ValueError):
@@ -83,35 +109,43 @@ class DispatchAgent:
             for alias in sorted(self.pad_aliases, key=len, reverse=True)
         ]
         self.pad_pattern = re.compile("|".join(alternatives) or r"(?!)", re.IGNORECASE)
+        self.pending: OrderedDict[str, PendingDispatch] = OrderedDict()
+        self.pending_lock = Lock()
 
-    def parse_dispatch_intent(self, user_query: str) -> DispatchIntent:
-        """Deterministic intent tool with ordered, role-marked pad names or IDs."""
-        query = unicodedata.normalize("NFKC", user_query)
-        avoid_zone_ids = self._avoidance(query)
+    def _locations(self, query: str) -> str:
         locations = AVOID_PATTERN.sub("", query)
         if "VP01" in self.pad_names:
             locations = re.sub(r"从信息学部(?=\s*(?:起飞|出发))", "从VP01", locations)
-        mentions = [
-            (self.pad_aliases[match[0].casefold()], locations[:match.start()])
-            for match in self.pad_pattern.finditer(locations)
-        ]
-        distinct = list(dict.fromkeys(identifier for identifier, _ in mentions))
-        if len(distinct) != 2:
-            raise ValueError("请给出两个不同的起降坪名称或编号，例如从 VP01 配送至 VP03。")
-        start = next((identifier for identifier, prefix in mentions if SOURCE_PREFIX.search(prefix)), None)
-        end = next((identifier for identifier, prefix in mentions if TARGET_PREFIX.search(prefix)), None)
-        if start is None and end is not None:
-            start = next(identifier for identifier in distinct if identifier != end)
-        if end is None and start is not None:
-            end = next(identifier for identifier in distinct if identifier != start)
+        return locations
+
+    def _pad_mentions(self, text: str) -> list[str]:
+        return list(dict.fromkeys(self.pad_aliases[match[0].casefold()] for match in self.pad_pattern.finditer(text)))
+
+    def parse_dispatch_intent(self, query: str) -> DispatchCandidate:
+        """Extract locally grounded pad roles and preferences, including partial intent."""
+        locations = self._locations(query)
+        distinct = self._pad_mentions(locations)
+        starts, ends = set(), set()
+        for match in self.pad_pattern.finditer(locations):
+            pad = self.pad_aliases[match[0].casefold()]
+            prefix = locations[:match.start()]
+            if SOURCE_PREFIX.search(prefix) or re.match(r"\s*(?:起飞|出发)", locations[match.end():]):
+                starts.add(pad)
+            if TARGET_PREFIX.search(prefix):
+                ends.add(pad)
+        start = next(iter(starts)) if len(starts) == 1 else None
+        end = next(iter(ends)) if len(ends) == 1 else None
+        if len(distinct) == 2 and len(starts) <= 1 and len(ends) <= 1:
+            start = start or next(pad for pad in distinct if pad != end)
+            end = end or next(pad for pad in distinct if pad != start)
         task_text = self.pad_pattern.sub("", locations)
-        return DispatchIntent(
-            start_id=start or distinct[0],
-            end_id=end or distinct[1],
+        return DispatchCandidate(
+            start_id=start,
+            end_id=end,
             mission_type="inspection" if INSPECTION_PATTERN.search(task_text) else "delivery",
-            avoid_zone_ids=avoid_zone_ids,
+            avoid_zone_ids=self._avoidance(LOW_FLIGHT.sub("", query)),
             priority="urgent" if URGENT_PATTERN.search(query) else "normal",
-            prefer_high_altitude=bool(HIGH_PATTERN.search(query)),
+            prefer_high_altitude=bool(HIGH_PATTERN.search(LOW_FLIGHT.sub("", query))),
         )
 
     def _avoidance(self, query: str) -> tuple[str, ...]:
@@ -128,10 +162,10 @@ class DispatchAgent:
             ids.extend(found)
         return tuple(dict.fromkeys(ids))
 
-    def _model_intent(self, query: str) -> DispatchIntent:
-        schema = DispatchIntent.model_json_schema()
+    def _model_intent(self, query: str) -> ModelDispatchIntent:
+        schema = ModelDispatchIntent.model_json_schema()
         for key in ("start_id", "end_id"):
-            schema["properties"][key]["enum"] = list(self.pad_names)
+            schema["properties"][key]["enum"] = [*self.pad_names, None]
         if self.zone_names:
             schema["properties"]["avoid_zone_ids"]["items"]["enum"] = list(self.zone_names)
         function = {
@@ -140,7 +174,10 @@ class DispatchAgent:
             "parameters": schema,
         }
         prompt = (
-            "Call the intent tool once using valid IDs. Interpret 信息学部起飞 as VP01 when available. "
+            "Call the intent tool once using valid IDs. Use null for missing or ambiguous endpoints and never guess. "
+            "Interpret 信息学部起飞 as VP01 when available. Negative wording such as 不要飞高空 is not a high-altitude preference. "
+            "For cruise_requirement and deadline_requirement, quote the complete relevant user phrase verbatim, "
+            "or use null when absent. Include comparators, units and any preference or obligation. "
             f"Vertiports: {self.pad_names}. No-fly zones: {self.zone_names}. "
             "Avoidance applies only to explicitly requested zones. Preserve the requested mission type."
         )
@@ -164,10 +201,27 @@ class DispatchAgent:
         function_call = calls[0].function
         if function_call is None or function_call.name != TOOL_NAME:
             raise ValueError("Unexpected dispatch intent tool name")
-        intent = DispatchIntent.model_validate_json(function_call.arguments)
-        self._check_intent(intent)
-        zones = tuple(dict.fromkeys((*intent.avoid_zone_ids, *self._avoidance(query))))
-        return intent.model_copy(update={"avoid_zone_ids": zones})
+        intent = ModelDispatchIntent.model_validate_json(function_call.arguments)
+        if any(pad is not None and pad not in self.pad_names for pad in (intent.start_id, intent.end_id)):
+            raise ValueError("Unknown vertiport from model")
+        if any(zone not in self.zone_names for zone in intent.avoid_zone_ids):
+            raise ValueError("Unknown avoid zone from model")
+        return intent
+
+    def _ground_model(self, query: str, local: DispatchCandidate, model: ModelDispatchIntent) -> DispatchCandidate:
+        locations = self._locations(query)
+        mentioned = self._pad_mentions(locations)
+        task_text = self.pad_pattern.sub("", locations)
+        start = local.start_id or (model.start_id if model.start_id in mentioned and model.start_id != local.end_id else None)
+        end = local.end_id or (model.end_id if model.end_id in mentioned and model.end_id != start else None)
+        zones = tuple(dict.fromkeys((*local.avoid_zone_ids, *model.avoid_zone_ids)))
+        return DispatchCandidate(
+            start_id=start, end_id=end, avoid_zone_ids=zones,
+            mission_type=local.mission_type if INSPECTION_PATTERN.search(task_text) or DELIVERY_PATTERN.search(task_text)
+            else model.mission_type,
+            priority="urgent" if local.priority == "urgent" else model.priority,
+            prefer_high_altitude=local.prefer_high_altitude or (model.prefer_high_altitude and not LOW_FLIGHT.search(query)),
+        )
 
     def _check_intent(self, intent: DispatchIntent) -> None:
         if intent.start_id not in self.pad_names or intent.end_id not in self.pad_names:
@@ -185,52 +239,195 @@ class DispatchAgent:
         extra_nofly_zones: tuple[DynamicHazard, ...] = (),
         *,
         avoid_zone_ids: tuple[str, ...] = (),
+        cruise_limits: CruiseLimits | None = None,
     ) -> AssessedRoute:
         route = self.planner.plan_3d_route(
-            start, end_id, mission_type, extra_nofly_zones, avoid_zone_ids=avoid_zone_ids
+            start, end_id, mission_type, extra_nofly_zones, avoid_zone_ids=avoid_zone_ids, cruise_limits=cruise_limits,
         )
-        kpis = self._metrics(route, mission_type, start, end_id, extra_nofly_zones, avoid_zone_ids)
-        return AssessedRoute(waypoints=route.waypoints, distance_m=route.distance_m, kpis=kpis)
+        kpis, flight_seconds = self._metrics(route, mission_type, start, end_id, extra_nofly_zones, avoid_zone_ids)
+        return AssessedRoute(waypoints=route.waypoints, distance_m=route.distance_m, kpis=kpis, flight_seconds=flight_seconds)
 
-    def dispatch(self, query: str) -> DispatchResult:
+    def dispatch(self, query: str, clarification_token: str | None = None) -> DispatchResult | DispatchNotice:
+        query = unicodedata.normalize("NFKC", query).strip()
         steps: list[ThoughtStep] = []
-        _add(steps, "thought", "提取任务类型、起降坪和空域偏好。")
-        mode: LLMMode = self.settings.mode
-        intent = None
-        if mode == "live_llm":
+        _add(steps, "action", "classify_dispatch · 本地识别使用帮助、调度请求及补答")
+        if HELP.fullmatch(query):
+            return self._notice(steps, "help", HELP_MESSAGE)
+        if CHAT.search(query):
+            return self._notice(steps, "out_of_scope", SCOPE_MESSAGE)
+
+        locations = self._locations(query)
+        mentioned = self._pad_mentions(locations)
+        task_text = self.pad_pattern.sub("地点", locations)
+        is_request = bool(DISPATCH_WORDS.search(task_text) or mentioned and ROUTE_WORDS.search(task_text))
+        if clarification_token and self._is_pad_reply(query, mentioned):
+            pending = self._pending_for(clarification_token)
+            if len(mentioned) == 1 or pending is None or not (pending.candidate.start_id or pending.candidate.end_id):
+                return self._complete_clarification(clarification_token, query, mentioned, steps)
+        if not is_request:
+            if mentioned or query.casefold().rstrip(".!?。！？ ") in self.zone_aliases:
+                return self._notice(steps, "needs_intent", CLARIFY_INTENT_MESSAGE)
+            return self._notice(steps, "out_of_scope", SCOPE_MESSAGE)
+
+        _add(steps, "thought", "提取有输入依据的起降坪、任务类型与约束。")
+        if UNSUPPORTED_WAYPOINT.search(locations):
+            return self._notice(steps, "constraint_conflict", "当前支持单段配送或巡检，请直接指定起点和终点。")
+        try:
+            local = self.parse_dispatch_intent(query)
+        except ValueError as exc:
+            raise _error(steps, str(exc), 422) from exc
+        try:
+            constraints = parse_constraints(query)
+        except ValueError as exc:
+            return self._notice(steps, "constraint_conflict", str(exc))
+
+        candidate = local
+        model_called = self.settings.mode == "live_llm"
+        mode: LLMMode = "fallback_mock"
+        if model_called:
             _add(steps, "action", "parse_dispatch_intent · OpenAI 兼容函数调用")
             try:
-                intent = self._model_intent(query)
+                model = self._model_intent(query)
+                candidate = self._ground_model(query, local, model)
+                mode = "live_llm"
             except (OpenAIError, ValueError):
-                mode = "fallback_mock"
                 _add(steps, "observation", "模型调用失败或参数不合规，切换至本地规则。")
-        if intent is None:
+            else:
+                if model.cruise_requirement and model.cruise_requirement in query and not (
+                    constraints.cruise or constraints.preferred_cruise or LOW_FLIGHT.search(query)
+                    or HIGH_PATTERN.search(query)
+                ):
+                    return self._notice(steps, "constraint_conflict", "请明确巡航高度，例如‘巡航不超过 50 米’。",
+                                        mode=mode, model_called=True)
+                if model.deadline_requirement and model.deadline_requirement in query and (
+                    constraints.deadline_seconds is None and constraints.preferred_deadline_seconds is None
+                ):
+                    return self._notice(steps, "constraint_conflict", "请明确飞行时限，例如‘起飞后 60 秒内送达’。",
+                                        mode=mode, model_called=True)
+        if mode == "fallback_mock":
             _add(steps, "action", "parse_dispatch_intent · 本地关键词与起降坪匹配")
-            try:
-                intent = self.parse_dispatch_intent(query)
-                self._check_intent(intent)
-            except ValueError as exc:
-                raise _error(steps, str(exc), 422) from exc
+        if LOW_FLIGHT.search(query) and (candidate.mission_type == "inspection" or candidate.prefer_high_altitude):
+            return self._notice(steps, "constraint_conflict", "任务要求避开高空，但指定的巡检或高空航道为 60–90 米。请调整任务或高度要求。",
+                                mode=mode, model_called=model_called)
+        model_fallback = model_called and mode == "fallback_mock"
+        if not (candidate.start_id and candidate.end_id):
+            token = token_urlsafe(24)
+            with self.pending_lock:
+                self.pending[token] = PendingDispatch(candidate, constraints, mode, model_fallback,
+                                                      monotonic() + PENDING_TTL_SECONDS)
+                if len(self.pending) > PENDING_LIMIT:
+                    self.pending.popitem(last=False)
+            missing = "起点" if candidate.end_id else "终点" if candidate.start_id else "起点和终点"
+            return self._notice(steps, "needs_clarification", f"请补充{missing}的起降坪名称或编号。",
+                                mode=mode, model_called=model_called, token=token)
+        return self._plan_dispatch(candidate, constraints, mode, steps, model_called, model_fallback)
+
+    def _is_pad_reply(self, query: str, mentioned: list[str]) -> bool:
+        if not 1 <= len(mentioned) <= 2:
+            return False
+        words = self.pad_pattern.sub(" ", query)
+        return re.fullmatch(r"(?:\s|[，,。!！]|从|由|到|至|去|选|是|起点|终点|起飞|出发|降落|吧|即可|→|->)+", words) is not None
+
+    def _pending_for(self, token: str, *, consume: bool = False) -> PendingDispatch | None:
+        with self.pending_lock:
+            pending = self.pending.pop(token, None) if consume else self.pending.get(token)
+            if pending is not None and pending.expires_at > monotonic():
+                return pending
+            self.pending.pop(token, None)
+        return None
+
+    def _complete_clarification(
+        self, token: str, query: str, mentioned: list[str], steps: list[ThoughtStep],
+    ) -> DispatchResult | DispatchNotice:
+        pending = self._pending_for(token, consume=True)
+        if pending is None:
+            return self._notice(steps, "clarification_closed", "这次补答已失效，请重新提交完整调度指令。")
+        _add(steps, "action", "clarify_dispatch · 本地补齐起降坪并沿用原任务约束")
+        candidate = pending.candidate
+        reply = self.parse_dispatch_intent(query)
+        if len(mentioned) == 1 and (candidate.start_id or candidate.end_id):
+            if candidate.start_id and reply.start_id is None:
+                candidate = candidate.model_copy(update={"end_id": mentioned[0]})
+            elif candidate.end_id and reply.end_id is None:
+                candidate = candidate.model_copy(update={"start_id": mentioned[0]})
+        elif len(mentioned) == 2:
+            candidate = candidate.model_copy(update={"start_id": reply.start_id, "end_id": reply.end_id})
+        if not candidate.start_id or not candidate.end_id:
+            return self._notice(steps, "clarification_closed", "补答仍缺少明确起降坪，请重新提交完整调度指令。")
+        return self._plan_dispatch(candidate, pending.constraints, pending.mode, steps, False, pending.model_fallback)
+
+    @staticmethod
+    def _notice(
+        steps: list[ThoughtStep], status: DispatchNoticeType, detail: str, *, mode: LLMMode | None = None,
+        model_called: bool = False, token: str | None = None,
+    ) -> DispatchNotice:
+        _add(steps, "observation", detail)
+        return DispatchNotice(status=status, detail=detail, thought_steps=steps, mode=mode,
+                              model_called=model_called, clarification_token=token)
+
+    def _plan_dispatch(
+        self, candidate: DispatchCandidate, constraints: DispatchConstraints, mode: LLMMode,
+        steps: list[ThoughtStep], model_called: bool, model_fallback: bool,
+    ) -> DispatchResult | DispatchNotice:
+        intent = DispatchIntent(**candidate.model_dump(), constraints=constraints)
+        try:
+            self._check_intent(intent)
+        except ValueError as exc:
+            return self._notice(steps, "constraint_conflict", str(exc), mode=mode, model_called=model_called)
 
         start_name = self.pad_names[intent.start_id]
         end_name = self.pad_names[intent.end_id]
         _add(steps, "observation", f"{intent.start_id} {start_name} → {intent.end_id} {end_name}")
         corridor = "inspection" if intent.prefer_high_altitude else intent.mission_type
         layer = MISSION_LAYERS[corridor]
+        limits = constraints.cruise
         _add(steps, "action", f"校验空域 · {layer.min_alt:g}–{layer.max_alt:g} m · {layer.name}")
+        if limits and not self.planner.cruise_levels(layer, limits):
+            return self._notice(steps, "constraint_conflict",
+                                f"当前巡航高度条件与 {layer.min_alt:g}–{layer.max_alt:g} 米航层内的可用高度不相容。",
+                                mode=mode, model_called=model_called)
         zones = "、".join(self.zone_names[zone_id] for zone_id in intent.avoid_zone_ids)
         rule = f"全高度绕开{zones}，并应用其余空域限制。" if zones else "应用建筑缓冲区和全部静态空域限制。"
         _add(steps, "observation", rule)
         _add(steps, "action", "plan_3d_route · 搜索三维体素航线并复核航段")
+        preferred = intersect_limits(limits, constraints.preferred_cruise)
         try:
+            if constraints.preferred_cruise and preferred != limits:
+                try:
+                    route = self.plan_3d_route(intent.start_id, intent.end_id, corridor,
+                                               avoid_zone_ids=intent.avoid_zone_ids, cruise_limits=preferred)
+                except NoRouteError:
+                    _add(steps, "observation", "巡航高度偏好下没有合规航线，继续按硬约束规划。")
+                else:
+                    if constraints.deadline_seconds is None or route.flight_seconds <= constraints.deadline_seconds:
+                        return self._finish_dispatch(intent, route, corridor, mode, steps, model_called, model_fallback)
+                    _add(steps, "observation", "巡航高度偏好下的候选航线超过硬时限，继续按硬约束规划。")
             route = self.plan_3d_route(
-                intent.start_id, intent.end_id, corridor, avoid_zone_ids=intent.avoid_zone_ids
+                intent.start_id, intent.end_id, corridor, avoid_zone_ids=intent.avoid_zone_ids, cruise_limits=limits,
             )
         except NoRouteError as exc:
+            if limits:
+                return self._notice(steps, "constraint_conflict", "指定巡航高度和空域限制下没有合规航线。",
+                                    mode=mode, model_called=model_called)
             raise _error(steps, "当前空域与高度层下没有合规航线。", 409) from exc
+        return self._finish_dispatch(intent, route, corridor, mode, steps, model_called, model_fallback)
+
+    def _finish_dispatch(
+        self, intent: DispatchIntent, route: AssessedRoute, corridor: MissionType, mode: LLMMode,
+        steps: list[ThoughtStep], model_called: bool, model_fallback: bool,
+    ) -> DispatchResult | DispatchNotice:
+        elapsed = route.kpis.estimated_seconds
+        deadline = intent.constraints.deadline_seconds
+        preferred_deadline = intent.constraints.preferred_deadline_seconds
+        if deadline is not None and route.flight_seconds > deadline:
+            return self._notice(steps, "constraint_conflict", f"候选航线预计 {elapsed:g} 秒，超过 {deadline:g} 秒硬时限。请放宽时限或调整起降坪。",
+                                mode=mode, model_called=model_called)
+        if preferred_deadline is not None and route.flight_seconds > preferred_deadline:
+            _add(steps, "observation", f"预计飞行 {elapsed:g} 秒，超过偏好的 {preferred_deadline:g} 秒。")
         _add(steps, "observation", f"规划成功，{len(route.waypoints)} 个航点，{route.distance_m:.0f} m。")
         return DispatchResult(
-            intent=intent, mode=mode, corridor=corridor, start_name=start_name, end_name=end_name,
+            intent=intent, mode=mode, model_called=model_called, model_fallback=model_fallback,
+            corridor=corridor, start_name=self.pad_names[intent.start_id], end_name=self.pad_names[intent.end_id],
             waypoints=route.waypoints, kpis=route.kpis, thought_steps=steps,
         )
 
@@ -268,12 +465,21 @@ class DispatchAgent:
             else:
                 _add(steps, "action", f"plan_3d_route · 从当前坐标绕飞至 {target}")
                 route = self.plan_3d_route(
-                    request.current_pos, target, corridor, hazards, avoid_zone_ids=request.avoid_zone_ids
+                    request.current_pos, target, corridor, hazards, avoid_zone_ids=request.avoid_zone_ids,
+                    cruise_limits=request.cruise_limits,
                 )
         except NoRouteError as exc:
             raise _error(steps, "当前位置和空域限制下没有合规应急航线。", 409) from exc
 
         _add(steps, "observation", f"新航线已通过空域校验，剩余航程 {route.distance_m:.0f} m。")
+        deadline = request.remaining_deadline_seconds
+        if deadline is not None:
+            if request.emergency_type == "low_battery":
+                _add(steps, "observation", "原送达任务因低电量转为备降，原时限停止计入。")
+            elif route.flight_seconds > deadline:
+                _add(steps, "observation", "绕飞预计超出原任务剩余时限，优先采用合规应急航线。")
+            else:
+                _add(steps, "observation", "绕飞预计仍可在原任务剩余时限内完成。")
         return ReplanResult(
             emergency_type=request.emergency_type, original_target_id=request.target_id, target_id=target,
             corridor=corridor, waypoints=route.waypoints, kpis=route.kpis, thought_steps=steps,
@@ -294,7 +500,7 @@ class DispatchAgent:
                     try:
                         route = self.plan_3d_route(
                             request.current_pos, pad_id, candidate_layer, hazards,
-                            avoid_zone_ids=request.avoid_zone_ids,
+                            avoid_zone_ids=request.avoid_zone_ids, cruise_limits=request.cruise_limits,
                         )
                     except NoRouteError:
                         continue
@@ -311,7 +517,7 @@ class DispatchAgent:
         end_id: str,
         hazards: tuple[DynamicHazard, ...],
         avoid_zone_ids: tuple[str, ...],
-    ) -> RouteKPIs:
+    ) -> tuple[RouteKPIs, float]:
         start_roof = self.airspace.vertiports[start].roof_obstacle if isinstance(start, str) else None
         end_roof = self.airspace.vertiports[end_id].roof_obstacle
         positions = [self.airspace.frame.to_local(point) for point in route.waypoints]
@@ -326,7 +532,7 @@ class DispatchAgent:
         first, last = positions[0], positions[-1]
         ground_route = hypot(last[0] - first[0], last[1] - first[1]) * GROUND_DETOUR_FACTOR
         ground_time = ground_route / GROUND_SPEED_MPS
-        return RouteKPIs(
+        kpis = RouteKPIs(
             distance_m=round(route.distance_m, 2),
             estimated_seconds=round(elapsed, 2),
             ground_estimated_seconds=round(ground_time, 2),
@@ -335,3 +541,4 @@ class DispatchAgent:
             compliant=True,
             compliance_percent=100,
         )
+        return kpis, elapsed

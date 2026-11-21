@@ -15,6 +15,9 @@ MissionType = Literal["delivery", "inspection"]
 FlightPhase = Literal["takeoff", "cruise", "landing", "transition"]
 EmergencyType = Literal["wind_gust", "temp_nofly", "low_battery"]
 LLMMode = Literal["live_llm", "fallback_mock"]
+DispatchNoticeType = Literal[
+    "help", "out_of_scope", "needs_intent", "needs_clarification", "clarification_closed", "constraint_conflict",
+]
 
 
 class FeatureProperties(BaseModel, frozen=True):
@@ -79,18 +82,46 @@ class RoutePlan(BaseModel):
     distance_m: NonnegativeMeters
 
 
+class CruiseLimits(BaseModel, frozen=True):
+    min_alt: NonnegativeMeters | None = None
+    max_alt: NonnegativeMeters | None = None
+    min_exclusive: bool = False
+    max_exclusive: bool = False
+
+    def allows(self, altitude: float) -> bool:
+        if self.min_alt is not None and (altitude < self.min_alt or self.min_exclusive and altitude == self.min_alt):
+            return False
+        if self.max_alt is not None and (altitude > self.max_alt or self.max_exclusive and altitude == self.max_alt):
+            return False
+        return True
+
+
+class DispatchConstraints(BaseModel, frozen=True):
+    cruise: CruiseLimits | None = None
+    deadline_seconds: NonnegativeMeters | None = None
+    preferred_cruise: CruiseLimits | None = None
+    preferred_deadline_seconds: NonnegativeMeters | None = None
+
+
 class DispatchRequest(BaseModel):
     query: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=500)]
     scene_version: str | None = None
+    clarification_token: Annotated[str, StringConstraints(min_length=1, max_length=80)] | None = None
 
 
-class DispatchIntent(BaseModel):
+class DispatchCandidate(BaseModel):
     mission_type: MissionType
-    start_id: NonemptyString
-    end_id: NonemptyString
+    start_id: NonemptyString | None = None
+    end_id: NonemptyString | None = None
     avoid_zone_ids: tuple[str, ...] = ()
     priority: Literal["normal", "urgent"] = "normal"
     prefer_high_altitude: bool = False
+
+
+class DispatchIntent(DispatchCandidate):
+    start_id: NonemptyString
+    end_id: NonemptyString
+    constraints: DispatchConstraints = Field(default_factory=DispatchConstraints)
 
 
 class ReplanRequest(BaseModel):
@@ -102,6 +133,8 @@ class ReplanRequest(BaseModel):
     active_hazards: Annotated[tuple[DynamicHazard, ...], Field(max_length=20)] = ()
     avoid_zone_ids: Annotated[tuple[str, ...], Field(max_length=20)] = ()
     scene_version: str | None = None
+    cruise_limits: CruiseLimits | None = None
+    remaining_deadline_seconds: FiniteFloat | None = None
 
     @model_validator(mode="after")
     def check_hazard(self) -> ReplanRequest:
@@ -128,6 +161,7 @@ class RouteKPIs(BaseModel):
 
 class AssessedRoute(RoutePlan):
     kpis: RouteKPIs
+    flight_seconds: NonnegativeMeters
 
 
 class MissionResult(BaseModel):
@@ -139,10 +173,23 @@ class MissionResult(BaseModel):
 
 
 class DispatchResult(MissionResult):
+    status: Literal["planned"] = "planned"
     mode: LLMMode
+    model_called: bool = False
+    model_fallback: bool = False
     intent: DispatchIntent
     start_name: str
     end_name: str
+
+
+class DispatchNotice(BaseModel):
+    status: DispatchNoticeType
+    detail: str
+    thought_steps: list[ThoughtStep]
+    mode: LLMMode | None = None
+    model_called: bool = False
+    clarification_token: str | None = None
+    scene_version: str | None = None
 
 
 class HazardPolygon(BaseModel):

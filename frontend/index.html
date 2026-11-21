@@ -94,7 +94,22 @@
       </div>
     </div>
     <aside class="dispatch glass panel" aria-labelledby="dispatch-heading">
-      <div class="panel-heading"><h2 id="dispatch-heading">Agent 调度</h2><span id="mode" class="pill">连接中</span></div>
+      <div class="panel-heading">
+        <h2 id="dispatch-heading">Agent 调度</h2>
+        <div class="dispatch-tools">
+          <span id="mode" class="pill">连接中</span>
+          <button id="agent-help" type="button" popovertarget="agent-welcome">使用帮助</button>
+        </div>
+      </div>
+      <section id="agent-welcome" class="glass welcome" aria-labelledby="welcome-heading" hidden>
+        <h3 id="welcome-heading">欢迎使用 VoxAero</h3>
+        <p>在武大信息学部仿真场景中，我可以规划无人机配送和巡检。请告诉我从哪里起飞、去哪里，以及绕飞、巡航限高或送达时限。</p>
+        <div class="welcome-actions" role="group" aria-label="调度指引">
+          <button type="button" data-welcome-example="delivery">配送示例</button>
+          <button type="button" data-welcome-example="inspection">巡检示例</button>
+          <button type="button" id="welcome-close">关闭指引</button>
+        </div>
+      </section>
       <div class="presets" role="group" aria-label="一键演示">
         <button type="button" data-preset="delivery" disabled>中午配送</button>
         <button type="button" data-preset="inspection" disabled>夜间巡检</button>
@@ -104,7 +119,10 @@
         <p class="chat-empty">输入起降坪和任务要求，或选择上方演示。</p>
       </div>
       <form id="dispatch-form">
-        <label for="query">调度指令</label>
+        <div class="dispatch-prompt">
+          <label for="query">调度指令</label>
+          <button id="clear-clarification" type="button" hidden>另起任务</button>
+        </div>
         <textarea id="query" rows="2" maxlength="500" required placeholder="例如：从 VP01 巡检至 VP04"></textarea>
         <p id="dispatch-status" class="feedback" role="status"></p>
         <button id="submit" type="submit" class="primary" disabled>规划航线</button>

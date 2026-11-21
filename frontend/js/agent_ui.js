@@ -6,31 +6,83 @@ const PRESETS = {
 const ROLES = { thought: "任务", action: "调用", observation: "结果" };
 
 export class AgentUI {
-  constructor(dispatch) {
+  constructor(dispatch, clearClarification) {
     this.mode = document.getElementById("mode");
     this.input = document.getElementById("query");
     this.form = document.getElementById("dispatch-form");
     this.conversation = document.getElementById("conversation");
     this.feedback = document.getElementById("dispatch-status");
     this.submit = this.form.querySelector("#submit");
+    this.clear = document.getElementById("clear-clarification");
+    this.clear.addEventListener("click", clearClarification);
     this.presets = [...document.querySelectorAll("[data-preset]")];
     for (const button of this.presets) {
       button.addEventListener("click", () => {
         const preset = button.dataset.preset;
         this.input.value = PRESETS[preset];
-        dispatch(this.input.value, preset === "emergency");
+        dispatch(this.input.value, { newTask: true, autoPlay: preset === "emergency" });
       });
     }
     this.form.addEventListener("submit", (event) => {
       event.preventDefault();
       const query = this.input.value.trim();
-      if (query) dispatch(query, false);
+      if (query) dispatch(query);
       else this.status("请输入起降坪与任务要求。", true);
     });
+    this.setupWelcome();
+  }
+
+  setupWelcome() {
+    const panel = document.getElementById("agent-welcome");
+    const help = document.getElementById("agent-help");
+    const nativePopover = "popover" in HTMLElement.prototype;
+    const hide = () => {
+      if (nativePopover) panel.hidePopover();
+      else panel.hidden = true;
+    };
+    const show = () => {
+      if (nativePopover) panel.showPopover();
+      else panel.hidden = false;
+    };
+    if (nativePopover) {
+      panel.popover = "auto";
+      panel.hidden = false;
+    } else {
+      help.setAttribute("aria-controls", panel.id);
+      help.addEventListener("click", () => { if (panel.hidden) show(); else hide(); });
+      panel.addEventListener("keydown", (event) => {
+        if (event.key === "Escape") {
+          hide();
+          help.focus();
+        }
+      });
+    }
+    document.getElementById("welcome-close").addEventListener("click", () => { hide(); help.focus(); });
+    for (const button of panel.querySelectorAll("[data-welcome-example]")) {
+      button.addEventListener("click", () => {
+        this.clear.click();
+        this.input.value = PRESETS[button.dataset.welcomeExample];
+        hide();
+        this.input.focus();
+      });
+    }
+    let firstVisit = true;
+    try {
+      firstVisit = !sessionStorage.getItem("voxaero-welcome-shown");
+      sessionStorage.setItem("voxaero-welcome-shown", "1");
+    } catch { /* Storage may be unavailable in a private preview. */ }
+    if (firstVisit) show();
+  }
+
+  setClarification(active) {
+    this.clear.hidden = !active;
+    this.submit.textContent = active ? "提交补答" : "规划航线";
+    this.input.placeholder = active ? "例如：食堂" : "例如：从 VP01 巡检至 VP04";
   }
 
   setAvailable(available) {
     this.submit.disabled = !available;
+    this.clear.disabled = !available;
     for (const button of this.presets) button.disabled = !available;
   }
 

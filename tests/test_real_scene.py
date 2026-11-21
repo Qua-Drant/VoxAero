@@ -110,6 +110,27 @@ def test_real_dispatch_routes_and_version(scene, client, query, destination, lay
     assert stale.status_code == 409 and "刷新" in stale.json()["detail"]
 
 
+def test_real_dispatch_respects_cruise_and_time_constraints(scene, client):
+    base = "从食堂把午餐送到测国重楼顶，避开图书馆禁飞区"
+    planned = client.post("/api/agent/dispatch", json={"query": base + "，不要飞高空，巡航不要高于 50 米"})
+    assert planned.status_code == 200, planned.text
+    plan = DispatchResult.model_validate(planned.json())
+    assert plan.corridor == "delivery" and plan.intent.constraints.cruise.max_alt == 50
+    field, _ = scene.with_hazards((), plan.intent.avoid_zone_ids)
+    _verify_api_route(plan, scene, "VP01", "VP03", field)
+    assert all(max(a.alt, b.alt) <= 50 for a, b in pairwise(plan.waypoints) if b.phase == "cruise")
+
+    for suffix, reason in (("巡航必须低于二十米", "30–60"), ("必须在10秒内送达", "超过 10 秒")):
+        response = client.post("/api/agent/dispatch", json={"query": base + "，" + suffix})
+        body = response.json()
+        assert response.status_code == 409 and body["status"] == "constraint_conflict", body
+        assert "waypoints" not in body and reason in body["detail"]
+
+    preferred = client.post("/api/agent/dispatch", json={"query": base + "，尽量 10 秒内送到"})
+    assert preferred.status_code == 200 and preferred.json()["intent"]["constraints"]["deadline_seconds"] is None
+    assert any("超过偏好" in step["content"] for step in preferred.json()["thought_steps"])
+
+
 @pytest.fixture(scope="module")
 def real_detour(scene):
     baseline = RoutePlanner(scene).plan_3d_route("VP04", "VP05", "inspection")
@@ -133,6 +154,14 @@ def test_real_temporary_restriction_and_diversion(scene, client, real_detour, em
     assert detour.target_id == "VP05" and detour.temporary_nofly_zone
     assert detour.scene_version == scene.scene_version
     _verify_api_route(detour, scene, current, "VP05", changed)
+    limited = client.post("/api/agent/replan", json={
+        **request, "emergency_type": emergency_type, "dynamic_hazard": hazard.model_dump(),
+        "cruise_limits": {"min_alt": 65, "max_alt": 85}, "remaining_deadline_seconds": 0,
+    })
+    assert limited.status_code == 200, limited.text
+    limited_route = ReplanResult.model_validate(limited.json())
+    assert all(65 <= p.alt <= 85 for p in limited_route.waypoints if p.phase == "cruise")
+    assert any("超出原任务剩余时限" in step.content for step in limited_route.thought_steps)
     battery = client.post("/api/agent/replan", json={
         **request, "target_id": "VP03", "emergency_type": "low_battery",
         "active_hazards": [hazard.model_dump()],

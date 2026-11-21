@@ -16,7 +16,7 @@ from backend.config import (
     AirspaceLayer,
 )
 from backend.core.airspace import Airspace, LocalPoint, Obstacle, ObstacleField, Vertiport, Voxel
-from backend.schemas import DynamicHazard, FlightPhase, MissionType, Position, RoutePlan, Waypoint
+from backend.schemas import CruiseLimits, DynamicHazard, FlightPhase, MissionType, Position, RoutePlan, Waypoint
 
 
 class NoRouteError(ValueError):
@@ -42,6 +42,7 @@ class RoutePlanner:
         extra_nofly_zones: tuple[DynamicHazard, ...] = (),
         *,
         avoid_zone_ids: tuple[str, ...] = (),
+        cruise_limits: CruiseLimits | None = None,
     ) -> RoutePlan:
         """Plan from a vertiport ID or an airborne WGS84 position to a vertiport."""
         if mission_type not in MISSION_LAYERS:
@@ -73,12 +74,10 @@ class RoutePlanner:
             if not (west <= x <= east and south <= y <= north and 0 <= z <= CEILING_M):
                 raise NoRouteError("Route endpoints must be inside the planning volume")
 
+        levels = self.cruise_levels(layer, cruise_limits)
+        if not levels:
+            raise NoRouteError("No grid levels satisfy the cruise altitude limits")
         field, blocked = self.airspace.with_hazards(extra_nofly_zones, avoid_zone_ids)
-        levels = tuple(
-            k
-            for k in range(self.grid.shape[2])
-            if layer.min_alt <= self.grid.center((0, 0, k))[2] <= layer.max_alt
-        )
         starts = self._attachments(start_point, levels, field, blocked, origin_roof, origin_is_pad)
         goals = self._attachments(end_point, levels, field, blocked, end_pad.roof_obstacle, True)
         if not starts or not goals:
@@ -112,6 +111,13 @@ class RoutePlanner:
             waypoints.append(Waypoint(lon=lon, lat=lat, alt=point[2], phase=phase))
         length = sum(dist(a, b) for (a, _), (b, _) in pairwise(points))
         return RoutePlan(waypoints=waypoints, distance_m=length)
+
+    def cruise_levels(self, layer: AirspaceLayer, limits: CruiseLimits | None = None) -> tuple[int, ...]:
+        return tuple(
+            index for index in range(self.grid.shape[2])
+            if layer.min_alt <= (altitude := self.grid.center((0, 0, index))[2]) <= layer.max_alt
+            and (limits is None or limits.allows(altitude))
+        )
 
     def _pad(self, pad_id: str) -> Vertiport:
         try:
