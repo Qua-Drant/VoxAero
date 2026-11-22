@@ -16,8 +16,8 @@ from shapely.geometry.polygon import orient
 from backend.config import LLMSettings, MISSION_LAYERS
 from backend.core.airspace import Airspace, Obstacle
 from backend.core.intent import (
-    CHAT, CLARIFY_INTENT_MESSAGE, DISPATCH_WORDS, HELP, HELP_MESSAGE, LOW_FLIGHT, ROUTE_WORDS,
-    SCOPE_MESSAGE, UNSUPPORTED_WAYPOINT, intersect_limits, parse_constraints,
+    ALT_CONTEXT, CHAT, CLARIFY_INTENT_MESSAGE, DEADLINE, DISPATCH_WORDS, HELP, HELP_MESSAGE, LOW_FLIGHT, MEASUREMENT,
+    ROUTE_WORDS, SCOPE_MESSAGE, UNSUPPORTED_WAYPOINT, intersect_limits, parse_constraints,
 )
 from backend.core.planner import NoRouteError, RoutePlanner
 from backend.schemas import (
@@ -37,8 +37,12 @@ PAD_ALIASES = {
 AVOID_PATTERN = re.compile(
     r"(?:避开|绕开|绕过|\bavoid\b)\s*([^，。；,;]+?)(?=[，。；,;]|从|由|\bfrom\b|$)", re.IGNORECASE
 )
-SOURCE_PREFIX = re.compile(r"(?:从|由|\bfrom)\s*$", re.IGNORECASE)
-TARGET_PREFIX = re.compile(r"(?:到|至|前往|飞往|抵达|送往|去|→|->|\bto)\s*$", re.IGNORECASE)
+SOURCE_PREFIX = re.compile(r"(?:从|由|\bfrom|(?:起点|出发点)(?:设在|在|是|为|[:：]))\s*$", re.IGNORECASE)
+TARGET_PREFIX = re.compile(
+    r"(?:到|至|前往|飞往|抵达|送往|去|→|->|\bto|(?:终点|目的地)(?:设在|在|是|为|[:：]))\s*$", re.IGNORECASE,
+)
+SOURCE_SUFFIX = re.compile(r"\s*(?:起飞|出发|(?:作为|设为|是|为)\s*(?:起点|出发点))")
+TARGET_SUFFIX = re.compile(r"\s*(?:作为|设为|是|为)\s*(?:终点|目的地)")
 INSPECTION_PATTERN = re.compile(r"巡检|巡逻|安防|\b(?:inspection|inspect|patrol)\b", re.IGNORECASE)
 DELIVERY_PATTERN = re.compile(r"配送|送(?:到|往|至|餐|件|货)|投送|\bdeliver\w*\b", re.IGNORECASE)
 HIGH_PATTERN = re.compile(r"优先高空|高空|60\s*[-–—~至]\s*90|high.altitude", re.IGNORECASE)
@@ -129,9 +133,10 @@ class DispatchAgent:
         for match in self.pad_pattern.finditer(locations):
             pad = self.pad_aliases[match[0].casefold()]
             prefix = locations[:match.start()]
-            if SOURCE_PREFIX.search(prefix) or re.match(r"\s*(?:起飞|出发)", locations[match.end():]):
+            suffix = locations[match.end():]
+            if SOURCE_PREFIX.search(prefix) or SOURCE_SUFFIX.match(suffix):
                 starts.add(pad)
-            if TARGET_PREFIX.search(prefix):
+            if TARGET_PREFIX.search(prefix) or TARGET_SUFFIX.match(suffix):
                 ends.add(pad)
         start = next(iter(starts)) if len(starts) == 1 else None
         end = next(iter(ends)) if len(ends) == 1 else None
@@ -176,8 +181,8 @@ class DispatchAgent:
         prompt = (
             "Call the intent tool once using valid IDs. Use null for missing or ambiguous endpoints and never guess. "
             "Interpret 信息学部起飞 as VP01 when available. Negative wording such as 不要飞高空 is not a high-altitude preference. "
-            "For cruise_requirement and deadline_requirement, quote the complete relevant user phrase verbatim, "
-            "or use null when absent. Include comparators, units and any preference or obligation. "
+            "For cruise_requirement quote only an altitude request; for deadline_requirement quote only a time request. "
+            "Quote the complete relevant phrase verbatim, or use null when absent. Include comparators, units and any preference or obligation. "
             f"Vertiports: {self.pad_names}. No-fly zones: {self.zone_names}. "
             "Avoidance applies only to explicitly requested zones. Preserve the requested mission type."
         )
@@ -293,7 +298,11 @@ class DispatchAgent:
             except (OpenAIError, ValueError):
                 _add(steps, "observation", "模型调用失败或参数不合规，切换至本地规则。")
             else:
-                if model.cruise_requirement and model.cruise_requirement in query and not (
+                altitude_quote = model.cruise_requirement
+                if altitude_quote and altitude_quote in query and (
+                    MEASUREMENT.search(altitude_quote)
+                    or (ALT_CONTEXT.search(altitude_quote) and not DEADLINE.search(altitude_quote))
+                ) and not (
                     constraints.cruise or constraints.preferred_cruise or LOW_FLIGHT.search(query)
                     or HIGH_PATTERN.search(query)
                 ):

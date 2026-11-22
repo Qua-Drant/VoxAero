@@ -400,8 +400,22 @@ def test_low_battery_can_use_regular_pad_when_emergency_pads_are_closed(airspace
     _verify_api_route(result, airspace, origin, result.target_id, airspace.with_hazards(tuple(hazards))[0])
 
 
-@pytest.mark.parametrize("scenario", ["function_call", "timeout", "invalid_tool", "invalid_payload"])
+@pytest.mark.parametrize(("query", "start", "end"), [
+    ("目的地是菜鸟驿站，起点是食堂，安排一次配送", "VP01", "VP02"),
+    ("终点设在图书馆西侧，星湖备降坪是起点，做一次巡检", "VP05", "VP04"),
+])
+def test_dispatch_prefers_explicit_pad_roles_to_mention_order(client, query, start, end):
+    response = client.post("/api/agent/dispatch", json={"query": query})
+    assert response.status_code == 200, response.text
+    intent = DispatchResult.model_validate(response.json()).intent
+    assert (intent.start_id, intent.end_id) == (start, end)
+
+
+@pytest.mark.parametrize("scenario", ["function_call", "deadline_in_cruise_field", "timeout", "invalid_tool", "invalid_payload"])
 def test_openai_compatible_intent_and_fallback(scenario):
+    successful = scenario in {"function_call", "deadline_in_cruise_field"}
+    mistyped_quote = "尽量 10 秒内送达"
+
     def respond(request):
         assert request.url.path == "/v1/chat/completions"
         body = json.loads(request.content)
@@ -413,9 +427,11 @@ def test_openai_compatible_intent_and_fallback(scenario):
         if scenario == "invalid_payload":
             return httpx.Response(200, text="<html>Provider gateway</html>")
         arguments = {
-            "start_id": "VP01", "end_id": "VP03" if scenario == "function_call" else "unknown",
+            "start_id": "VP01", "end_id": "VP03" if successful else "unknown",
             "mission_type": "delivery",
         }
+        if scenario == "deadline_in_cruise_field":
+            arguments["cruise_requirement"] = mistyped_quote
         return httpx.Response(200, json={
             "id": "chatcmpl-test", "object": "chat.completion", "created": 0, "model": "test-model",
             "choices": [{"index": 0, "finish_reason": "tool_calls", "message": {
@@ -432,14 +448,18 @@ def test_openai_compatible_intent_and_fallback(scenario):
                 http_client=httpx.Client(transport=transport)) as sdk:
         with TestClient(create_app(settings, llm_client=sdk, directory=MOCK_DATA)) as api:
             assert api.get("/api/health").json()["llm_mode"] == "live_llm"
-            response = api.post("/api/agent/dispatch", json={"query": DELIVERY_QUERY})
+            query = DELIVERY_QUERY + ("，" + mistyped_quote if scenario == "deadline_in_cruise_field" else "")
+            response = api.post("/api/agent/dispatch", json={"query": query})
     assert response.status_code == 200, response.text
     result = DispatchResult.model_validate(response.json())
-    assert result.mode == ("live_llm" if scenario == "function_call" else "fallback_mock")
-    assert result.model_called and result.model_fallback == (scenario != "function_call")
+    assert result.mode == ("live_llm" if successful else "fallback_mock")
+    assert result.model_called and result.model_fallback == (not successful)
     assert result.intent.avoid_zone_ids == ("NFZ01",) and result.intent.end_id == "VP03"
-    if scenario != "function_call":
+    if not successful:
         assert any("切换至本地规则" in event.content for event in result.thought_steps)
+    if scenario == "deadline_in_cruise_field":
+        assert result.intent.constraints.preferred_deadline_seconds == 10
+        assert result.intent.constraints.cruise is None
 
 
 def test_dispatch_classification_and_grounded_one_turn_tool_workflow():
