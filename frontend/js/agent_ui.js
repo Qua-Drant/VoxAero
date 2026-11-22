@@ -144,6 +144,7 @@ export class AgentUI {
 
   showGuide(show) {
     this.guide.hidden = !show;
+    this.form.closest(".dispatch").toggleAttribute("data-guide", show);
     this.help.setAttribute("aria-expanded", String(show));
   }
 
@@ -156,10 +157,12 @@ export class AgentUI {
     const element = this.exchangeTemplate.content.cloneNode(true).firstElementChild;
     const part = (name) => element.querySelector(`[data-exchange="${name}"]`);
     const exchange = { element, part, body: null, ok: false };
-    const toggle = part("trace").querySelector("summary");
-    toggle.setAttribute("aria-disabled", "true");
-    toggle.addEventListener("click", (event) => {
-      if (toggle.getAttribute("aria-disabled") === "true") event.preventDefault();
+    part("trace").addEventListener("click", () => {
+      const open = part("trace").getAttribute("aria-expanded") !== "true";
+      part("trace").setAttribute("aria-expanded", String(open));
+      part("summary").hidden = open;
+      part("steps").hidden = !open;
+      part("trace-title").textContent = open ? "返回摘要" : `展开 ${exchange.total} 步详情`;
     });
     element.dataset.pending = "";
     this.messages.replaceChildren(element);
@@ -203,8 +206,9 @@ export class AgentUI {
     const count = part("count");
     const planned = body?.kpis?.compliant && (body.status === "planned" || Boolean(body.emergency_type));
     const reduced = matchMedia("(prefers-reduced-motion: reduce)").matches;
+    exchange.total = steps.length;
     part("trace-title").textContent = steps.length ? `展开 ${steps.length} 步详情` : "无步骤";
-    part("trace").querySelector("summary").setAttribute("aria-disabled", String(!steps.length));
+    part("trace").disabled = !steps.length;
     this.setTraceProgress(exchange, steps.length, 0);
     if (steps.length) count.textContent = `0/${steps.length}`;
     else if (count.textContent === "已收到回复") count.textContent = "已处理";
@@ -213,34 +217,34 @@ export class AgentUI {
       if (!element.isConnected) return;
       const [label, detail] = readableStep(step);
       const row = document.createElement("li");
+      const number = document.createElement("span");
+      number.className = "mono";
+      number.textContent = String(index + 1).padStart(2, "0");
       const title = document.createElement("b");
-      title.textContent = `${String(index + 1).padStart(2, "0")}  ${label}`;
+      title.textContent = label;
       const text = document.createElement("p");
       text.textContent = detail;
-      row.append(title, text);
+      row.append(number, title, text);
       list.append(row);
       this.setTraceProgress(exchange, steps.length, index + 1);
       count.textContent = `${index + 1}/${steps.length}`;
-      part("trace-title").textContent = part("trace").open ? "收起详情" : `展开 ${steps.length} 步详情`;
       this.setTraceSummary(exchange, [[label, detail]]);
     }
     delete element.dataset.pending;
     if (steps.length) {
       count.textContent = `${steps.length}/${steps.length} ${ok && planned ? "通过" : "已处理"}`;
-      part("trace").addEventListener("toggle", () => {
-        part("trace-title").textContent = part("trace").open ? "收起详情" : `展开 ${steps.length} 步详情`;
-      });
+      if (ok && planned) element.dataset.passed = "";
     }
     if (planned && ok) {
       const { kpis, intent } = body;
       const corridor = CORRIDORS[body.corridor];
       const constraints = intent ? planRequirements(body, zoneNames) : [];
-      const checked = constraints[0]?.text;
+      const checked = constraints.find(({ text }) => text.includes("避让") || text.includes("时限"));
       this.setTraceSummary(exchange, [
         ["指令解析", intent
           ? `确认${intent.mission_type === "inspection" ? "巡检" : "配送"}任务 · ${intent.start_id} → ${intent.end_id}`
           : `重新研判当前机位与目的地 ${body.target_id}`],
-        ["约束核验", checked ? `${corridor} · ${checked}` : `锁定 ${corridor} 并绕飞禁飞区`],
+        ["约束核验", checked?.text ?? `航层 ${corridor} · 避开禁飞区`],
         ["航线生成", `生成 ${decimal(kpis.distance_m)} m 避障三维航迹`],
       ]);
     } else if (body?.detail) {
@@ -307,7 +311,7 @@ export class AgentUI {
     this.setPlanEndpoint("end", target, targetName);
     part("corridor").textContent = CORRIDORS[result.corridor];
     part("compliance").textContent = kpis.compliant
-      ? `● ${Math.round(kpis.compliance_percent)}% · 校验 ${zoneNames.size + (result.temporary_nofly_zone ? 1 : 0)} 区` : "未通过";
+      ? `${Math.round(kpis.compliance_percent)}% · 校验 ${zoneNames.size + (result.temporary_nofly_zone ? 1 : 0)} 区` : "未通过";
     part("clearance").textContent = kpis.min_clearance_m == null ? "—" : `≥ ${(Math.floor(kpis.min_clearance_m * 10) / 10).toFixed(1)} m`;
     part("clearance").title = "规划航段距最近建筑或禁飞区包络的最小净空";
     part("source").textContent = !intent ? "本地应急规划" : result.model_fallback ? "本地规则兜底"
@@ -315,7 +319,7 @@ export class AgentUI {
     part("kpis").textContent = `规划航程 ${decimal(kpis.distance_m)} m · 预计 ${decimal(kpis.estimated_seconds)} s`;
   }
 
-  setMissionState(label, tone = "normal") {
+  setMissionState(label, tone = "neutral") {
     const state = this.plan?.part("state");
     if (!state) return;
     state.textContent = label;
@@ -324,7 +328,7 @@ export class AgentUI {
 
   acceptPlan() {
     this.activePlan = this.plan;
-    this.setMissionState("已确认 · 执行中");
+    this.setMissionState("已确认 · 执行中", "vector");
     this.plan.part("actions").hidden = true;
   }
 

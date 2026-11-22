@@ -1,10 +1,10 @@
-import { CampusMap } from "./map3d.js?v=10";
+import { CampusMap } from "./map3d.js?v=11";
 import { DroneSim } from "./drone_sim.js?v=8";
-import { FlightReplay, flightClock } from "./flight_replay.js?v=8";
-import { FlightHUD } from "./ar_hud.js?v=8";
-import { AgentUI, plainDispatchText } from "./agent_ui.js?v=10";
+import { FlightReplay, flightClock } from "./flight_replay.js?v=11";
+import { FlightHUD } from "./ar_hud.js?v=11";
+import { AgentUI, plainDispatchText } from "./agent_ui.js?v=11";
 
-import { VerticalProfile } from "./flight_profile.js";
+import { VerticalProfile } from "./flight_profile.js?v=11";
 
 const element = (id) => document.getElementById(id);
 const layerToggles = [...document.querySelectorAll("[data-layer]")];
@@ -160,12 +160,15 @@ function flightState() {
 
 function refreshFlightState() {
   text("flight-state", flightState());
-  element("flight-state").dataset.tone = mission?.hold ? "error" : busy || mission?.diverted ? "warn" : "normal";
+  const moving = frame?.playing && !frame.onGround && !review?.active;
+  const tone = busy === "replan" || mission?.hold || (moving && mission?.rerouted) ? "warn"
+    : busy === "dispatch" ? "vector" : moving ? frame.instrumentTone : "neutral";
+  element("flight-state").dataset.tone = tone;
   if (!review?.active && mission && !draft && busy !== "dispatch") {
     const state = busy === "replan" ? "应急 · 改航中" : mission.hold ? "应急 · 悬停"
       : frame?.complete ? (mission.diverted ? "已备降" : "任务完成")
         : frame?.playing ? "已确认 · 执行中" : frame?.elapsed ? "任务已暂停" : "已确认 · 待起飞";
-    ui.setMissionState(state, busy === "replan" || mission.hold ? "warn" : "normal");
+    ui.setMissionState(state, tone);
   }
   updateControls();
 }
@@ -178,13 +181,12 @@ function onFrame(next) {
   if (!next.playing || next.playing !== previous?.playing || next.leg !== previous?.leg
       || now - lastTelemetry >= 120 || next.elapsed < previous?.elapsed) {
     lastTelemetry = now;
-    clearance = map.clearance(next.coordinates, mission.avoid);
-    profile.paint(next, clearance);
+    clearance = next.onGround ? null : map.clearance(next.coordinates, mission.avoid);
   }
   paintTelemetry(next, sim);
-  setFlightProgress(mission.elapsedBeforeSegment + next.elapsed, mission.elapsedBeforeSegment + next.duration, next.leg.phase);
+  setFlightProgress(mission.elapsedBeforeSegment + next.elapsed, mission.elapsedBeforeSegment + next.duration, next.onGround ? null : next.leg.phase);
   if (next.complete && !previous?.complete) {
-    const outcome = mission.diverted ? "已备降 · 原任务终止" : "已抵达 · 任务完成";
+    const outcome = mission.diverted ? "已备降 · 原任务终止" : "任务完成";
     saveReview(next, outcome, mission.diverted ? "已备降" : "已抵达");
     ui.status(outcome + "。");
   }
@@ -196,9 +198,13 @@ function onFrame(next) {
 
 function measurement(id, value, unit) {
   const target = element(id);
-  const number = format.format(value);
+  const number = value == null ? "—" : format.format(value);
   if (target.dataset.value === number) return;
   target.dataset.value = number;
+  if (value == null) {
+    target.textContent = number;
+    return;
+  }
   const label = document.createElement("span");
   label.className = "unit";
   label.textContent = unit;
@@ -211,16 +217,24 @@ function paintTelemetry(next, currentSim) {
   const seconds = leg.end - leg.start;
   const heading = Math.round((Cesium.Math.toDegrees(currentSim.heading ?? 0) + 360) % 360) % 360;
   const vertical = moving ? leg.dz / seconds : 0;
-  measurement("altitude", coordinates.alt, "m");
+  next.agl = map.altitudeAGL(coordinates);
+  next.altitudeText = format.format(next.agl) + " m";
+  const lowClearance = !next.onGround && clearance !== null && clearance < 12;
+  const flightActive = next.playing || review?.playing;
+  const warning = lowClearance || (!review?.active && mission?.hold);
+  next.instrumentTone = next.onGround ? "neutral" : warning ? "warn"
+    : !flightActive ? "neutral" : leg.phase === "cruise" ? "normal" : "vector";
+  element("altitude").closest(".flight-board").dataset.tone = next.instrumentTone;
+  measurement("altitude", next.agl, "m");
   measurement("speed", moving ? leg.horizontal / seconds : 0, "m/s");
   text("charge", Math.round(battery) + " %");
-  if (clearance !== null) measurement("clearance", clearance, "m");
-  const lowClearance = !next.onGround && clearance !== null && clearance < 12;
-  element("clearance").dataset.alert = lowClearance;
-  text("clearance-status", lowClearance ? "● 净空偏低" : "● 距最近障碍物");
-  element("clearance-status").dataset.alert = lowClearance;
-  element("charge").dataset.alert = battery < 18;
-  element("battery-meter").dataset.alert = battery < 18;
+  measurement("clearance", next.onGround ? null : clearance, "m");
+  element("clearance").dataset.tone = lowClearance ? "warn" : "neutral";
+  text("clearance-status", next.onGround ? "地面停机" : clearance === null ? "等待净空数据"
+    : lowClearance ? "净空偏低" : "距最近障碍物");
+  element("clearance-status").dataset.tone = next.onGround || clearance === null ? "neutral" : next.instrumentTone;
+  element("charge").dataset.alert = !next.onGround && battery < 18;
+  element("battery-meter").dataset.alert = !next.onGround && battery < 18;
   Array.from(element("battery-meter").children).forEach((bar, index) => bar.toggleAttribute("data-lit", index < Math.ceil(battery / 20)));
   text("vertical-speed", vertical > .05 ? `↑ 爬升 +${format.format(vertical)} m/s`
     : vertical < -.05 ? `↓ 下降 ${format.format(vertical)} m/s` : "垂直速度 0.0 m/s");
@@ -229,7 +243,9 @@ function paintTelemetry(next, currentSim) {
     + Math.hypot(step.horizontal, step.dz) * (step.end - Math.max(step.start, next.elapsed)) / (step.end - step.start), 0);
   text("distance", format.format(remaining) + " m");
   text("duration", format.format(next.duration - next.elapsed) + " s");
-  hud.update(currentSim.view === "fpv", next, clearance);
+  map.updateAircraftTag(next.altitudeText, next.instrumentTone);
+  if (profile.track === currentSim.track) profile.paint(next);
+  hud.update(currentSim.view === "fpv", next, next.onGround ? null : clearance);
 }
 
 const landingStart = (track) => track.legs.find((leg) => leg.phase === "landing")?.start ?? track.duration;
@@ -253,7 +269,7 @@ function setFlightProgress(elapsed, duration, phase) {
   text("flight-elapsed", flightClock(elapsed));
   text("flight-total", flightClock(duration));
   for (const label of timeline.querySelectorAll("[data-phase]")) {
-    label.toggleAttribute("data-active", label.dataset.phase === (phase === "takeoff" ? "climb" : phase === "landing" ? "landing" : "cruise"));
+    label.toggleAttribute("data-active", Boolean(phase) && label.dataset.phase === (phase === "takeoff" ? "climb" : phase === "landing" ? "landing" : "cruise"));
   }
 }
 
@@ -263,8 +279,9 @@ function targetLabel(id) {
 
 function showRouteData(result, target) {
   const saving = result.kpis.time_saving_percent;
-  text("saving", saving == null ? "—" : format.format(-saving) + "%");
-  element("saving").style.color = saving > 0 ? "" : "var(--text-muted)";
+  text("saving-label", saving < 0 ? "较地面多耗时" : "较地面节省");
+  text("saving", saving == null ? "—" : format.format(Math.abs(saving)) + "%");
+  element("saving").toggleAttribute("data-positive", saving > 0);
   const start = mission.original.intent.start_id;
   const short = (id) => {
     const name = padNames.get(id);
@@ -281,7 +298,7 @@ function installRoute(result, target, battery = 100, rerouted = false) {
   mission.segments.push({ result, target, battery, start: mission.elapsedBeforeSegment, volumes: [...mission.volumes] });
   if (!rerouted) {
     mission.events = [{
-      at: 0, name: "开始仿真", detail: targetLabel(target), position: result.waypoints[0], segmentIndex: 0,
+      at: 0, name: "起飞", position: result.waypoints[0], segmentIndex: 0,
     }];
   }
   lastTelemetry = -Infinity;
@@ -292,7 +309,7 @@ function installRoute(result, target, battery = 100, rerouted = false) {
   ui.updatePlan(result, target, padNames.get(target));
   sim.load(result.waypoints, result.corridor, { battery, target });
   profile.setTrack(sim.track, result.corridor, rerouted ? "改航点" : mission.original.intent.start_id, target);
-  profile.paint(frame, clearance);
+  profile.paint(frame);
   if (!rerouted) mission.climbEnds = sim.track.legs.find((leg) => leg.phase !== "takeoff")?.start ?? sim.track.duration;
   setMissionTimeline();
 }
@@ -301,11 +318,11 @@ function saveReview(next, outcome, endEvent) {
   const segmentIndex = mission.segments.length - 1;
   const duration = mission.elapsedBeforeSegment + next.elapsed;
   const events = [...mission.events];
-  if (endEvent) events.push({ at: duration, name: endEvent, detail: targetLabel(mission.target), position: next.coordinates, segmentIndex });
+  if (endEvent) events.push({ at: duration, name: endEvent, position: next.coordinates, segmentIndex });
   review.setRecord({
     sceneVersion, duration, events, avoid: mission.avoid, battery: next.battery, startId: mission.original.intent.start_id,
     climbEnds: mission.climbEnds, landingStarts: mission.elapsedBeforeSegment + landingStart(sim.track),
-    outcome: `${outcome} · ${targetLabel(mission.target)}`,
+    outcome: `${mission.original.intent.start_id} → ${mission.target} · ${outcome}`,
     segments: [...mission.segments.slice(0, -1), { ...mission.segments[segmentIndex], flown: sim.flownWaypoints(next) }],
   });
 }
@@ -317,14 +334,13 @@ function paintReplay(next, record, segment) {
   const now = performance.now();
   if (!review.playing || now - lastTelemetry >= 120) {
     lastTelemetry = now;
-    clearance = map.clearance(next.coordinates, record.avoid);
+    clearance = next.onGround ? null : map.clearance(next.coordinates, record.avoid);
     if (profile.track !== review.sim.track) {
       profile.setTrack(review.sim.track, segment.result.corridor, segment.start ? "改航点" : record.startId, segment.target);
     }
-    profile.paint(next, clearance);
   }
   paintTelemetry(next, review.sim);
-  setFlightProgress(at, record.duration, next.leg.phase);
+  setFlightProgress(at, record.duration, next.onGround ? null : next.leg.phase);
 }
 
 function setReplayMode(active) {
@@ -486,7 +502,6 @@ async function replan(type) {
   const constraints = mission.original.intent.constraints;
   const elapsed = mission.elapsedBeforeSegment + before.elapsed;
   const segmentIndex = mission.segments.length - 1;
-  const priorTarget = mission.target;
   const event = { at: elapsed, position: before.coordinates };
   const deadline = mission.diverted ? null : constraints.deadline_seconds;
   busy = "replan";
@@ -522,8 +537,8 @@ async function replan(type) {
     mission.segments[segmentIndex].flown = sim.flownWaypoints(before);
     installRoute(result, result.target_id, sim.battery, true);
     const action = type === "low_battery" ? "备降" : "绕飞";
-    const detail = hazard ? `半径 ${format.format(hazard.radius_m)} m · 继续前往 ${targetLabel(result.target_id)}`
-      : `${targetLabel(priorTarget)} → ${targetLabel(result.target_id)}`;
+    const detail = hazard ? `临时禁飞区半径 ${format.format(hazard.radius_m)} m`
+      : `改降 ${targetLabel(result.target_id)}`;
     mission.events.push({
       ...event, segmentIndex: segmentIndex + 1, name: `${eventNames[type]} · ${action}获准`, compare: true,
       detail,
@@ -535,7 +550,7 @@ async function replan(type) {
     const detail = plainDispatchText(error.message);
     mission.hold = true;
     mission.events.push({ ...event, segmentIndex, name: `${eventNames[type]} · 仿真悬停`,
-      detail: targetLabel(priorTarget) + " · " + detail, battery: sim.battery });
+      detail, battery: sim.battery });
     saveReview(sim.snapshot(), "仿真悬停 · 应急规划未成功");
     ui.status("已悬停 · " + detail, true);
     void ui.revealSteps(exchange, error.steps);
@@ -547,7 +562,11 @@ async function replan(type) {
 
 async function launch() {
   try {
-    const data = await api("/api/layers/all");
+    const [data] = await Promise.all([
+      api("/api/layers/all"),
+      document.fonts.load('600 12px "Vox Mono"', "VP01").catch(() => []),
+      document.fonts.load('600 12px "Vox CJK"', "降落靶标").catch(() => []),
+    ]);
     sceneVersion = data.scene_version;
     map = new CampusMap("map", data.bounds, data.terrain);
     await map.load(data);
@@ -574,7 +593,6 @@ async function launch() {
     const heightDatum = data.terrain ? " · 地形高程" : "";
     text("scene-status", data.buildings.features.length + " 建筑 · " + padNames.size + " 起降坪" + heightDatum);
     text("pads-label", "起降坪 ×" + padNames.size);
-    text("geo-source", data.terrain ? "NASA SRTM / OSM" : "OSM");
     text("sim-live", "SIM LIVE");
     element("system-status").dataset.ready = "";
     element("north").disabled = false;

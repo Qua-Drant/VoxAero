@@ -1,7 +1,31 @@
+@font-face {
+  font-family: "Vox Inter";
+  src: url("/assets/fonts/Inter-Latin.woff2") format("woff2");
+  font-style: normal;
+  font-weight: 100 900;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: "Vox Mono";
+  src: url("/assets/fonts/JetBrainsMono-Latin.woff2") format("woff2");
+  font-style: normal;
+  font-weight: 100 800;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: "Vox CJK";
+  src: url("/assets/fonts/NotoSansSC-Interface.woff2") format("woff2");
+  font-style: normal;
+  font-weight: 400 750;
+  font-display: swap;
+}
+
 :root {
   color-scheme: dark;
   --bg-canvas: #080a0f;
-  --surface-panel: linear-gradient(180deg, rgba(17, 22, 32, 0.92) 0%, rgba(11, 14, 21, 0.90) 100%);
+  --surface-panel: linear-gradient(165deg, rgb(20 25 34 / .985), rgb(12 16 23 / .98));
   --surface-topbar: linear-gradient(180deg, rgba(14, 18, 26, 0.96) 0%, rgba(9, 12, 18, 0.94) 100%);
   --surface-well: #0a0e15;
   --surface-control: #151b26;
@@ -9,15 +33,15 @@
   --surface-control-active: #20293a;
   --border-hairline: rgba(255, 255, 255, 0.09);
   --border-specular-top: rgba(255, 255, 255, 0.18);
-  --shadow-panel: 0 12px 32px rgba(0, 0, 0, 0.55);
+  --shadow-panel: 0 12px 32px rgb(0 0 0 / .52), 0 2px 6px rgb(0 0 0 / .24);
   --radius-panel: 6px;
   --radius-control: 4px;
   --radius-badge: 3px;
-  --font-sans: "Inter", "PingFang SC", "Microsoft YaHei", sans-serif;
-  --font-mono: "JetBrains Mono", "DIN Alternate", ui-monospace, monospace;
+  --font-sans: "Vox Inter", "Vox CJK", "PingFang SC", "Microsoft YaHei UI", "Microsoft YaHei", "Noto Sans CJK SC", system-ui, sans-serif;
+  --font-mono: "Vox Mono", "Cascadia Mono", "SFMono-Regular", Consolas, var(--font-sans);
   --text-primary: #f8fafc;
   --text-secondary: #cbd5e1;
-  --text-muted: #7d8b9f;
+  --text-muted: #98a5b8;
   --text-dim: #526074;
   --accent-vector: #38bdf8;
   --accent-route-end: #2dd4bf;
@@ -34,6 +58,8 @@
   --topbar-height: 48px;
   --dock-height: 48px;
   --dock-bottom: 24px;
+  --font-title: 1.125rem;
+  --font-readout: 1.9375rem;
   --font-label: .6875rem;
   --font-small: .75rem;
   --font-normal: .8125rem;

@@ -52,9 +52,12 @@ export class FlightReplay {
       timestamp.textContent = flightClock(event.at);
       const name = document.createElement("strong");
       name.textContent = event.name;
-      const detail = document.createElement("small");
-      detail.textContent = event.detail;
-      button.append(timestamp, name, detail);
+      button.append(timestamp, name);
+      if (event.detail) {
+        const detail = document.createElement("small");
+        detail.textContent = event.detail;
+        button.append(detail);
+      }
       button.addEventListener("click", () => {
         this.open();
         this.pause();

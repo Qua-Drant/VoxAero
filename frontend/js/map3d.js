@@ -196,37 +196,15 @@ export class CampusMap {
       const { longitude, latitude, height } = Cesium.Cartographic.fromCartesian(position);
       return Cesium.Cartesian3.fromRadians(longitude, latitude, height + 13);
     };
-    const plate = document.createElement("canvas");
-    plate.width = 344;
-    plate.height = 44;
-    const ink = plate.getContext("2d");
-    ink.fillStyle = "#0a151e";
-    ink.fillRect(0, 0, 30, plate.height);
-    ink.strokeStyle = "#38bdf8";
-    ink.lineWidth = 1.6;
-    ink.strokeRect(1, 1, plate.width - 2, plate.height - 2);
-    ink.fillStyle = "#34d399";
-    ink.beginPath();
-    ink.arc(16, 22, 4.5, 0, Math.PI * 2);
-    ink.fill();
-    this.aircraftReadout = this.viewer.entities.add({
-      position: new Cesium.CallbackProperty(anchor, false),
-      billboard: {
-        image: plate, width: 172, height: 22, pixelOffset: new Cesium.Cartesian2(0, -14),
-        disableDepthTestDistance: Number.POSITIVE_INFINITY,
-      },
-      label: {
-        text: new Cesium.CallbackProperty((time) => {
-          const position = pose(time);
-          const alt = position ? Cesium.Cartographic.fromCartesian(position).height.toFixed(1) : "—";
-          return `VOXAERO-01 | ${alt} m`;
-        }, false),
-        font: `650 12px ${readoutFont}`, fillColor: color("#e0f2fe"),
-        disableDepthTestDistance: Number.POSITIVE_INFINITY,
-        showBackground: true, backgroundColor: color("#0a151e", .94),
-        backgroundPadding: new Cesium.Cartesian2(4, 3),
-        pixelOffset: new Cesium.Cartesian2(6, -14),
-      },
+    this.aircraftAnchor = anchor;
+    this.aircraftTag = document.getElementById("aircraft-tag");
+    this.aircraftTagValue = this.aircraftTag.querySelector(".aircraft-tag-value");
+    this.aircraftTagWidth = 176;
+    new ResizeObserver(([entry]) => {
+      if (entry.contentRect.width > 0) this.aircraftTagWidth = this.aircraftTag.offsetWidth;
+    }).observe(this.aircraftTag);
+    this.aircraftLeader = this.viewer.entities.add({
+      show: false,
       polyline: {
         positions: new Cesium.CallbackProperty((time) => {
           const position = pose(time);
@@ -396,14 +374,36 @@ export class CampusMap {
     this.viewer.scene.requestRender();
   }
 
+  altitudeAGL({ lon, lat, alt }) {
+    return Math.max(0, alt - this.elevation(lon, lat));
+  }
+
+  updateAircraftTag(altitude, tone) {
+    if (this.aircraftTagValue.textContent !== altitude) this.aircraftTagValue.textContent = altitude;
+    if (this.aircraftTag.dataset.tone !== tone) this.aircraftTag.dataset.tone = tone;
+  }
+
   positionLabels() {
-    const { scene, clock } = this.viewer;
-    const aircraft = this.flightEntity.show ? this.aircraftReadout.position.getValue(clock.currentTime) : undefined;
-    this.aircraftReadout.show = Boolean(aircraft) && document.body.dataset.view !== "fpv";
+    const { scene, clock, canvas } = this.viewer;
+    const position = this.flightEntity.show && document.body.dataset.view !== "fpv"
+      ? this.aircraftAnchor(clock.currentTime) : undefined;
+    const point = position && Cesium.SceneTransforms.worldToWindowCoordinates(scene, position);
+    const visible = Boolean(point && point.x >= 0 && point.x <= canvas.clientWidth
+      && point.y >= 34 && point.y <= canvas.clientHeight);
+    const occupied = [];
+    if (this.aircraftLeader.show !== visible) {
+      this.aircraftLeader.show = visible;
+      scene.requestRender();
+    }
+    this.aircraftTag.hidden = !visible;
+    if (visible) {
+      const edge = this.aircraftTagWidth / 2 + 4;
+      const x = Cesium.Math.clamp(point.x, edge, canvas.clientWidth - edge);
+      this.aircraftTag.style.transform = `translate3d(${x}px, ${point.y}px, 0) translate(-50%, -100%)`;
+      occupied.push({ x, y: point.y - 13, width: this.aircraftTagWidth });
+    }
+
     const points = [];
-    if (this.aircraftReadout.show) points.push({
-      position: aircraft, label: this.aircraftReadout.label, billboard: this.aircraftReadout.billboard, width: 174, offsets: [[0, -14], [40, -27], [-40, -27]],
-    });
     if (this.layers.get("vertiports")?.show) {
       const markers = [...this.padLabels.values()].sort((a, b) => Number(Boolean(b.role)) - Number(Boolean(a.role)));
       for (const { leader, anchor, role } of markers) points.push({
@@ -413,8 +413,10 @@ export class CampusMap {
             : [[0, -11], [0, -33], [21, -13], [-22, -10], [0, 15], [-28, 11], [30, 35]],
       });
     }
-    const occupied = [];
-    for (const { position, label, billboard, width, offsets } of points) {
+    if (this.routeAltitudeLabel && this.layers.get("route").show) {
+      points.push(this.routeAltitudeLabel);
+    }
+    for (const { position, label, width, offsets } of points) {
       const point = Cesium.SceneTransforms.worldToWindowCoordinates(scene, position);
       if (!point) continue;
       const placement = offsets.find(([dx, dy]) => occupied.every((box) => {
@@ -425,10 +427,8 @@ export class CampusMap {
       occupied.push({ x: point.x + placement[0], y: point.y + placement[1], width });
       const current = label.pixelOffset?.getValue(clock.currentTime);
       const [x, y] = placement;
-      const labelX = x + (billboard ? 6 : 0);
-      if (current?.x !== labelX || current?.y !== y) {
-        label.pixelOffset = new Cesium.Cartesian2(labelX, y);
-        if (billboard) billboard.pixelOffset = new Cesium.Cartesian2(x, y);
+      if (current?.x !== x || current?.y !== y) {
+        label.pixelOffset = new Cesium.Cartesian2(x, y);
         scene.requestRender();
       }
     }
@@ -543,6 +543,7 @@ export class CampusMap {
   }
 
   addRouteDepth(entities, waypoints, rerouted) {
+    this.routeAltitudeLabel = null;
     if (waypoints.length < 2) return;
     const cartesian = ({ lon, lat, alt }) => degrees([lon, lat], alt);
     const dash = (opacity) => new Cesium.PolylineDashMaterialProperty({
@@ -588,15 +589,18 @@ export class CampusMap {
     }
     if (middle) {
       const position = lerp(...middle, .5);
-      const altitude = Cesium.Cartographic.fromCartesian(position).height;
-      entities.add({
+      const { longitude, latitude, height } = Cesium.Cartographic.fromCartesian(position);
+      const altitude = this.altitudeAGL({ lon: Cesium.Math.toDegrees(longitude), lat: Cesium.Math.toDegrees(latitude), alt: height });
+      const { label } = entities.add({
         position,
         label: {
-          text: altitude.toFixed(1) + " m", font: `650 11px ${readoutFont}`, fillColor: color("#dbeafe"),
-          style: Cesium.LabelStyle.FILL_AND_OUTLINE, outlineColor: color("#080a0f"), outlineWidth: 3,
-          pixelOffset: new Cesium.Cartesian2(0, -16), disableDepthTestDistance: Number.POSITIVE_INFINITY,
+          text: altitude.toFixed(1) + " m AGL", font: `620 11px ${readoutFont}`, fillColor: color("#e2e8f0"),
+          showBackground: true, backgroundColor: color("#101821", .98),
+          backgroundPadding: new Cesium.Cartesian2(7, 4),
+          pixelOffset: new Cesium.Cartesian2(0, -17), disableDepthTestDistance: Number.POSITIVE_INFINITY,
         },
       });
+      this.routeAltitudeLabel = { position, label, width: 93, offsets: [[0, -17], [20, -32], [-18, 19], [40, 13]] };
     }
   }
 

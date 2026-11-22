@@ -254,7 +254,7 @@ export class FlightHUD {
     drawHeading(ctx, centerX, Math.max(77, height * .133), Math.min(width * .255, 220), frame.heading ?? 0, compact);
     drawPitch(ctx, centerX, centerY, compact ? width * .72 : width, height, (frame.pitch ?? 0) * 180 / Math.PI);
     drawTape(ctx, { x: margin, y: centerY, width: tapeWidth, height: tapeHeight, right: false,
-      name: "ALT", value: frame.coordinates.alt, unit: "m", step: 5, range: 35, compact });
+      name: "AGL", value: frame.agl, unit: "m", step: 5, range: 35, compact });
     drawTape(ctx, { x: width - margin - tapeWidth, y: centerY, width: tapeWidth, height: tapeHeight, right: true,
       name: "SPD", value: frame.speed, unit: "m/s", step: 1, range: 7, compact });
 
