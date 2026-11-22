@@ -1,11 +1,11 @@
-const CYAN = "#5aeeff";
-const TEXT = "#e6f6ff";
-const MUTED = "#a6c9e1";
-const SAFE = "#52f1b3";
+const CYAN = "#38bdf8";
+const TEXT = "#f8fafc";
+const MUTED = "#9baabd";
+const SAFE = "#34d399";
 const DANGER = "#ff858e";
 const typography = getComputedStyle(document.documentElement);
-const READOUT_FONT = typography.getPropertyValue("--readout-font").trim() || "monospace";
-const LABEL_FONT = typography.getPropertyValue("--ui-font").trim() || "system-ui, sans-serif";
+const READOUT_FONT = typography.getPropertyValue("--font-mono").trim() || "monospace";
+const LABEL_FONT = typography.getPropertyValue("--font-sans").trim() || "system-ui, sans-serif";
 const PHASE_LABELS = { takeoff: "起飞", cruise: "巡航", landing: "降落", transition: "调整高度" };
 
 function clamp(value, min, max) {
@@ -28,8 +28,8 @@ function text(ctx, value, x, y, { color = TEXT, size = 13, weight = 650, align =
 
 function plate(ctx, x, y, width, height, tint = "#79b5dea6") {
   const glass = ctx.createLinearGradient(0, y, 0, y + height);
-  glass.addColorStop(0, "#1c4265d4");
-  glass.addColorStop(1, "#071526e8");
+  glass.addColorStop(0, "#161e2bd9");
+  glass.addColorStop(1, "#090d15eb");
   ctx.fillStyle = glass;
   ctx.strokeStyle = tint;
   ctx.lineWidth = 1;

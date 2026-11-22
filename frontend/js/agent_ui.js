@@ -13,13 +13,17 @@ const ACTION_STEPS = {
   clarify_dispatch: ["补地点", "用你刚提供的地点补全任务，保留之前的飞行要求。"],
   replan_emergency: ["做应急", "根据突发情况，重新选择可以飞的路线。"],
 };
-const MAX_VISIBLE_MESSAGES = 18;
-const CORRIDORS = { delivery: "配送层 30–60 m", inspection: "巡检层 60–90 m" };
-const number = new Intl.NumberFormat("zh-CN", { maximumFractionDigits: 6 });
+const decimal = (value) => value.toFixed(1);
+const CORRIDORS = { delivery: "30–60 m", inspection: "60–90 m" };
+const number = new Intl.NumberFormat("zh-CN", { minimumFractionDigits: 1, maximumFractionDigits: 1 });
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 export function plainDispatchText(content) {
+  if (typeof content !== "string" || /(?:^|\s)[{\[]\s*["{\[]|["\w]+"\s*:\s*["{\[]/.test(content)) {
+    return "平台已返回回复，请查看任务状态。";
+  }
   return content
+    .replace(/(\d+(?:\.\d+)?)\s+m\b/g, (_, meters) => Number(meters).toFixed(1) + " m")
     .replaceAll("起降坪", "起降点")
     .replaceAll("候选航线", "找到的路线")
     .replaceAll("合规航线", "符合飞行要求的路线")
@@ -35,7 +39,7 @@ export function plainDispatchText(content) {
 function readableStep({ role, content }) {
   if (role === "action") {
     const [action, detail] = content.split(" · ");
-    if (action === "校验空域") return ["查限制", `检查可用的巡航高度（${detail}），确认哪些地方要绕开。`];
+    if (action === "校验空域") return ["查限制", `检查可用的巡航高度（${plainDispatchText(detail ?? "适用航层")}），确认哪些地方要绕开。`];
     if (action === "plan_3d_route") {
       if (detail?.includes("备降") || detail?.includes("应急坪")) return ["找路线", "比较附近能到达的备降点，选一条符合飞行要求的路线。"];
       if (detail?.startsWith("从当前")) return ["找路线", "从无人机现在的位置出发，找一条能绕开限制区域的路线。"];
@@ -47,21 +51,10 @@ function readableStep({ role, content }) {
     ? ["看位置", "记录无人机现在的位置，作为改航的起点。"]
     : ["看要求", "从指令中找出任务类型、地点和需要遵守的要求。"];
   const endpoints = content.match(/^\S+ (.+) → \S+ (.+)$/);
-  if (endpoints) return ["核对", `计划从${endpoints[1]}出发，飞往${endpoints[2]}。`];
+  if (endpoints) return ["地点匹配", `计划从${endpoints[1]}出发，飞往${endpoints[2]}。`];
   const route = content.match(/^规划成功，\d+ 个航点，([\d.]+) m。$/);
-  if (route) return ["结果", `找到了约 ${route[1]} 米的路线。`];
-  return ["结果", plainDispatchText(content)];
-}
-
-function formatPayload(payload) {
-  if (typeof payload === "string") return payload || "空正文";
-  return JSON.stringify(payload, (key, value) => key === "clarification_token" && value ? "[会话令牌已隐藏]" : value, 2);
-}
-
-function stage(element, state) {
-  element.dataset.state = state;
-  if (state === "active") element.setAttribute("aria-current", "step");
-  else element.removeAttribute("aria-current");
+  if (route) return ["航线已生成", "航点已生成，路线符合飞行要求。"];
+  return [content.includes("空域") || content.includes("避让") ? "规则核验" : "处理反馈", plainDispatchText(content)];
 }
 
 function altitudeText(limits) {
@@ -99,8 +92,8 @@ export class AgentUI {
     this.mode = document.getElementById("mode");
     this.input = document.getElementById("query");
     this.form = document.getElementById("dispatch-form");
-    this.conversation = document.getElementById("conversation");
     this.messages = document.getElementById("agent-messages");
+    this.mission = document.getElementById("active-mission");
     this.exchangeTemplate = document.getElementById("agent-exchange-template");
     this.planTemplate = document.getElementById("dispatch-plan-template");
     this.guide = document.getElementById("agent-welcome");
@@ -110,6 +103,7 @@ export class AgentUI {
     this.clear = document.getElementById("clear-clarification");
     this.clear.addEventListener("click", clearClarification);
     this.presets = [...document.querySelectorAll("[data-preset]")];
+    this.missionNumber = 0;
     for (const button of this.presets) {
       button.addEventListener("click", () => {
         const preset = button.dataset.preset;
@@ -131,23 +125,13 @@ export class AgentUI {
         const { selectionStart, selectionEnd, value, maxLength } = this.input;
         if (value.length - (selectionEnd - selectionStart) < maxLength) {
           this.input.setRangeText("\n", selectionStart, selectionEnd, "end");
-          this.fitInput();
         }
       } else if (!event.shiftKey) {
         event.preventDefault();
         if (!event.repeat && !this.submit.disabled) this.form.requestSubmit(this.submit);
       }
     });
-    this.setupGuide();
-    this.setupInputSizing();
-  }
-
-  setupGuide() {
-    this.help.addEventListener("click", () => {
-      const show = this.guide.hidden;
-      this.showGuide(show);
-      if (show) this.conversation.scrollTop = 0;
-    });
+    this.help.addEventListener("click", () => this.showGuide(this.guide.hidden));
     for (const button of this.guide.querySelectorAll("[data-welcome-example]")) {
       button.addEventListener("click", () => {
         this.clear.click();
@@ -163,118 +147,111 @@ export class AgentUI {
     this.help.setAttribute("aria-expanded", String(show));
   }
 
-  setupInputSizing() {
-    this.nativeFieldSizing = CSS.supports("field-sizing", "content");
-    if (this.nativeFieldSizing) return;
-    this.input.addEventListener("input", () => this.fitInput());
-    let width;
-    new ResizeObserver(([entry]) => {
-      const nextWidth = entry.contentRect.width;
-      if (nextWidth === width) return;
-      width = nextWidth;
-      this.fitInput();
-    }).observe(this.form);
-    this.fitInput();
-  }
-
-  fitInput() {
-    if (this.nativeFieldSizing) return;
-    this.input.style.blockSize = "auto";
-    const borders = this.input.offsetHeight - this.input.clientHeight;
-    this.input.style.blockSize = (this.input.scrollHeight + borders) + "px";
-  }
-
   setInput(value) {
     this.input.value = value;
-    this.fitInput();
   }
 
-  beginDispatch(query) {
+  beginExchange() {
     this.showGuide(false);
-    return this.message("user", query);
-  }
-
-  finishDispatch(prompt, exchange, replaceThread) {
-    if (replaceThread) this.messages.replaceChildren(prompt, exchange.element);
-  }
-
-  beginExchange(path, payload) {
-    if (this.lastTrace) this.lastTrace.open = false;
     const element = this.exchangeTemplate.content.cloneNode(true).firstElementChild;
     const part = (name) => element.querySelector(`[data-exchange="${name}"]`);
-    part("endpoint").textContent = `POST ${path}`;
-    part("request").textContent = formatPayload(payload);
-    this.lastTrace = part("trace");
-    this.appendMessage(element);
-    return {
-      element, part,
-      receive: (response, body) => {
-        const label = RESPONSE_LABELS[body?.status] ?? (body?.emergency_type ? "应急航线已规划" : "");
-        const status = part("status");
-        status.textContent = "已收到回复";
-        status.dataset.outcome = label || (response.ok ? "已收到回复" : "这次请求未成功");
-        part("http").textContent = `HTTP ${response.status}`;
-        status.toggleAttribute("data-error", !response.ok && body?.status !== "needs_clarification");
-        part("response").textContent = formatPayload(body);
-        part("receive").textContent = "已收到回复";
-        stage(part("receive"), "done");
-      },
-      fail: (message) => {
-        part("status").textContent = "连接失败";
-        part("status").setAttribute("data-error", "");
-        part("http").textContent = "未收到 HTTP 回复";
-        part("response").textContent = message;
-        part("receive").textContent = "没有收到回复";
-        stage(part("receive"), "error");
-      },
+    const exchange = { element, part, body: null, ok: false };
+    const toggle = part("trace").querySelector("summary");
+    toggle.setAttribute("aria-disabled", "true");
+    toggle.addEventListener("click", (event) => {
+      if (toggle.getAttribute("aria-disabled") === "true") event.preventDefault();
+    });
+    element.dataset.pending = "";
+    this.messages.replaceChildren(element);
+    this.setTraceProgress(exchange, 8, 0);
+    this.setTraceSummary(exchange, [["调度请求", "已发送，等待平台确认任务与飞行条件。"]]);
+    exchange.receive = (response, body) => {
+      exchange.body = typeof body === "object" ? body : null;
+      exchange.ok = response.ok && Boolean(exchange.body);
+      part("count").textContent = exchange.ok ? "已收到回复" : "请求待处理";
     };
+    exchange.fail = () => { part("count").textContent = "连接失败"; };
+    return exchange;
   }
 
-  async revealSteps({ part }, steps = []) {
-    const panel = part("trace");
-    const review = part("review");
-    const status = part("status");
-    if (panel.open || part("steps").childElementCount) return;
-    if (!steps.length) {
-      review.textContent = "没有处理步骤";
-      if (status.dataset.outcome) status.textContent = status.dataset.outcome;
-      return;
+  setTraceProgress({ part }, total, complete) {
+    const progress = part("progress");
+    if (progress.childElementCount !== total) {
+      progress.replaceChildren(...Array.from({ length: total }, () => document.createElement("span")));
     }
-    panel.hidden = false;
-    panel.open = true;
-    stage(review, "active");
-    part("trace-title").textContent = `调度过程 · ${steps.length} 步`;
-    const list = part("steps");
-    // Keep the readout paced even when the reply arrives in a single frame.
-    const interval = Math.min(440, 3600 / Math.max(1, steps.length - 1));
-    for (const [index, step] of steps.entries()) {
-      await delay(index === 0 ? 260 : interval);
-      if (!panel.isConnected) return;
-      const [label, detail] = readableStep(step);
+    Array.from(progress.children).forEach((cell, index) => cell.toggleAttribute("data-done", index < complete));
+  }
+
+  setTraceSummary({ part }, steps) {
+    part("summary").replaceChildren(...steps.map(([label, detail], index) => {
       const row = document.createElement("li");
-      row.value = step.step;
-      const title = document.createElement("span");
-      title.textContent = label;
+      const number = document.createElement("span");
+      number.className = "mono";
+      number.textContent = String(index + 1).padStart(2, "0");
+      const name = document.createElement("b");
+      name.textContent = label;
       const body = document.createElement("p");
       body.textContent = detail;
-      row.append(title, body);
-      const atEnd = this.conversation.scrollHeight - this.conversation.scrollTop - this.conversation.clientHeight < 36;
-      list.append(row);
-      if (atEnd && panel.open && panel === this.lastTrace) this.scrollToLatest();
-    }
-    stage(review, "done");
-    if (status.dataset.outcome) status.textContent = status.dataset.outcome;
+      row.append(number, name, body);
+      return row;
+    }));
   }
 
-  scrollToLatest() {
-    this.conversation.scrollTop = this.conversation.scrollHeight;
+  async revealSteps(exchange, steps = [], zoneNames = new Map()) {
+    const { element, part, body, ok } = exchange;
+    const list = part("steps");
+    const count = part("count");
+    const planned = body?.kpis?.compliant && (body.status === "planned" || Boolean(body.emergency_type));
+    const reduced = matchMedia("(prefers-reduced-motion: reduce)").matches;
+    part("trace-title").textContent = steps.length ? `展开 ${steps.length} 步详情` : "无步骤";
+    part("trace").querySelector("summary").setAttribute("aria-disabled", String(!steps.length));
+    this.setTraceProgress(exchange, steps.length, 0);
+    if (steps.length) count.textContent = `0/${steps.length}`;
+    else if (count.textContent === "已收到回复") count.textContent = "已处理";
+    for (const [index, step] of steps.entries()) {
+      if (!reduced) await delay(index === 0 ? 220 : Math.min(310, 2600 / steps.length));
+      if (!element.isConnected) return;
+      const [label, detail] = readableStep(step);
+      const row = document.createElement("li");
+      const title = document.createElement("b");
+      title.textContent = `${String(index + 1).padStart(2, "0")}  ${label}`;
+      const text = document.createElement("p");
+      text.textContent = detail;
+      row.append(title, text);
+      list.append(row);
+      this.setTraceProgress(exchange, steps.length, index + 1);
+      count.textContent = `${index + 1}/${steps.length}`;
+      part("trace-title").textContent = part("trace").open ? "收起详情" : `展开 ${steps.length} 步详情`;
+      this.setTraceSummary(exchange, [[label, detail]]);
+    }
+    delete element.dataset.pending;
+    if (steps.length) {
+      count.textContent = `${steps.length}/${steps.length} ${ok && planned ? "通过" : "已处理"}`;
+      part("trace").addEventListener("toggle", () => {
+        part("trace-title").textContent = part("trace").open ? "收起详情" : `展开 ${steps.length} 步详情`;
+      });
+    }
+    if (planned && ok) {
+      const { kpis, intent } = body;
+      const corridor = CORRIDORS[body.corridor];
+      const constraints = intent ? planRequirements(body, zoneNames) : [];
+      const checked = constraints[0]?.text;
+      this.setTraceSummary(exchange, [
+        ["指令解析", intent
+          ? `确认${intent.mission_type === "inspection" ? "巡检" : "配送"}任务 · ${intent.start_id} → ${intent.end_id}`
+          : `重新研判当前机位与目的地 ${body.target_id}`],
+        ["约束核验", checked ? `${corridor} · ${checked}` : `锁定 ${corridor} 并绕飞禁飞区`],
+        ["航线生成", `生成 ${decimal(kpis.distance_m)} m 避障三维航迹`],
+      ]);
+    } else if (body?.detail) {
+      this.setTraceSummary(exchange, [[RESPONSE_LABELS[body.status] ?? "调度反馈", plainDispatchText(body.detail)]]);
+    }
   }
 
   setClarification(active) {
     this.clear.hidden = !active;
-    this.submit.textContent = active ? "提交补答" : "规划航线";
+    document.getElementById("submit-label").textContent = active ? "提交补答" : "规划航线";
     this.input.placeholder = active ? "例如：食堂" : "例如：从 VP01 巡检至 VP04";
-    this.fitInput();
   }
 
   setAvailable(available) {
@@ -286,86 +263,73 @@ export class AgentUI {
   setMode(mode) {
     this.mode.textContent = { live_llm: "模型模式", fallback_mock: "本地规则" }[mode] ?? "服务离线";
     this.mode.dataset.tone = mode ? "normal" : "error";
-    this.mode.title = mode ?? "";
   }
 
   status(message, error = false) {
-    this.feedback.textContent = message;
+    this.feedback.textContent = plainDispatchText(message);
     this.feedback.dataset.error = error;
+    this.feedback.toggleAttribute("data-active", !error && /已确认|飞行中|已接入|已开始/.test(message));
   }
 
-  showPlan(result, zoneNames, { confirm, edit, locate }, exchange) {
+  showPlan(result, zoneNames, { confirm, edit, locate }, running = false) {
     const card = this.planTemplate.content.cloneNode(true).firstElementChild;
     const part = (name) => card.querySelector(`[data-plan="${name}"]`);
-    const { intent, kpis } = result;
-    part("type").textContent = intent.mission_type === "inspection" ? "巡检任务" : "配送任务";
-    part("corridor").textContent = CORRIDORS[result.corridor] + "（场景高度）";
-    for (const [key, id, name, role] of [
-      ["start", intent.start_id, result.start_name, "起点"],
-      ["end", intent.end_id, result.end_name, "终点"],
-    ]) {
-      const button = part(key);
-      button.textContent = `${id} · ${name}`;
-      button.setAttribute("aria-label", `定位${role} ${button.textContent}`);
-      button.addEventListener("click", () => locate(id));
-    }
-    for (const { text, warning } of planRequirements(result, zoneNames)) {
-      const row = document.createElement("li");
-      row.textContent = text;
-      row.toggleAttribute("data-warning", Boolean(warning));
-      part("constraints").append(row);
-    }
-    part("source").textContent = result.model_fallback ? "本地规则 · 模型调用失败后兜底"
-      : result.mode === "live_llm" ? "接入模型 · 已校验任务参数" : "本地规则";
-    part("kpis").textContent = `${number.format(kpis.distance_m)} m · 预计 ${number.format(kpis.estimated_seconds)} s · `
-      + (kpis.compliant ? "模拟空域校验通过" : "模拟空域校验未通过");
+    const { intent } = result;
+    part("type").textContent = intent.mission_type === "inspection" ? "校园巡检任务" : "校园配送任务";
+    part("id").textContent = "#MSN-" + String(++this.missionNumber).padStart(3, "0");
+    this.plan = { card, part, locate, zoneNames };
+    this.setPlanEndpoint("start", intent.start_id, result.start_name);
+    this.setPlanEndpoint("end", intent.end_id, result.end_name);
     part("confirm").addEventListener("click", confirm);
     part("edit").addEventListener("click", edit);
-    part("exchange").addEventListener("click", () => {
-      const details = exchange.part("trace");
-      details.open = true;
-      const summary = details.querySelector("summary");
-      summary.focus({ preventScroll: true });
-      this.conversation.scrollTop += exchange.element.getBoundingClientRect().top
-        - this.conversation.getBoundingClientRect().top;
-    });
-    this.plan = card;
-    this.message("agent", card);
-    // Keep the route summary in view when the scrollable panel is short.
-    this.conversation.scrollTop = card.closest(".message").getBoundingClientRect().top
-      - this.conversation.getBoundingClientRect().top + this.conversation.scrollTop;
+    this.mission.replaceChildren(card);
+    this.updatePlan(result, intent.end_id, result.end_name);
+    if (running) this.acceptPlan();
   }
 
-  finishPlan(label) {
+  setPlanEndpoint(key, id, name) {
+    const { part, locate } = this.plan;
+    const button = part(key);
+    const code = document.createElement("span");
+    code.className = "mono";
+    code.textContent = id;
+    const label = document.createElement("span");
+    label.textContent = name;
+    button.replaceChildren(code, label);
+    button.title = `定位${key === "start" ? "起点" : "终点"} ${id} ${name}`;
+    button.onclick = () => locate(id);
+  }
+
+  updatePlan(result, target, targetName) {
     if (!this.plan) return;
-    this.plan.querySelector('[data-plan="state"]').textContent = label;
-    this.plan.querySelector('[data-plan="actions"]').hidden = true;
-    for (const button of this.plan.querySelectorAll(".plan-location")) button.disabled = true;
-    this.plan = null;
+    const { part, zoneNames } = this.plan;
+    const { kpis, intent } = result;
+    this.setPlanEndpoint("end", target, targetName);
+    part("corridor").textContent = CORRIDORS[result.corridor];
+    part("compliance").textContent = kpis.compliant
+      ? `● ${Math.round(kpis.compliance_percent)}% · 校验 ${zoneNames.size + (result.temporary_nofly_zone ? 1 : 0)} 区` : "未通过";
+    part("clearance").textContent = kpis.min_clearance_m == null ? "—" : `≥ ${(Math.floor(kpis.min_clearance_m * 10) / 10).toFixed(1)} m`;
+    part("clearance").title = "规划航段距最近建筑或禁飞区包络的最小净空";
+    part("source").textContent = !intent ? "本地应急规划" : result.model_fallback ? "本地规则兜底"
+      : result.mode === "live_llm" ? "LLM 语义校验" : "本地规则";
+    part("kpis").textContent = `规划航程 ${decimal(kpis.distance_m)} m · 预计 ${decimal(kpis.estimated_seconds)} s`;
   }
 
-  message(kind, message) {
-    const bubble = document.createElement("article");
-    bubble.className = "message";
-    bubble.dataset.kind = kind;
-    const header = document.createElement("p");
-    header.className = "message-header";
-    header.textContent = { user: "操作员", agent: "VoxAero Agent", error: "调度异常" }[kind];
-    bubble.append(header);
-    if (typeof message === "string") {
-      const text = document.createElement("p");
-      text.textContent = message;
-      bubble.append(text);
-    } else {
-      bubble.append(message);
-    }
-    this.appendMessage(bubble);
-    return bubble;
+  setMissionState(label, tone = "normal") {
+    const state = this.plan?.part("state");
+    if (!state) return;
+    state.textContent = label;
+    state.dataset.tone = tone;
   }
 
-  appendMessage(bubble) {
-    this.messages.append(bubble);
-    if (this.messages.childElementCount > MAX_VISIBLE_MESSAGES) this.messages.firstElementChild.remove();
-    this.scrollToLatest();
+  acceptPlan() {
+    this.activePlan = this.plan;
+    this.setMissionState("已确认 · 执行中");
+    this.plan.part("actions").hidden = true;
+  }
+
+  restoreMission() {
+    this.plan = this.activePlan;
+    this.mission.replaceChildren(...(this.plan ? [this.plan.card] : []));
   }
 }
