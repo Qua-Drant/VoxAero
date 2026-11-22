@@ -3,6 +3,10 @@ const SPEED = { delivery: 12, inspection: 15 };
 const CLIMB_SPEED = 3;
 const NOSE_OFFSET = 0.42;
 
+export function batteryAfterFlight(battery, seconds) {
+  return Math.max(0, battery - seconds * .10);
+}
+
 function world({ lon, lat, alt }) {
   return C.Cartesian3.fromDegrees(lon, lat, alt);
 }
@@ -47,6 +51,7 @@ function makeTrack(waypoints, corridor) {
     if (seconds === 0) continue;
     legs.push({
       start: duration, end: duration + seconds, horizontal, dz,
+      waypointIndex: i,
       speed: Math.hypot(horizontal, dz) / seconds,
       direction: C.Cartesian3.subtract(points[i], points[i - 1], new C.Cartesian3()),
       phase: waypoints[i].phase,
@@ -72,7 +77,7 @@ function makeTrack(waypoints, corridor) {
     nextGate = Math.max(5, nextGate - leg.horizontal);
   }
   return {
-    property, time, duration, legs, at, gates, origin: waypoints[0], target: waypoints.at(-1),
+    property, time, duration, legs, at, gates, waypoints, origin: waypoints[0], target: waypoints.at(-1),
   };
 }
 
@@ -90,20 +95,44 @@ export class DroneSim {
     this.guideTime = -Infinity;
   }
 
-  load(waypoints, corridor, { battery, target }) {
+  load(waypoints, corridor, { battery, target, elapsed = 0 }) {
     const track = makeTrack(waypoints, corridor);
     this.pause(false);
     this.track = track;
     this.targetId = target;
-    this.elapsed = 0;
+    this.elapsed = Math.min(elapsed, track.duration);
     this.heading = undefined;
     this.bank = 0;
     this.guideTime = -Infinity;
     this.battery = battery;
-    this.map.flightEntity.position = track.property;
+    this.attach();
+  }
+
+  attach() {
+    this.map.flightEntity.position = this.track.property;
     this.map.flightEntity.show = this.view !== "fpv";
     this.map.flightEntity.point.show = this.view === "overview";
+    this.map.viewer.scene.screenSpaceCameraController.enableInputs = this.view === "overview";
+    this.guideTime = -Infinity;
     this.paint();
+  }
+
+  seek(elapsed, battery, jumped, delta = 0) {
+    this.elapsed = Math.min(elapsed, this.track.duration);
+    this.battery = battery;
+    if (jumped) {
+      this.heading = undefined;
+      this.bank = 0;
+      this.guideTime = -Infinity;
+    }
+    this.paint(delta);
+  }
+
+  flownWaypoints(frame) {
+    const points = this.track.waypoints;
+    if (frame.elapsed === 0) return points.slice(0, 1);
+    if (frame.complete) return points;
+    return [...points.slice(0, frame.leg.waypointIndex), { ...frame.coordinates, phase: frame.leg.phase }];
   }
 
   setRate(rate) {
@@ -142,7 +171,7 @@ export class DroneSim {
     this.previousFrame = now;
     const advanced = Math.min(delta * this.rate, this.track.duration - this.elapsed);
     this.elapsed += advanced;
-    this.battery = Math.max(0, this.battery - advanced * .10);
+    this.battery = batteryAfterFlight(this.battery, advanced);
     if (this.elapsed >= this.track.duration) this.playing = false;
     this.paint(delta);
     this.frameRequest = this.playing ? requestAnimationFrame(this.tick) : null;

@@ -163,6 +163,10 @@ export class CampusMap {
     this.layers = new Map();
     this.staticVolumes = [];
     this.dynamicVolumes = [];
+    this.padFocus = this.viewer.entities.add({
+      show: false,
+      point: { pixelSize: 15, color: color("#d6fff8"), outlineColor: color("#17a48f"), outlineWidth: 3 },
+    });
     this.flightEntity = this.viewer.entities.add({
       name: "VOXAERO-01",
       show: false,
@@ -229,6 +233,7 @@ export class CampusMap {
       const { id, name, altitude, type } = feature.properties;
       const tint = color(type === "emergency" ? "#fad383" : "#86f2d8");
       pads.add({
+        id,
         name,
         position: degrees(feature.geometry.coordinates, altitude + 1),
         ellipse: {
@@ -323,6 +328,8 @@ export class CampusMap {
   }
 
   resetView() {
+    this.viewer.camera.cancelFlight();
+    this.clearPadFocus();
     const [west, south, east, north] = this.bounds;
     const target = degrees([(west + east) / 2, (south + north) / 2], this.terrain ? 35 : 20);
     const extent = Cesium.Cartesian3.distance(degrees([west, south]), degrees([east, north]));
@@ -333,9 +340,65 @@ export class CampusMap {
     this.viewer.scene.requestRender();
   }
 
-  drawRoute(waypoints, rerouted) {
+  focusRoute(waypoints, usableWidth) {
+    const camera = this.viewer.camera;
+    const { clientWidth, clientHeight } = this.viewer.canvas;
+    const points = waypoints.map(({ lon, lat, alt }) => degrees([lon, lat], alt));
+    const bounds = Cesium.BoundingSphere.fromPoints(points);
+    const vertical = Math.tan(camera.frustum.fovy / 2) * .76;
+    const aspect = (usableWidth || clientWidth) / Math.max(1, clientHeight);
+    const halfAngle = Math.atan(vertical * Math.min(1, aspect));
+    const range = Math.max(185, (bounds.radius * 1.18 + 12) / Math.sin(halfAngle));
+    camera.flyToBoundingSphere(bounds, {
+      offset: new Cesium.HeadingPitchRange(-.3, -.86, range),
+      duration: matchMedia("(prefers-reduced-motion: reduce)").matches ? 0 : .8,
+    });
+    this.viewer.scene.requestRender();
+  }
+
+  focusPad(id) {
+    const pad = this.layers.get("vertiports").entities.getById(id);
+    if (!pad) return;
+    this.focusPoint(pad.position.getValue(this.viewer.clock.currentTime));
+  }
+
+  focusPosition({ lon, lat, alt }) {
+    // Keep the event above the review controls at the bottom of the scene.
+    this.focusPoint(degrees([lon, lat], alt), 28);
+  }
+
+  focusPoint(position, cameraDrop = 0) {
+    const camera = this.viewer.camera;
+    camera.cancelFlight();
+    this.padFocus.position = position;
+    this.padFocus.show = true;
+    camera.lookAt(position, new Cesium.HeadingPitchRange(-0.3, -0.92, 135));
+    camera.lookAtTransform(Cesium.Matrix4.IDENTITY);
+    if (cameraDrop) camera.moveDown(cameraDrop);
+    this.viewer.scene.requestRender();
+  }
+
+  clearPadFocus() {
+    this.padFocus.show = false;
+    this.viewer.scene.requestRender();
+  }
+
+  drawRoute(waypoints, rerouted, preview = false) {
     const entities = this.layers.get("route").entities;
     entities.removeAll();
+    this.addRoute(entities, waypoints, rerouted, preview ? "#a5efff" : null);
+    this.viewer.scene.requestRender();
+  }
+
+  drawReplayRoutes(segments, comparison) {
+    const entities = this.layers.get("route").entities;
+    entities.removeAll();
+    if (comparison) this.addRoute(entities, comparison, false, "#6588aa");
+    segments.forEach(({ flown }, index) => this.addRoute(entities, flown, index > 0));
+    this.viewer.scene.requestRender();
+  }
+
+  addRoute(entities, waypoints, rerouted, dashedTint = null) {
     const tints = { takeoff: "#6be1ff", cruise: "#b2ffa2", landing: "#d7a5ff", transition: "#ffcd85" };
     for (let i = 1; i < waypoints.length; i += 1) {
       const phase = waypoints[i].phase;
@@ -343,13 +406,13 @@ export class CampusMap {
       entities.add({
         polyline: {
           positions: waypoints.slice(i - 1, i + 1).map(({ lon, lat, alt }) => degrees([lon, lat], alt)),
-          width: 5,
-          material: new Cesium.PolylineGlowMaterialProperty({ color: color(hex), glowPower: .2 }),
+          width: dashedTint ? 4 : 5,
+          material: dashedTint ? new Cesium.PolylineDashMaterialProperty({ color: color(dashedTint) })
+            : new Cesium.PolylineGlowMaterialProperty({ color: color(hex), glowPower: .2 }),
           arcType: Cesium.ArcType.NONE,
         },
       });
     }
-    this.viewer.scene.requestRender();
   }
 
   setHazards(features) {
