@@ -3,7 +3,9 @@ const TEXT = "#e6f6ff";
 const MUTED = "#a6c9e1";
 const SAFE = "#52f1b3";
 const DANGER = "#ff858e";
-const MONO = "ui-monospace, Consolas, monospace";
+const typography = getComputedStyle(document.documentElement);
+const READOUT_FONT = typography.getPropertyValue("--readout-font").trim() || "monospace";
+const LABEL_FONT = typography.getPropertyValue("--ui-font").trim() || "system-ui, sans-serif";
 const PHASE_LABELS = { takeoff: "起飞", cruise: "巡航", landing: "降落", transition: "调整高度" };
 
 function clamp(value, min, max) {
@@ -17,8 +19,8 @@ function line(ctx, points) {
   ctx.stroke();
 }
 
-function text(ctx, value, x, y, { color = TEXT, size = 13, weight = 600, align = "left" } = {}) {
-  ctx.font = weight + " " + size + "px " + MONO;
+function text(ctx, value, x, y, { color = TEXT, size = 13, weight = 650, align = "left", font = READOUT_FONT } = {}) {
+  ctx.font = `${weight} ${size}px ${font}`;
   ctx.textAlign = align;
   ctx.fillStyle = color;
   ctx.fillText(value, x, y);
@@ -46,14 +48,14 @@ function drawTape(ctx, { x, y, width, height, right, name, value, unit, step, ra
   const gap = 8;
   plate(ctx, x, top - readoutHeight - gap, width, readoutHeight);
   if (compact) {
-    text(ctx, name, x + width / 2, top - gap - 28, { color: MUTED, size: 10, align: "center" });
+    text(ctx, name, x + width / 2, top - gap - 28, { color: MUTED, size: 10, align: "center", font: LABEL_FONT });
     text(ctx, value.toFixed(1) + unit, x + width / 2, top - gap - 12,
       { color: CYAN, size: 12, weight: 740, align: "center" });
   } else {
     const baseline = top - gap - readoutHeight / 2;
     const rightEdge = x + width - 9;
-    text(ctx, name, x + 9, baseline, { color: MUTED, size: 11 });
-    text(ctx, unit, rightEdge, baseline + 2, { color: MUTED, size: 11, align: "right" });
+    text(ctx, name, x + 9, baseline, { color: MUTED, size: 11, font: LABEL_FONT });
+    text(ctx, unit, rightEdge, baseline + 2, { color: MUTED, size: 11, align: "right", font: LABEL_FONT });
     text(ctx, value.toFixed(1), rightEdge - ctx.measureText(unit).width - 4, baseline,
       { color: CYAN, size: 17, weight: 740, align: "right" });
   }
@@ -179,13 +181,13 @@ function drawTelemetry(ctx, x, y, battery, clearance, low, alarm, compact) {
   }
   ctx.globalAlpha = 1;
   const textX = start + batteryWidth + 10;
-  text(ctx, "BAT", textX, middle, { color: MUTED, size: compact ? 10 : 11 });
+  text(ctx, "BAT", textX, middle, { color: MUTED, size: compact ? 10 : 11, font: LABEL_FONT });
   text(ctx, Math.round(battery) + "%", textX + 25, middle,
     { color: low ? DANGER : CYAN, size: compact ? 13 : 16, weight: 750 });
   const divider = x + (compact ? 110 : 132);
   ctx.strokeStyle = "#9fc7e482";
   line(ctx, [[divider, y + 7], [divider, y + height - 7]]);
-  text(ctx, "CLEARANCE", divider + 10, middle, { color: MUTED, size: compact ? 10 : 11 });
+  text(ctx, "CLEARANCE", divider + 10, middle, { color: MUTED, size: compact ? 10 : 11, font: LABEL_FONT });
   text(ctx, clearance === null ? "—" : clearance.toFixed(1) + " m", x + width - 10, middle,
     { color: alarm ? DANGER : CYAN, size: compact ? 12 : 16, weight: 750, align: "right" });
 }
@@ -245,7 +247,8 @@ export class FlightHUD {
     const statusWidth = compact ? 103 : 140;
     const statusX = width - margin - statusWidth;
     plate(ctx, statusX, 45, statusWidth, 28, tint);
-    text(ctx, status, statusX + statusWidth / 2, 59, { color: tint, size: compact ? 11 : 13, align: "center" });
+    text(ctx, status, statusX + statusWidth / 2, 59,
+      { color: tint, size: compact ? 11 : 13, align: "center", font: LABEL_FONT });
     ctx.globalAlpha = 1;
 
     drawHeading(ctx, centerX, Math.max(77, height * .133), Math.min(width * .255, 220), frame.heading ?? 0, compact);
@@ -255,7 +258,8 @@ export class FlightHUD {
     drawTape(ctx, { x: width - margin - tapeWidth, y: centerY, width: tapeWidth, height: tapeHeight, right: true,
       name: "SPD", value: frame.speed, unit: "m/s", step: 1, range: 7, compact });
 
-    const telemetryY = width < 875 ? height - (compact ? 135 : 106) : height - 67;
+    // Leave the bottom band clear for the flight controls.
+    const telemetryY = height - (compact ? 135 : 110);
     drawTelemetry(ctx, margin, telemetryY, frame.battery, clearance, low, alarm, compact);
   }
 }

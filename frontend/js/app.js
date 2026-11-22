@@ -1,7 +1,7 @@
-import { CampusMap } from "./map3d.js?v=5";
+import { CampusMap } from "./map3d.js?v=7";
 import { DroneSim } from "./drone_sim.js?v=4";
 import { FlightReplay, flightClock } from "./flight_replay.js";
-import { FlightHUD } from "./ar_hud.js";
+import { FlightHUD } from "./ar_hud.js?v=7";
 import { AgentUI, plainDispatchText } from "./agent_ui.js?v=6";
 
 const element = (id) => document.getElementById(id);

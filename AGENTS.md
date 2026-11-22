@@ -12,7 +12,8 @@
 # Brand & UI Identity（品牌与界面标识规范）
 - **项目名称**：`VoxAero`（中文副标：`维空智航 · 低空三维导航与智能体调度平台`）
 - **网页标题（`<title>`）**：`VoxAero — 低空三维数字孪生与智能体调度平台`
-- **顶栏 Logo**：左侧展示 `VoxAero` 极简几何标志与名称，右侧附紧凑副标 `Spatial Agent & 3D Airspace Twin`
+- **顶栏 Logo**：几何标志后横向排列 `VoxAero` 与 `维空智航`，顶栏品牌区保留这两个名称。
+- **文字层级**：标题、正文、控件、说明和数字读数沿用 `frontend/css/style.css` 的共享字号与字重。实时读数使用等宽数字。
 - **无人机标识 / HUD 呼号**：`VOXAERO-01`
 - **后端服务元数据**：FastAPI 初始化设置 `title="VoxAero API"`、`version="1.0.0"`，`/api/health` 返回字段包含 `"service": "VoxAero"`。
 
@@ -36,7 +37,7 @@
    - **必须内置 Deterministic Fallback（确定性规则兜底引擎）**：当未配置 `LLM_API_KEY` 或网络请求超时失败时，自动降级到本地关键词+正则意图解析器，完整输出与真实 Agent 相同格式的推理步骤（`thought_steps`）和工具调用结果，确保演示永不崩溃。
 4. **Git 版本管理规范**：
    - 使用本地 Git 管理代码（默认分支 `main`），遵循 Conventional Commits 风格（如 `feat:`、`fix:`、`docs:`、`chore:`）。
-   - 每个 Phase 或独立功能在测试/验证通过后再执行 `git commit`，保持提交记录清晰、可回滚。
+   - 每轮修改完成并验证通过后，自动在当前分支执行本地 `git commit`，附上清晰的改动说明，方便查看和回滚。
    - **严禁**提交 `.env`、个人 API Key、缓存文件（`__pycache__/`、`.pytest_cache/`）或未授权执行 `git push`、`git reset --hard`。
 
 ---

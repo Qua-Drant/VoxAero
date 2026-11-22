@@ -6,10 +6,10 @@
   <title>VoxAero — 低空三维数字孪生与智能体调度平台</title>
   <link rel="icon" href="data:,">
   <link rel="stylesheet" href="https://cesium.com/downloads/cesiumjs/releases/1.119/Build/Cesium/Widgets/widgets.css">
-  <link rel="stylesheet" href="/css/style.css?v=6">
+  <link rel="stylesheet" href="/css/style.css?v=7">
   <script src="https://cdn.tailwindcss.com/3.4.17" defer></script>
   <script src="https://cesium.com/downloads/cesiumjs/releases/1.119/Build/Cesium/Cesium.js" defer></script>
-  <script src="/js/app.js?v=6" type="module"></script>
+  <script src="/js/app.js?v=7" type="module"></script>
 </head>
 <body>
   <svg class="icon-definitions" aria-hidden="true" focusable="false" width="0" height="0">
@@ -33,8 +33,10 @@
         <path fill="#72f3ff" d="m1 3 20 9L9 13Zm42 0-20 9 12 1Z"/>
         <path fill="#087caa" d="m4 17 17 12-9-13Zm36 0L23 29l9-13Z"/>
       </svg>
-      <div class="brand-wordmark"><strong>VoxAero</strong><p>维空智航</p></div>
-      <p class="brand-note">Spatial Agent &amp; 3D Airspace Twin</p>
+      <div class="brand-wordmark">
+        <strong class="brand-name" lang="en">VoxAero</strong>
+        <span class="brand-name-zh">维空智航</span>
+      </div>
     </div>
     <div class="view-switch segmented" role="group" aria-label="飞行视角">
       <button type="button" data-view="overview" aria-pressed="true" disabled>全局总览</button>

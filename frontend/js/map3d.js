@@ -1,4 +1,7 @@
 const Cesium = globalThis.Cesium;
+const typography = getComputedStyle(document.documentElement);
+const labelFont = typography.getPropertyValue("--ui-font").trim() || "system-ui, sans-serif";
+const readoutFont = typography.getPropertyValue("--readout-font").trim() || "monospace";
 
 const color = (hex, opacity = 1) => Cesium.Color.fromCssColorString(hex).withAlpha(opacity);
 const degrees = ([lon, lat], alt = 0) => Cesium.Cartesian3.fromDegrees(lon, lat, alt);
@@ -179,7 +182,7 @@ export class CampusMap {
         runAnimations: true,
       },
       label: {
-        text: "VOXAERO-01", font: "600 12px monospace", fillColor: color("#baffec"),
+        text: "VOXAERO-01", font: `650 12px ${readoutFont}`, fillColor: color("#baffec"),
         showBackground: true, backgroundColor: color("#10242b", .92),
         pixelOffset: new Cesium.Cartesian2(0, -37),
       },
@@ -187,7 +190,7 @@ export class CampusMap {
     this.guides = this.viewer.entities.add({
       show: false,
       label: {
-        text: "AR 降落靶标", font: "600 12px system-ui", fillColor: color("#abffb0"),
+        text: "AR 降落靶标", font: `650 12px ${labelFont}`, fillColor: color("#abffb0"),
         showBackground: true, backgroundColor: color("#122e23", .9),
         pixelOffset: new Cesium.Cartesian2(0, 16), disableDepthTestDistance: Number.POSITIVE_INFINITY,
       },
@@ -247,7 +250,7 @@ export class CampusMap {
         point: { pixelSize: 7, color: tint, outlineColor: color("#172838"), outlineWidth: 1.5 },
         label: {
           text: id,
-          font: "600 13px system-ui",
+          font: `650 13px ${readoutFont}`,
           fillColor: tint,
           style: Cesium.LabelStyle.FILL_AND_OUTLINE,
           outlineColor: color("#101724"),
@@ -298,7 +301,7 @@ export class CampusMap {
         position: degrees([west + (east - west) * 0.22, south + (north - south) * 0.09], alt),
         label: {
           text: alt + " m",
-          font: "600 12px system-ui",
+          font: `650 12px ${readoutFont}`,
           fillColor: color(tint),
           showBackground: true,
           backgroundColor: color("#111a26", 0.9),
