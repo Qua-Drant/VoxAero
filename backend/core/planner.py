@@ -123,6 +123,11 @@ class RoutePlanner:
             and (limits is None or limits.allows(altitude))
         )
 
+    def can_access_pad(self, pad: Vertiport, levels: tuple[int, ...], field: ObstacleField, blocked: np.ndarray) -> bool:
+        """Use the same takeoff/landing connections as the route search."""
+        local = self.airspace.frame.to_local(pad.position)
+        return bool(self._attachments(local, levels, field, blocked, pad.roof_obstacle, True))
+
     def _pad(self, pad_id: str) -> Vertiport:
         try:
             return self.airspace.vertiports[pad_id]

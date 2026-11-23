@@ -1,9 +1,9 @@
 import { CampusMap } from "./map3d.js?v=17";
-import { DroneSim } from "./drone_sim.js?v=8";
-import { FlightReplay, flightClock } from "./flight_replay.js?v=13";
+import { DroneSim } from "./drone_sim.js?v=9";
+import { FlightReplay, flightClock } from "./flight_replay.js?v=14";
 import { FlightHUD } from "./ar_hud.js?v=15";
 import { batteryReading, paintBattery } from "./battery_display.js";
-import { AgentUI, plainDispatchText } from "./agent_ui.js?v=18";
+import { AgentUI, plainDispatchText } from "./agent_ui.js?v=19";
 
 import { VerticalProfile } from "./flight_profile.js?v=14";
 
@@ -132,6 +132,7 @@ async function api(path, payload, exchange) {
     const error = new Error(typeof body?.detail === "string" ? body.detail : "请求失败，请检查参数后重试。");
     error.steps = body?.thought_steps;
     error.dispatchNotice = body?.status ? body : null;
+    error.temporaryFence = body?.temporary_nofly_zone;
     throw error;
   }
   return body;
@@ -594,6 +595,7 @@ function presentDraft(result, query, autoPlay = false) {
   setView("overview");
   renderSpatialPicks();
   map.setTaskSites(result.task_sites);
+  showSiteReferences(result.task_sites);
   map.setHazards(result.task_zones ?? []);
   map.setRouteTargets(result.intent.start_id, result.intent.end_id);
   map.drawRoute(result.waypoints, false, true, result.route_visits);
@@ -618,6 +620,7 @@ function presentChoices(result, query) {
       proposal.option = option;
       map.clearPadFocus();
       map.setTaskSites([option.start, option.end]);
+      showSiteReferences([option.start, option.end]);
       map.setHazards(result.task_zones ?? []);
       map.setRouteTargets(option.start.id, option.end.id);
       map.drawRoute(option.waypoints, false, true, option.route_visits);
@@ -656,6 +659,12 @@ async function confirmCandidate(optionId) {
     busy = null;
     refreshFlightState();
   }
+}
+
+function showSiteReferences(sites = []) {
+  map.showPickMarkers(sites.flatMap((site) => site.reference_position && site.offset_m >= 8
+    ? [{ ...site.reference_position, name: site.reference_name }]
+    : []));
 }
 
 function renderSpatialPicks() {
@@ -758,6 +767,7 @@ async function replan(type, { automatic = false } = {}) {
   mission.automaticEvent = null;
 
   const before = sim.snapshot();
+  const wasHolding = mission.hold;
   const constraints = mission.original.intent.constraints;
   const elapsed = mission.elapsedBeforeSegment + before.elapsed;
   const segmentIndex = mission.segments.length - 1;
@@ -776,6 +786,7 @@ async function replan(type, { automatic = false } = {}) {
     mission_token: mission.original.mission_token,
     mission_type: mission.current.corridor,
     emergency_type: type,
+    battery_percent: sim.battery,
     ...(hazard && { dynamic_hazard: hazard }),
     active_hazards: mission.hazards,
     avoid_zone_ids: [...mission.avoid],
@@ -783,13 +794,16 @@ async function replan(type, { automatic = false } = {}) {
     completed_visits: mission.diverted ? 0 : mission.completedVisits,
   };
   const exchange = ui.beginExchange();
+  const keepFence = (fence) => {
+    if (!fence || !hazard || mission.volumes.some(({ properties }) => properties.id === fence.properties.id)) return;
+    mission.hazards.push(hazard);
+    mission.volumes.push(fence);
+    map.setHazards(mission.volumes);
+  };
   try {
     const result = await api(path, payload, exchange);
     if (result.scene_version !== sceneVersion) throw new Error("空域场景已变更，请刷新后重新调度。");
-    if (result.temporary_nofly_zone && hazard) {
-      mission.hazards.push(hazard);
-      mission.volumes.push(result.temporary_nofly_zone);
-    }
+    keepFence(result.temporary_nofly_zone);
     mission.diverted ||= type === "low_battery";
     mission.elapsedBeforeSegment = elapsed;
     mission.hold = false;
@@ -797,19 +811,22 @@ async function replan(type, { automatic = false } = {}) {
     installRoute(result, result.target_id, sim.battery, true);
     const action = type === "low_battery" ? "备降" : "绕飞";
     const detail = hazard ? `临时禁飞区半径 ${format.format(hazard.radius_m)} 米`
-      : `改降 ${targetLabel(result.target_id)}`;
+      : `改降 ${targetLabel(result.target_id)}${result.arrival_battery_percent == null
+        ? "" : ` · 预计落地电量 ${format.format(result.arrival_battery_percent)}%`}`;
     mission.events.push({
       ...event, segmentIndex: segmentIndex + 1, name: `${incident} · ${action}获准`, compare: true,
       detail,
     });
-    ui.status(`${incident}，${action}航线已接入。`);
-    if (before.playing) sim.play();
+    ui.status(`${incident}，${action}航线已接入${result.arrival_battery_percent == null
+      ? "" : ` · 预计落地电量 ${format.format(result.arrival_battery_percent)}%`}。`);
+    if (before.playing || wasHolding) sim.play();
     void ui.revealSteps(exchange, result.thought_steps, zoneNames);
   } catch (error) {
     const detail = plainDispatchText(error.message);
+    keepFence(error.temporaryFence);
     mission.hold = true;
     mission.events.push({ ...event, segmentIndex, name: `${incident} · 仿真悬停`,
-      detail, battery: sim.battery });
+      detail, battery: sim.battery, volumes: [...mission.volumes] });
     saveReview(sim.snapshot(), "仿真悬停 · 应急规划未成功");
     ui.status(`${incident}，已悬停 · ${detail}`, true);
     void ui.revealSteps(exchange, error.steps);
@@ -832,8 +849,9 @@ async function launch() {
     padNames = new Map(data.vertiports.features.map(({ properties }) => [properties.id, properties.name]));
     zoneNames = new Map(data.nofly_zones.features.map(({ properties }) => [properties.id, properties.name]));
     profile = new VerticalProfile(map);
-    sim = new DroneSim(map, onFrame);
+    sim = new DroneSim(map, onFrame, data.battery_model);
     review = new FlightReplay(map, {
+      batteryModel: data.battery_model,
       onFrame: paintReplay,
       onSegment: ({ result, target }) => {
         lastTelemetry = -Infinity;
@@ -986,7 +1004,24 @@ playButton.addEventListener("click", () => {
     ui.status("仿真飞行中。");
   }
 });
-resetButton.addEventListener("click", () => {
+resetButton.addEventListener("click", async () => {
+  if (!mission || busy) return;
+  if (mission.hazards.length && mission.original.mission_token) {
+    busy = "reset";
+    refreshFlightState();
+    try {
+      const refreshed = await api("/api/agent/restart-mission", {
+        mission_token: mission.original.mission_token, scene_version: sceneVersion,
+      });
+      mission.original.mission_token = refreshed.mission_token;
+    } catch (error) {
+      ui.status(plainDispatchText(error.message), true);
+      return;
+    } finally {
+      busy = null;
+      refreshFlightState();
+    }
+  }
   if (isInFlight() && !mission.hold) saveReview(frame, "任务中止 · 已重置仿真", "重置飞行");
   mission.hazards = [];
   mission.volumes = [...(mission.original.task_zones ?? [])];

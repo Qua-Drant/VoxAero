@@ -13,14 +13,16 @@ from time import monotonic
 from openai import OpenAI, OpenAIError
 from shapely.geometry.polygon import orient
 
-from backend.config import LLMSettings, MISSION_LAYERS
+from backend.config import (
+    BATTERY_PERCENT_PER_CLIMB_M, BATTERY_PERCENT_PER_SECOND, BATTERY_RESERVE_PERCENT, LLMSettings, MISSION_LAYERS,
+)
 from backend.core.airspace import Airspace, Obstacle, Vertiport
 from backend.core.intent import (
     ALT_CONTEXT, CHAT, CLARIFY_INTENT_MESSAGE, DISPATCH_WORDS, HELP, HELP_MESSAGE, LOW_FLIGHT, MEASUREMENT,
     ROUTE_WORDS, SCOPE_MESSAGE, TIME_REQUEST, UNSUPPORTED_STOP, intersect_limits, parse_constraints,
 )
 from backend.core.planner import NoRouteError, RoutePlanner
-from backend.core.spatial_dispatch import SpatialDispatch, route_visits
+from backend.core.spatial_dispatch import ActiveTask, SpatialDispatch, route_visits
 from backend.schemas import (
     AssessedRoute, CruiseLimits, DispatchCandidate, DispatchConstraints, DispatchIntent, DispatchNotice,
     DispatchNoticeType, DispatchResult, DynamicHazard, HazardFeature, HazardPolygon, LLMMode, MissionType,
@@ -69,22 +71,24 @@ class PendingDispatch:
     mode: LLMMode
     model_fallback: bool
     expires_at: float
+    allow_layer_fallback: bool
 
 
 class AgentError(ValueError):
-    def __init__(self, message: str, steps: list[ThoughtStep], status: int) -> None:
+    def __init__(self, message: str, steps: list[ThoughtStep], status: int, hazard: HazardFeature | None = None) -> None:
         super().__init__(message)
         self.steps = steps
         self.status = status
+        self.hazard = hazard
 
 
 def _add(steps: list[ThoughtStep], role, content: str) -> None:
     steps.append(ThoughtStep(step=len(steps) + 1, role=role, content=content))
 
 
-def _error(steps: list[ThoughtStep], message: str, status: int) -> AgentError:
+def _error(steps: list[ThoughtStep], message: str, status: int, hazard: HazardFeature | None = None) -> AgentError:
     _add(steps, "observation", message)
-    return AgentError(message, steps, status)
+    return AgentError(message, steps, status, hazard)
 
 
 def _aliases(names: dict[str, str], extras: dict[str, tuple[str, ...]]) -> dict[str, str]:
@@ -349,17 +353,18 @@ class DispatchAgent:
             return self._notice(steps, "constraint_conflict", "任务要求避开高空，但指定的巡检或高空航道为 60–90 米。请调整任务或高度要求。",
                                 mode=mode, model_called=model_called)
         model_fallback = model_called and mode == "fallback_mock"
+        allow_layer_fallback = not (candidate.prefer_high_altitude or LOW_FLIGHT.search(query) or constraints.cruise)
         if not (candidate.start_id and candidate.end_id):
             token = token_urlsafe(24)
             with self.pending_lock:
                 self.pending[token] = PendingDispatch(candidate, constraints, mode, model_fallback,
-                                                      monotonic() + PENDING_TTL_SECONDS)
+                                                      monotonic() + PENDING_TTL_SECONDS, allow_layer_fallback)
                 if len(self.pending) > PENDING_LIMIT:
                     self.pending.popitem(last=False)
             missing = "起点" if candidate.end_id else "终点" if candidate.start_id else "起点和终点"
             return self._notice(steps, "needs_clarification", f"请补充{missing}的起降点编号或场景地名。",
                                 mode=mode, model_called=model_called, token=token)
-        return self._plan_dispatch(candidate, constraints, mode, steps, model_called, model_fallback)
+        return self._plan_dispatch(candidate, constraints, mode, steps, model_called, model_fallback, allow_layer_fallback)
 
     def _is_pad_reply(self, query: str, mentioned: list[str]) -> bool:
         if not 1 <= len(mentioned) <= 2:
@@ -393,7 +398,8 @@ class DispatchAgent:
             candidate = candidate.model_copy(update={"start_id": reply.start_id, "end_id": reply.end_id})
         if not candidate.start_id or not candidate.end_id:
             return self._notice(steps, "clarification_closed", "补答仍缺少明确起降坪，请重新提交完整调度指令。")
-        return self._plan_dispatch(candidate, pending.constraints, pending.mode, steps, False, pending.model_fallback)
+        return self._plan_dispatch(candidate, pending.constraints, pending.mode, steps, False, pending.model_fallback,
+                                   pending.allow_layer_fallback)
 
     @staticmethod
     def _notice(
@@ -406,7 +412,7 @@ class DispatchAgent:
 
     def _plan_dispatch(
         self, candidate: DispatchCandidate, constraints: DispatchConstraints, mode: LLMMode,
-        steps: list[ThoughtStep], model_called: bool, model_fallback: bool,
+        steps: list[ThoughtStep], model_called: bool, model_fallback: bool, allow_layer_fallback: bool,
     ) -> DispatchResult | DispatchNotice:
         intent = DispatchIntent(**candidate.model_dump(), constraints=constraints)
         try:
@@ -429,37 +435,30 @@ class DispatchAgent:
         rule = f"全高度绕开{zones}，并应用其余空域限制。" if zones else "应用建筑缓冲区和全部静态空域限制。"
         _add(steps, "observation", rule)
         _add(steps, "action", "plan_3d_route · 搜索三维体素航线并复核航段")
-        preferred = intersect_limits(limits, constraints.preferred_cruise)
-        try:
-            if constraints.preferred_cruise and preferred != limits:
-                try:
-                    route = self.plan_3d_route(intent.start_id, intent.end_id, corridor,
-                                               avoid_zone_ids=intent.avoid_zone_ids, cruise_limits=preferred)
-                except NoRouteError:
-                    _add(steps, "observation", "巡航高度偏好下没有合规航线，继续按硬约束规划。")
-                else:
-                    return self._finish_dispatch(intent, route, corridor, mode, steps, model_called, model_fallback)
-            route = self.plan_3d_route(
-                intent.start_id, intent.end_id, corridor, avoid_zone_ids=intent.avoid_zone_ids, cruise_limits=limits,
+        alternate = "inspection" if corridor == "delivery" else "delivery"
+        for layer_id in (corridor, alternate) if allow_layer_fallback else (corridor,):
+            task = ActiveTask(intent, {}, (), layer_id, allow_layer_fallback)
+            try:
+                route, _, preferred = self.spatial.route(task)
+            except NoRouteError:
+                continue
+            if layer_id != corridor:
+                alternate_layer = MISSION_LAYERS[layer_id]
+                _add(steps, "observation", f"默认航层未找到可行航线，改用 {alternate_layer.min_alt:g}–{alternate_layer.max_alt:g} 米航层。")
+            elif not preferred:
+                _add(steps, "observation", "航线满足必须条件，部分高度偏好未满足。")
+            _add(steps, "observation", f"规划成功，{len(route.waypoints)} 个航点，{route.distance_m:.0f} m。")
+            return DispatchResult(
+                intent=intent, mode=mode, model_called=model_called, model_fallback=model_fallback,
+                corridor=layer_id, start_name=start_name, end_name=end_name,
+                waypoints=route.waypoints, kpis=route.kpis, thought_steps=steps,
+                mission_token=self.spatial.activate(task),
+                airspace_check=self.airspace.check_airspace(route.waypoints, route.flight_seconds),
             )
-        except NoRouteError as exc:
-            if limits:
-                return self._notice(steps, "constraint_conflict", "指定巡航高度和空域限制下没有合规航线。",
-                                    mode=mode, model_called=model_called)
-            raise _error(steps, "当前空域与高度层下没有合规航线。", 409) from exc
-        return self._finish_dispatch(intent, route, corridor, mode, steps, model_called, model_fallback)
-
-    def _finish_dispatch(
-        self, intent: DispatchIntent, route: AssessedRoute, corridor: MissionType, mode: LLMMode,
-        steps: list[ThoughtStep], model_called: bool, model_fallback: bool,
-    ) -> DispatchResult | DispatchNotice:
-        _add(steps, "observation", f"规划成功，{len(route.waypoints)} 个航点，{route.distance_m:.0f} m。")
-        return DispatchResult(
-            intent=intent, mode=mode, model_called=model_called, model_fallback=model_fallback,
-            corridor=corridor, start_name=self.pad_names[intent.start_id], end_name=self.pad_names[intent.end_id],
-            waypoints=route.waypoints, kpis=route.kpis, thought_steps=steps,
-            airspace_check=self.airspace.check_airspace(route.waypoints, route.flight_seconds),
-        )
+        if limits:
+            return self._notice(steps, "constraint_conflict", "指定巡航高度和空域限制下没有合规航线。",
+                                mode=mode, model_called=model_called)
+        raise _error(steps, "当前空域与允许的高度层下未找到合规航线。", 409)
 
     def replan_emergency(self, request: ReplanRequest) -> ReplanResult:
         steps: list[ThoughtStep] = []
@@ -470,9 +469,13 @@ class DispatchAgent:
             raise _error(steps, "本任务的临时起降点会话已失效，请重新规划。", 409)
         pads = self.airspace.vertiports | (task.pads if task else {})
         if task:
+            try:
+                limits = intersect_limits(task.intent.constraints.cruise, request.cruise_limits)
+            except ValueError as exc:
+                raise _error(steps, "应急请求的高度范围与原任务的硬约束冲突。", 409) from exc
             request = request.model_copy(update={
                 "avoid_zone_ids": tuple(dict.fromkeys((*task.intent.avoid_zone_ids, *request.avoid_zone_ids))),
-                "cruise_limits": intersect_limits(task.intent.constraints.cruise, request.cruise_limits),
+                "cruise_limits": limits,
             })
         if request.target_id not in pads:
             raise _error(steps, "原目的地不在起降坪清单内。", 422)
@@ -480,14 +483,28 @@ class DispatchAgent:
             raise _error(steps, "指定的禁飞区编号不在空域清单内。", 422)
 
         if task and request.target_id == task.intent.end_id:
-            corridor = "inspection" if task.intent.prefer_high_altitude else task.intent.mission_type
+            corridor = task.corridor
         else:
             corridor = request.mission_type or ("inspection" if request.current_pos.alt >= 60 else "delivery")
-        hazards = (task.hazards if task else ()) + request.active_hazards
+        target = request.target_id
+        via = task.intent.via if task and target == task.intent.end_id else ()
+        if request.completed_visits > len(via):
+            raise _error(steps, "途经进度与当前任务不匹配。", 422)
+        remaining = via[request.completed_visits:] if request.emergency_type != "low_battery" else ()
+
         feature = None
-        if request.dynamic_hazard is not None:
-            hazards += (request.dynamic_hazard,)
-            obstacle = Obstacle.from_hazard(request.dynamic_hazard, self.airspace.frame, len(hazards))
+        hazard = request.dynamic_hazard
+        if hazard is not None and request.mission_token:
+            try:
+                task = self.spatial.remember_hazard(request.mission_token, hazard)
+            except ValueError as exc:
+                raise _error(steps, str(exc), 409) from exc
+            if task is None:
+                raise _error(steps, "应急任务会话已过期，请重新规划。", 409)
+        stored = (*task.hazards, *task.active_hazards) if task else ()
+        hazards = tuple(dict.fromkeys((*stored, *request.active_hazards, *((hazard,) if hazard else ()))))
+        if hazard is not None:
+            obstacle = Obstacle.from_hazard(hazard, self.airspace.frame, hazards.index(hazard) + 1)
             ring = [self.airspace.frame.to_position((x, y, 0)) for x, y in orient(obstacle.footprint).exterior.coords]
             feature = HazardFeature(
                 properties=NoFlyProperties(
@@ -496,18 +513,14 @@ class DispatchAgent:
                 ),
                 geometry=HazardPolygon(coordinates=[[(point.lon, point.lat) for point in ring]]),
             )
-            _add(steps, "observation", f"已应用半径 {request.dynamic_hazard.radius_m:g} m 的临时禁飞区。")
+            _add(steps, "observation", f"已应用半径 {hazard.radius_m:g} m 的临时禁飞区。")
 
-        target = request.target_id
-        via = task.intent.via if task and target == task.intent.end_id else ()
-        if request.completed_visits > len(via):
-            raise _error(steps, "途经进度与当前任务不匹配。", 422)
-        remaining = via[request.completed_visits:] if request.emergency_type != "low_battery" else ()
         try:
             if request.emergency_type == "low_battery":
                 _add(steps, "action", "plan_3d_route · 比较可达应急坪的合规航线")
-                route, target, corridor = self._divert(request, corridor, hazards, pads)
-                _add(steps, "observation", f"选定最短可达备降航线 · {target} {pads[target].properties.name}。")
+                route, target, corridor = self._divert(request, corridor, hazards, pads,
+                                                       allow_layer_fallback=task is None or task.allow_layer_fallback)
+                _add(steps, "observation", f"选定可达备降点 · {target} {pads[target].properties.name}。")
             else:
                 _add(steps, "action", f"plan_3d_route · 从当前坐标绕飞至 {target}")
                 route = self.plan_3d_route(
@@ -515,8 +528,17 @@ class DispatchAgent:
                     cruise_limits=request.cruise_limits, via=remaining,
                 )
         except NoRouteError as exc:
-            raise _error(steps, "当前位置和空域限制下没有合规应急航线。", 409) from exc
+            reason = ("当前空域和剩余电量下没有满足预留电量的可达备降点。"
+                      if request.emergency_type == "low_battery" and request.battery_percent is not None
+                      else "当前位置和空域限制下没有合规应急航线。")
+            raise _error(steps, reason, 409, feature) from exc
 
+        arrival_battery = None
+        if request.battery_percent is not None:
+            arrival_battery = request.battery_percent - route.kpis.estimated_battery_percent
+            if arrival_battery < BATTERY_RESERVE_PERCENT:
+                raise _error(steps, "剩余电量不足以完成绕飞并保留安全余量，可尝试低电量备降。", 409, feature)
+            _add(steps, "observation", f"预计落地电量 {arrival_battery:.1f}%，已预留 {BATTERY_RESERVE_PERCENT:g}%。")
         _add(steps, "observation", f"新航线已通过空域校验，剩余航程 {route.distance_m:.0f} m。")
         if remaining:
             _add(steps, "observation", "改航保留剩余途经点：" + " → ".join(site.name for site in remaining) + "。")
@@ -524,16 +546,19 @@ class DispatchAgent:
             emergency_type=request.emergency_type, original_target_id=request.target_id, target_id=target,
             corridor=corridor, waypoints=route.waypoints, kpis=route.kpis, thought_steps=steps,
             temporary_nofly_zone=feature, route_visits=route_visits(remaining, route),
+            arrival_battery_percent=round(arrival_battery, 2) if arrival_battery is not None else None,
             airspace_check=self.airspace.check_airspace(route.waypoints, route.flight_seconds),
         )
 
     def _divert(
-        self, request: ReplanRequest, corridor: MissionType, hazards: tuple[DynamicHazard, ...], pads: dict[str, Vertiport]
+        self, request: ReplanRequest, corridor: MissionType, hazards: tuple[DynamicHazard, ...],
+        pads: dict[str, Vertiport], *, allow_layer_fallback: bool,
     ) -> tuple[AssessedRoute, str, MissionType]:
         emergency, other = [], []
         for pad in pads.values():
             (emergency if pad.properties.type == "emergency" else other).append(pad)
-        corridors = (corridor, "inspection" if corridor == "delivery" else "delivery")
+        alternate = "inspection" if corridor == "delivery" else "delivery"
+        corridors = (corridor, alternate) if allow_layer_fallback else (corridor,)
         for group in (emergency, other):
             candidates = []
             for pad in group:
@@ -545,9 +570,14 @@ class DispatchAgent:
                         )
                     except NoRouteError:
                         continue
+                    if (request.battery_percent is not None
+                            and route.kpis.estimated_battery_percent + BATTERY_RESERVE_PERCENT > request.battery_percent):
+                        continue
                     candidates.append((route, pad.properties.id, candidate_layer))
             if candidates:
-                return min(candidates, key=lambda candidate: candidate[0].distance_m)
+                if request.battery_percent is None:
+                    return min(candidates, key=lambda candidate: candidate[0].distance_m)
+                return min(candidates, key=lambda candidate: (candidate[0].kpis.estimated_battery_percent, candidate[0].distance_m))
         raise NoRouteError("No reachable diversion pad")
 
     def _metrics(
@@ -565,11 +595,12 @@ class DispatchAgent:
         end_roof = end_pad.roof_obstacle
         positions = [self.airspace.frame.to_local(point) for point in route.waypoints]
         field, _ = self.airspace.with_hazards(hazards, avoid_zone_ids)
-        elapsed = 0.0
+        elapsed = climb = 0.0
         clearance = float("inf")
         for (a, b), arrival in zip(pairwise(positions), route.waypoints[1:], strict=True):
             elapsed += max(hypot(b[0] - a[0], b[1] - a[1]) / FLIGHT_SPEED_MPS[corridor],
                            abs(b[2] - a[2]) / VERTICAL_SPEED_MPS)
+            climb += max(0, b[2] - a[2])
             roof = start_roof if arrival.phase == "takeoff" else end_roof if arrival.phase == "landing" else None
             clearance = min(clearance, field.segment_clearance(a, b, roof_access=roof))
         checkpoints = (positions[0], *(positions[index] for index in route.visit_indices), positions[-1])
@@ -583,5 +614,6 @@ class DispatchAgent:
             min_clearance_m=int(clearance * 100) / 100 if isfinite(clearance) else None,
             compliant=True,
             compliance_percent=100,
+            estimated_battery_percent=elapsed * BATTERY_PERCENT_PER_SECOND + climb * BATTERY_PERCENT_PER_CLIMB_M,
         )
         return kpis, elapsed

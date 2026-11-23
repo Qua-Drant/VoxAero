@@ -12,7 +12,7 @@ from math import cos, hypot, pi, sin
 from secrets import token_urlsafe
 from threading import Lock
 from time import monotonic
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable
 
 from openai import OpenAIError
 from pydantic import BaseModel
@@ -45,6 +45,9 @@ ORIGINS = ("从", "由", "起点")
 EXTRA_CONSTRAINT = re.compile(r"[，,。；;]|\s*(?:绕开|避开|绕过|巡航|飞行时限|对比|比较|提供多条)")
 COMPARE = re.compile(r"(?:比较|对比|提供|给我|给出|规划)?\s*(?:多条|多种|备选|替代|[两三二23]条)\s*(?:可行)?(?:航线|路线|方案)|(?:比较|对比)(?:可行)?(?:航线|路线|方案)")
 MAX_VISITS = 3
+NEAR_RADIUS_M = 96
+EXPANDED_RADIUS_M = 168
+SITE_STEP_M = 12
 ROOFTOP = re.compile(r"楼顶|屋顶|屋面")
 SEARCH = re.compile(r"附近|空地|地面(?:点|起降|位置)|找.{0,8}(?:起飞|降落|起降|地面)|择优|任选|候选")
 AIRSPACE_QUERY = re.compile(r"(?:查(?:询|看)?|核验|确认).{0,36}(?:空域|禁飞|围栏)|(?:是否|能否|会不会).{0,8}禁飞|是不是禁飞")
@@ -98,6 +101,8 @@ class SpatialDraft:
     compare: bool
     mode: LLMMode
     model_called: bool
+    allow_layer_fallback: bool = False
+    expand_search: bool = False
 
 
 @dataclass(frozen=True)
@@ -105,6 +110,7 @@ class LocationIssue:
     reason: str
     options: tuple[Reference, ...] = ()
     map_pick: bool = True
+    expand_search: bool = False
 
 
 @dataclass(frozen=True)
@@ -126,6 +132,9 @@ class ActiveTask:
     intent: DispatchIntent
     pads: dict[str, Vertiport]
     hazards: tuple[DynamicHazard, ...]
+    corridor: MissionType
+    allow_layer_fallback: bool
+    active_hazards: tuple[DynamicHazard, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -435,7 +444,9 @@ class SpatialDispatch:
                  "end": roles.get("end", parsed.end_id or "")}
         selected = {slot: Reference(Place("地图点选位置", point), exact=True)
                     for slot, point in (("start", options.start), ("end", options.end)) if point}
-        draft = SpatialDraft(slots, selected, parsed, constraints, hazards, kind, bool(COMPARE.search(query)), mode, called)
+        allow_layer_fallback = not (parsed.prefer_high_altitude or LOW_FLIGHT.search(query) or constraints.cruise)
+        draft = SpatialDraft(slots, selected, parsed, constraints, hazards, kind, bool(COMPARE.search(query)), mode, called,
+                             allow_layer_fallback=allow_layer_fallback)
         return self.advance(draft, steps, model_called=called)
 
     def resolve_location(self, text: str, slot: str, resolved: dict[str, Reference]) -> Reference | LocationIssue:
@@ -526,7 +537,7 @@ class SpatialDispatch:
         return DispatchNotice(status=status, detail=detail, thought_steps=steps, mode=draft.mode, model_called=model_called,
                               clarification_token=f"geo-{token}", clarification=LocationClarification(
                                   slot=turn.slot, label=SLOT_LABELS[turn.slot], slots=slots, options=options,
-                                  map_pick=issue.map_pick))
+                                  map_pick=issue.map_pick, expand_search=issue.expand_search))
 
     def advance(
         self, draft: SpatialDraft, steps: list[ThoughtStep], *, model_called: bool = False,
@@ -562,6 +573,9 @@ class SpatialDispatch:
         event(steps, "action", f"继续确认{SLOT_LABELS[turn.slot]}，沿用已识别的地点、航层和避让要求。")
         draft = turn.draft
         slot = turn.slot
+        if query.rstrip("。！!").strip() in {"扩大搜索范围", "扩大范围"} and turn.issue.expand_search:
+            event(steps, "action", f"继续查找距离原地标 {EXPANDED_RADIUS_M} 米内的可达起降点。")
+            return self.plan_draft(replace(draft, expand_search=True), turn.resolved, steps)
         if (AVOID_CLAUSE.search(query) or LOW_FLIGHT.search(query) or UNSUPPORTED_STOP.search(query)
                 or ALT_CONTEXT.search(query) and MEASUREMENT.search(query)):
             detail = f"当前在确认{SLOT_LABELS[slot]}，原航层和避让要求仍保留。若要同时修改约束，请点「另起任务」并发送更新后的指令。"
@@ -622,53 +636,87 @@ class SpatialDispatch:
         start, end = resolved["start"], resolved["end"]
         via = tuple(RouteReference(name=place.name, lon=place.point.lon, lat=place.point.lat, osm_ref=place.osm_ref)
                     for key in draft.slots if key.startswith("via-") for place in (resolved[key].place,))
-        field, _ = self.airspace.with_hazards(hazards, parsed.avoid_zone_ids)
-        start_rejected, end_rejected = Counter(), Counter()
-        starts = self.sites(start, "起点", field, start_rejected)
-        ends = self.sites(end, "终点", field, end_rejected)
-        if not starts or not ends:
-            slot = "start" if not starts else "end"
-            place = resolved[slot].place
-            cause = "、".join(start_rejected if not starts else end_rejected) or "缺少可用地面位置"
-            detail = f"{SLOT_LABELS[slot]}「{place.name}」无法安全起降（{cause}）。试试附近的另一处地标或重新点选。"
-            issue = LocationIssue(detail)
-            return self.ask(LocationTurn(draft, resolved, slot, issue), steps, status="constraint_conflict")
-        rejected = start_rejected + end_rejected
-
-        event(steps, "action", "用场景地形、障碍包络及已载入围栏筛选地面点，逐组校验起降与航线。")
-        accepted = []
-        for origin, target in sorted(product(starts, ends), key=lambda pair: sum(item.site.offset_m for item in pair))[:8]:
-            intent = DispatchIntent(**parsed.model_dump(exclude={"start_id", "end_id", "mission_type"}),
-                                    start_id=origin.site.id, end_id=target.site.id, mission_type=draft.mission_type,
-                                    constraints=draft.constraints, via=via)
-            pads = {item.site.id: item.pad for item in (origin, target)}
-            task = ActiveTask(intent, pads, hazards)
-            try:
-                route, corridor, preferred = self.route(task)
-            except NoRouteError:
-                rejected["起降或航线不满足约束"] += 1
-                continue
-            accepted.append((origin.site, target.site, task, route, corridor, preferred, None))
-        if not accepted:
-            visit_slots = [key for key in draft.slots if key.startswith("via-")]
-            corridor = "inspection" if parsed.prefer_high_altitude else draft.mission_type
+        field, blocked = self.airspace.with_hazards(hazards, parsed.avoid_zone_ids)
+        primary = "inspection" if parsed.prefer_high_altitude else draft.mission_type
+        alternate = "inspection" if primary == "delivery" else "delivery"
+        corridors = (primary, alternate) if draft.allow_layer_fallback else (primary,)
+        radius = EXPANDED_RADIUS_M if draft.expand_search else NEAR_RADIUS_M
+        accepted, rejected = [], Counter()
+        accessible = {"start": False, "end": False}
+        blocked_visits = []
+        pad_access = {}
+        event(steps, "action", "正在核对起降通道、巡航层接入和完整航线。")
+        for corridor in corridors:
             layer = MISSION_LAYERS[corridor]
-            altitudes = [self.airspace.grid.center((0, 0, level))[2]
-                         for level in self.agent.planner.cruise_levels(layer, draft.constraints.cruise)]
-            if not altitudes:
-                return self.notice("constraint_conflict", "指定巡航高度与当前任务航层不兼容，请调整航层后重新规划。", steps)
-            slot = "end"
-            detail = "当前航层和避让要求下，起终点之间没有可行航线。可换一个终点或另起任务调整要求。"
-            if via:
-                slot = visit_slots[0]
-                detail = "无法按当前顺序和约束连接所有地点。可指定要替换的途经点，例如「第一个途经点改为……」。"
-                for key, place in zip(visit_slots, via, strict=True):
-                    x, y, _ = self.airspace.frame.to_local(Position(lon=place.lon, lat=place.lat, alt=0))
-                    if not any(field.segment_clear((x, y, alt), (x, y, alt)) for alt in altitudes):
-                        slot = key
-                        detail = f"{SLOT_LABELS[key]}「{place.name}」在当前航层内没有可飞越的高度。请选择附近的另一处途经点。"
+            levels = self.agent.planner.cruise_levels(layer, draft.constraints.cruise)
+            if not levels:
+                continue
+            blocked_visits.append(self.blocked_visits(via, levels, field))
+            if blocked_visits[-1]:
+                continue
+
+            def connects(pad: Vertiport) -> bool:
+                key = (pad.position, pad.roof_obstacle.id if pad.roof_obstacle else None, levels)
+                if key not in pad_access:
+                    pad_access[key] = self.agent.planner.can_access_pad(pad, levels, field, blocked)
+                return pad_access[key]
+
+            seen_pairs = set()
+            for dense in (False, True):
+                if dense:
+                    event(steps, "action", f"加密搜索原地标 {radius} 米内能接入航层的起降点。")
+                starts = self.sites(start, "起点", field, rejected, connects, radius, dense)
+                ends = self.sites(end, "终点", field, rejected, connects, radius, dense)
+                accessible["start"] |= bool(starts)
+                accessible["end"] |= bool(ends)
+                for origin, target in sorted(product(starts, ends), key=lambda pair: sum(item.site.offset_m for item in pair)):
+                    pair = (origin.pad.position, target.pad.position)
+                    if pair in seen_pairs:
+                        continue
+                    seen_pairs.add(pair)
+                    intent = DispatchIntent(**parsed.model_dump(exclude={"start_id", "end_id", "mission_type"}),
+                                            start_id=origin.site.id, end_id=target.site.id, mission_type=draft.mission_type,
+                                            constraints=draft.constraints, via=via)
+                    task = ActiveTask(intent, {item.site.id: item.pad for item in (origin, target)}, hazards, corridor,
+                                      draft.allow_layer_fallback)
+                    try:
+                        route, _, preferred = self.route(task)
+                    except NoRouteError:
+                        rejected["候选组合无法连成完整航线"] += 1
+                        continue
+                    accepted.append((origin.site, target.site, task, route, corridor, preferred, None))
+                    if len(accepted) == 3:
                         break
-            return self.ask(LocationTurn(draft, resolved, slot, LocationIssue(detail)), steps, status="constraint_conflict")
+                if accepted or (start.exact and end.exact):
+                    break
+            if accepted:
+                if corridor != primary:
+                    event(steps, "observation", f"默认航层未找到可行航线，已用 {layer.min_alt:g}–{layer.max_alt:g} 米航层复核。")
+                break
+
+        if not accepted:
+            if not blocked_visits:
+                return self.notice("constraint_conflict", "指定巡航高度与当前任务航层不兼容，请调整航层后重新规划。", steps)
+            visit_slots = [key for key in draft.slots if key.startswith("via-")]
+            blocked_everywhere = set.intersection(*blocked_visits)
+            if blocked_everywhere:
+                index = min(blocked_everywhere)
+                slot = visit_slots[index]
+                detail = f"{SLOT_LABELS[slot]}「{via[index].name}」在允许的航层内没有可飞越的高度，可替换该途经点。"
+                issue = LocationIssue(detail)
+            else:
+                slot = next((key for key in ("start", "end") if not accessible[key]), "end")
+                if via and all(accessible.values()):
+                    slot = visit_slots[0]
+                can_expand = not draft.expand_search and any(not ref.exact and not ref.place.pad_id for ref in (start, end))
+                if slot in accessible and not accessible[slot]:
+                    detail = f"{SLOT_LABELS[slot]}「{resolved[slot].place.name}」周边未找到满足净空和航层接入条件的起降点。"
+                else:
+                    detail = "已检查可接入航层的起降点，当前约束下仍未找到完整航线。"
+                detail += (" 可扩大搜索范围，或点选附近的另一处位置。" if can_expand
+                           else f" 可换一个{SLOT_LABELS[slot]}或在地图上点选。")
+                issue = LocationIssue(detail, expand_search=can_expand)
+            return self.ask(LocationTurn(draft, resolved, slot, issue), steps, status="constraint_conflict")
         compare = draft.compare or bool(via)
         if compare:
             best = min(accepted, key=self.rank)
@@ -677,16 +725,22 @@ class SpatialDispatch:
         plans = {}
         for number, (origin, target, task, route, corridor, _, fixed) in enumerate(ranked[:3], start=1):
             clearance = route.kpis.min_clearance_m
+            notes = []
+            if corridor != primary:
+                layer = MISSION_LAYERS[corridor]
+                notes.append(f"改用 {layer.min_alt:g}–{layer.max_alt:g} 米航层")
+            if max(origin.offset_m, target.offset_m) > NEAR_RADIUS_M:
+                notes.append("采用扩展范围内的起降点")
             label = f"{fixed:g} m 巡航" if fixed is not None else "可行航线"
             label = ("推荐" if number == 1 else f"方案 {number}") + " · " + label
             option = SpatialRouteOption(
                 id=f"choice-{number}", start=origin, end=target, corridor=corridor,
                 waypoints=route.waypoints, kpis=route.kpis, route_label=label,
-                route_visits=route_visits(via, route),
+                route_visits=route_visits(via, route), planning_note=" · ".join(notes) or None,
                 airspace_check=self.airspace.check_airspace(route.waypoints, route.flight_seconds),
                 recommendation=f"已校验 {len(via) + 2} 个任务位置 · 航程 {route.kpis.distance_m:.1f} m"
                 + (f" · 最小净空 {clearance:.1f} m" if clearance is not None else "")
-                + f" · 起终点偏移 {origin.offset_m + target.offset_m:.1f} m。",
+                + "。",
             )
             plans[option.id] = CandidatePlan(option, task, fixed)
         if via:
@@ -701,6 +755,15 @@ class SpatialDispatch:
             rejected=dict(rejected), task_zones=task_zones,
         )
 
+
+    def blocked_visits(self, via: tuple[RouteReference, ...], levels: tuple[int, ...], field: ObstacleField) -> set[int]:
+        altitudes = [self.airspace.grid.center((0, 0, level))[2] for level in levels]
+        blocked = set()
+        for index, place in enumerate(via):
+            x, y, _ = self.airspace.frame.to_local(Position(lon=place.lon, lat=place.lat, alt=0))
+            if not any(field.segment_clear((x, y, alt), (x, y, alt)) for alt in altitudes):
+                blocked.add(index)
+        return blocked
 
     @staticmethod
     def rank(item):
@@ -728,89 +791,114 @@ class SpatialDispatch:
             alternatives.append((origin, target, task, route, corridor, preferred, altitude))
         return alternatives
 
-    def sites(self, reference: Reference, role: str, field: ObstacleField, rejected: Counter[str]) -> list[SiteChoice]:
+    def sites(
+        self, reference: Reference, role: str, field: ObstacleField, rejected: Counter[str],
+        connects: Callable[[Vertiport], bool], radius: int, dense: bool,
+    ) -> list[SiteChoice]:
         place = reference.place
         if not bounded(place.point):
             rejected["位置超出场景范围"] += 1
             return []
         if place.pad_id:
             pad = self.airspace.vertiports[place.pad_id]
+            if not connects(pad):
+                rejected["无法接入允许的航层"] += 1
+                return []
             return [SiteChoice(TaskSite(id=place.pad_id, name=place.name, position=pad.position,
-                                        reference_name=place.name, offset_m=0), pad)]
+                                        reference_name=place.name, offset_m=0, reference_position=place.point), pad)]
 
-        x, y, _ = self.airspace.frame.to_local(Position(lon=place.point.lon, lat=place.point.lat, alt=0))
+        frame = self.airspace.frame
+        x, y, _ = frame.to_local(Position(lon=place.point.lon, lat=place.point.lat, alt=0))
         dx, dy = reference.direction or (0, 0)
-        base_x, base_y = x + 28 * dx, y + 28 * dy
         offsets = [(0, 0)]
         if not reference.exact:
-            offsets.extend((radius * cos(angle * pi / 4), radius * sin(angle * pi / 4))
-                           for radius in (12, 18, 24, 36, 48, 60, 84, 96) for angle in range(8))
-        candidates = []
-        terrain = field.terrain
-        registered = [self.airspace.frame.to_local(pad.position)[:2] for pad in self.airspace.vertiports.values()]
-        for east_offset, north_offset in offsets:
-            east, north = base_x + east_offset, base_y + north_offset
-            if reference.direction and (east - x) * dx + (north - y) * dy <= 5:
-                continue
-            if not reference.exact and any(hypot(east - px, north - py) < 8 for px, py in registered):
-                continue
-            alt = max(0, float(terrain.elevation(east, north))) if terrain is not None else 0
-            position = self.airspace.frame.to_position((east, north, alt))
-            if reference.exact:
-                position = Position(lon=place.point.lon, lat=place.point.lat, alt=alt)
-            if not bounded(position):
-                rejected["位置超出场景范围"] += 1
-                continue
-            point = Point(east, north)
-            if self.ground_exclusions.covers(point):
-                rejected["位置落在道路或水面"] += 1
-                continue
-            indexes = field.index.query(point.buffer(5), predicate="intersects")
-            if any(field.obstacles[index].min_alt <= alt + 3 and field.obstacles[index].max_alt >= alt
-                   for index in indexes):
-                rejected["起降净空不足或落在围栏内"] += 1
-                continue
-            if terrain is not None:
-                samples = [terrain.elevation(east + a, north + b) for a, b in ((5, 0), (-5, 0), (0, 5), (0, -5))]
-                if max(samples) - min(samples) > 1.5:
-                    rejected["地形格网显示起伏较大"] += 1
-                    continue
-            candidates.append((hypot(east - x, north - y), position))
+            offsets.extend((dist * cos(angle * pi / 4), dist * sin(angle * pi / 4))
+                           for dist in (12, 18, 24, 36, 48, 60, 84, 96) for angle in range(8))
+            if dense:
+                axis = range(-radius, radius + 1, SITE_STEP_M)
+                offsets.extend(product(axis, repeat=2))
+
         chosen: list[SiteChoice] = []
+        chosen_xy: list[tuple[float, float]] = []
         if not reference.exact and not reference.direction and place.osm_ref:
             for pad_id in self.pads_by_source.get(place.osm_ref, []):
                 pad = self.airspace.vertiports[pad_id]
-                px, py, _ = self.airspace.frame.to_local(pad.position)
-                chosen.append(SiteChoice(TaskSite(id=pad_id, name=pad.properties.name, position=pad.position,
-                                                  reference_name=place.name, offset_m=round(hypot(px - x, py - y), 1)), pad))
-        for offset, position in sorted(candidates, key=lambda value: value[0]):
-            local = self.airspace.frame.to_local(position)
-            if any(hypot(*(a - b for a, b in zip(local[:2], self.airspace.frame.to_local(item.pad.position)[:2]))) < 14
-                   for item in chosen):
-                continue
-            if len(chosen) >= 5:
+                px, py, _ = frame.to_local(pad.position)
+                offset = hypot(px - x, py - y)
+                if offset <= radius and connects(pad):
+                    chosen.append(SiteChoice(TaskSite(id=pad_id, name=pad.properties.name, position=pad.position,
+                                                      reference_name=place.name, offset_m=round(offset, 1),
+                                                      reference_position=place.point), pad))
+                    chosen_xy.append((px, py))
+
+        shifts = dict.fromkeys((round(a + 28 * dx, 5), round(b + 28 * dy, 5)) for a, b in offsets)
+        for a, b in sorted(shifts, key=lambda offset: hypot(*offset)):
+            offset = hypot(a, b)
+            if offset > radius or len(chosen) >= 5:
                 break
+            if reference.direction and a * dx + b * dy <= 5:
+                continue
+            east, north = x + a, y + b
+            if any(hypot(east - px, north - py) < 14 for px, py in chosen_xy):
+                continue
+            position = self.ground_position(east, north, field, rejected)
+            if not position:
+                continue
+            if reference.exact:
+                position = Position(lon=place.point.lon, lat=place.point.lat, alt=position.alt)
             index = len(chosen) + 1
             identifier = f"TMP-{'S' if role == '起点' else 'E'}{index}"
             name = f"{place.name} · {role}候选 {index}"
             pad = Vertiport(VertiportProperties(id=identifier, name=name, type="logistics", altitude=position.alt),
-                           position, None)
+                            position, None)
+            if not connects(pad):
+                rejected["无法接入允许的航层"] += 1
+                continue
             chosen.append(SiteChoice(TaskSite(id=identifier, name=name, position=position, reference_name=place.name,
-                                              offset_m=round(offset, 1)), pad))
+                                              offset_m=round(offset, 1), reference_position=place.point), pad))
+            chosen_xy.append((east, north))
         return chosen
+
+    def ground_position(self, east: float, north: float, field: ObstacleField, rejected: Counter[str]) -> Position | None:
+        terrain = field.terrain
+        alt = max(0, float(terrain.elevation(east, north))) if terrain is not None else 0
+        position = self.airspace.frame.to_position((east, north, alt))
+        point = Point(east, north)
+        if not bounded(position):
+            reason = "位置超出场景范围"
+        elif self.ground_exclusions.covers(point):
+            reason = "位置落在道路或水面"
+        else:
+            nearby = field.index.query(point.buffer(5), predicate="intersects")
+            if any(field.obstacles[index].min_alt <= alt + 3 and field.obstacles[index].max_alt >= alt for index in nearby):
+                reason = "起降净空不足或落在围栏内"
+            else:
+                if terrain is None:
+                    return position
+                samples = [terrain.elevation(east + a, north + b) for a, b in ((5, 0), (-5, 0), (0, 5), (0, -5))]
+                if max(samples) - min(samples) <= 1.5:
+                    return position
+                reason = "地形格网显示起伏较大"
+        rejected[reason] += 1
+        return None
 
     def route(self, task: ActiveTask, fixed_altitude: float | None = None) -> tuple[AssessedRoute, MissionType, bool]:
         intent = task.intent
-        corridor = "inspection" if intent.prefer_high_altitude else intent.mission_type
+        corridor = task.corridor
         constraints = intent.constraints
         strict = constraints.cruise
         if fixed_altitude is not None:
             strict = intersect_limits(strict, CruiseLimits(min_alt=fixed_altitude, max_alt=fixed_altitude))
-        softer = intersect_limits(strict, constraints.preferred_cruise)
-        variants = [(softer, True), (strict, False)] if softer != strict else [(strict, True)]
+        try:
+            softer = intersect_limits(strict, constraints.preferred_cruise)
+        except ValueError:
+            variants = [(strict, False)]
+        else:
+            variants = [(softer, True), (strict, False)] if softer != strict else [(strict, True)]
         for limits, preferred in variants:
             try:
-                route = self.agent.plan_3d_route(task.pads[intent.start_id], task.pads[intent.end_id],
+                route = self.agent.plan_3d_route(task.pads.get(intent.start_id, intent.start_id),
+                                                 task.pads.get(intent.end_id, intent.end_id),
                                                  corridor, task.hazards, avoid_zone_ids=intent.avoid_zone_ids,
                                                  cruise_limits=limits, via=intent.via)
             except NoRouteError:
@@ -830,7 +918,7 @@ class SpatialDispatch:
             return self.notice("constraint_conflict", "复核时发现所选路线不可用，请重新规划。", steps)
         event(steps, "observation", "所选起降点及航线已复核。" if preferred else "航线满足必须条件，部分偏好未满足。")
         task = plan.task
-        token = self.store(self.active, task, TASK_TTL)
+        token = self.activate(task)
         return DispatchResult(
             mode=selection.mode, model_called=selection.model_called,
             model_fallback=selection.model_called and selection.mode == "fallback_mock",
@@ -875,6 +963,27 @@ class SpatialDispatch:
                 return entry[1]
             cache.pop(token, None)
         return None
+
+    def activate(self, task: ActiveTask) -> str:
+        return self.store(self.active, task, TASK_TTL)
+
+    def restart(self, token: str) -> str | None:
+        task = self.active_task(token)
+        return self.activate(replace(task, active_hazards=())) if task else None
+
+    def remember_hazard(self, token: str, hazard: DynamicHazard) -> ActiveTask | None:
+        with self.lock:
+            entry = self.active.get(token)
+            if entry is None or entry[0] <= monotonic():
+                self.active.pop(token, None)
+                return None
+            expires, task = entry
+            if hazard not in task.active_hazards:
+                if len(task.active_hazards) >= 20:
+                    raise ValueError("本任务已达到临时围栏上限。")
+                task = replace(task, active_hazards=(*task.active_hazards, hazard))
+                self.active[token] = (expires, task)
+            return task
 
     def active_task(self, token: str) -> ActiveTask | None:
         return self.get(self.active, token)

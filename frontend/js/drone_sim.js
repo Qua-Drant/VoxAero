@@ -3,9 +3,7 @@ const SPEED = { delivery: 12, inspection: 15 };
 const CLIMB_SPEED = 3;
 const NOSE_OFFSET = 0.42;
 
-export function batteryAfterFlight(battery, seconds) {
-  return Math.max(0, battery - seconds * .10);
-}
+const DEFAULT_BATTERY_MODEL = { per_second: 0.10, per_climb_m: 0.02 };
 
 function world({ lon, lat, alt }) {
   return C.Cartesian3.fromDegrees(lon, lat, alt);
@@ -36,27 +34,31 @@ function cross(a, b) {
   return C.Cartesian3.cross(a, b, new C.Cartesian3());
 }
 
-function makeTrack(waypoints, corridor) {
+function makeTrack(waypoints, corridor, batteryModel) {
   const property = new C.SampledPositionProperty();
   const epoch = C.JulianDate.now();
   const time = (seconds) => C.JulianDate.addSeconds(epoch, seconds, new C.JulianDate());
   const points = waypoints.map(world);
   const legs = [];
   let duration = 0;
+  let usedBattery = 0;
   property.addSample(epoch, points[0]);
   for (let i = 1; i < points.length; i += 1) {
     const horizontal = horizontalGap(waypoints[i - 1], waypoints[i]);
     const dz = waypoints[i].alt - waypoints[i - 1].alt;
     const seconds = Math.max(horizontal / SPEED[corridor], Math.abs(dz) / CLIMB_SPEED);
     if (seconds === 0) continue;
+    const energy = seconds * batteryModel.per_second + Math.max(dz, 0) * batteryModel.per_climb_m;
     legs.push({
       start: duration, end: duration + seconds, horizontal, dz,
+      energy, energyBefore: usedBattery,
       waypointIndex: i,
       speed: Math.hypot(horizontal, dz) / seconds,
       direction: C.Cartesian3.subtract(points[i], points[i - 1], new C.Cartesian3()),
       phase: waypoints[i].phase,
     });
     duration += seconds;
+    usedBattery += energy;
     property.addSample(time(duration), points[i]);
   }
   if (!legs.length) throw new Error("航线缺少可飞行航段。");
@@ -78,13 +80,18 @@ function makeTrack(waypoints, corridor) {
   }
   return {
     property, time, duration, legs, at, gates, waypoints, origin: waypoints[0], target: waypoints.at(-1),
+    energyAt: (elapsed) => {
+      const leg = legs.find(({ end }) => elapsed < end);
+      return leg ? leg.energyBefore + leg.energy * Math.max(0, elapsed - leg.start) / (leg.end - leg.start) : usedBattery;
+    },
   };
 }
 
 export class DroneSim {
-  constructor(map, onFrame) {
+  constructor(map, onFrame, batteryModel = DEFAULT_BATTERY_MODEL) {
     this.map = map;
     this.onFrame = onFrame;
+    this.batteryModel = batteryModel;
     this.rate = 1;
     this.view = "overview";
     this.playing = false;
@@ -95,8 +102,8 @@ export class DroneSim {
     this.guideTime = -Infinity;
   }
 
-  load(waypoints, corridor, { battery, target, elapsed = 0 }) {
-    const track = makeTrack(waypoints, corridor);
+  load(waypoints, corridor, { battery, target, elapsed = 0, batteryOverride }) {
+    const track = makeTrack(waypoints, corridor, this.batteryModel);
     this.pause(false);
     this.track = track;
     this.targetId = target;
@@ -104,7 +111,7 @@ export class DroneSim {
     this.heading = undefined;
     this.bank = 0;
     this.guideTime = -Infinity;
-    this.battery = battery;
+    this.battery = batteryOverride ?? this.projectBattery(battery, this.elapsed);
     this.attach();
   }
 
@@ -115,6 +122,10 @@ export class DroneSim {
     this.map.viewer.scene.screenSpaceCameraController.enableInputs = this.view === "overview";
     this.guideTime = -Infinity;
     this.paint();
+  }
+
+  projectBattery(battery, elapsed) {
+    return Math.max(0, battery - this.track.energyAt(elapsed));
   }
 
   seek(elapsed, battery, jumped, delta = 0) {
@@ -170,8 +181,9 @@ export class DroneSim {
     const delta = this.previousFrame === null ? 0 : Math.min((now - this.previousFrame) / 1000, .25);
     this.previousFrame = now;
     const advanced = Math.min(delta * this.rate, this.track.duration - this.elapsed);
+    const previouslyUsed = this.track.energyAt(this.elapsed);
     this.elapsed += advanced;
-    this.battery = batteryAfterFlight(this.battery, advanced);
+    this.battery = this.projectBattery(this.battery + previouslyUsed, this.elapsed);
     if (this.elapsed >= this.track.duration) this.playing = false;
     this.paint(delta);
     this.frameRequest = this.playing ? requestAnimationFrame(this.tick) : null;

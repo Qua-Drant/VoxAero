@@ -1,4 +1,4 @@
-import { renderAirspaceCheck, spatialCandidateForm } from "./spatial_ui.js?v=3";
+import { renderAirspaceCheck, spatialCandidateForm } from "./spatial_ui.js?v=4";
 
 const PRESETS = {
   spatial: "从信息学部附近找一个可起飞的地面点，去图书馆西侧巡检，绕开静谧区。",
@@ -299,6 +299,14 @@ export class AgentUI {
       button.addEventListener("click", () => this.dispatch(reply));
       return button;
     });
+    if (question.expand_search) {
+      const expand = document.createElement("button");
+      expand.type = "button";
+      expand.className = "action-button";
+      expand.textContent = "扩大搜索范围";
+      expand.addEventListener("click", () => this.dispatch(expand.textContent));
+      actions.push(expand);
+    }
     if (question.map_pick) {
       const button = document.createElement("button");
       button.type = "button";

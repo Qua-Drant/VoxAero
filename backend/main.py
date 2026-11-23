@@ -10,11 +10,15 @@ from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from openai import OpenAI
 
-from backend.config import AIRSPACE_LAYERS, DATA_DIR, FRONTEND_DIR, LLMSettings, STUDY_BOUNDS
+from backend.config import (
+    AIRSPACE_LAYERS, BATTERY_PERCENT_PER_CLIMB_M, BATTERY_PERCENT_PER_SECOND, DATA_DIR, FRONTEND_DIR,
+    LLMSettings, STUDY_BOUNDS,
+)
 from backend.core.agent import AgentError, DispatchAgent
 from backend.core.airspace import Airspace
 from backend.schemas import (
-    ConfirmSpatialRequest, DispatchNotice, DispatchRequest, DispatchResult, ReplanRequest, ReplanResult, SpatialChoices,
+    ConfirmSpatialRequest, DispatchNotice, DispatchRequest, DispatchResult, ReplanRequest, ReplanResult,
+    RestartMissionRequest, SpatialChoices,
 )
 
 
@@ -37,6 +41,7 @@ def create_app(
             content={
                 "detail": str(exc),
                 "thought_steps": [step.model_dump(mode="json") for step in exc.steps],
+                **({"temporary_nofly_zone": exc.hazard.model_dump(mode="json")} if exc.hazard else {}),
             },
         )
 
@@ -50,6 +55,10 @@ def create_app(
             **request.app.state.agent.airspace.geojson,
             "airspace_layers": [asdict(layer) for layer in AIRSPACE_LAYERS],
             "bounds": STUDY_BOUNDS,
+            "battery_model": {
+                "per_second": BATTERY_PERCENT_PER_SECOND,
+                "per_climb_m": BATTERY_PERCENT_PER_CLIMB_M,
+            },
             "scene_version": request.app.state.agent.airspace.scene_version,
         }
 
@@ -74,6 +83,14 @@ def create_app(
         version = current_version(request, payload.scene_version)
         result = request.app.state.agent.spatial.confirm(payload)
         return result.model_copy(update={"scene_version": version})
+
+    @app.post("/api/agent/restart-mission")
+    def restart_mission(payload: RestartMissionRequest, request: Request) -> dict[str, str]:
+        current_version(request, payload.scene_version)
+        token = request.app.state.agent.spatial.restart(payload.mission_token)
+        if token is None:
+            raise HTTPException(status_code=409, detail="本任务会话已失效，请重新规划。")
+        return {"mission_token": token}
 
     @app.post("/api/agent/replan")
     def replan(payload: ReplanRequest, request: Request) -> ReplanResult:

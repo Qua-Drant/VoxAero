@@ -161,6 +161,11 @@ class DispatchIntent(DispatchCandidate):
     via: tuple[RouteReference, ...] = ()
 
 
+class RestartMissionRequest(BaseModel):
+    mission_token: Annotated[str, StringConstraints(min_length=1, max_length=80)]
+    scene_version: str | None = None
+
+
 class ReplanRequest(BaseModel):
     current_pos: Position
     target_id: NonemptyString
@@ -172,6 +177,7 @@ class ReplanRequest(BaseModel):
     scene_version: str | None = None
     cruise_limits: CruiseLimits | None = None
     remaining_deadline_seconds: FiniteFloat | None = None  # Accepted for older clients.
+    battery_percent: Annotated[FiniteFloat, Field(ge=0, le=100)] | None = None
     completed_visits: Annotated[int, Field(ge=0, le=3)] = 0
     mission_token: Annotated[str, StringConstraints(min_length=1, max_length=80)] | None = None
 
@@ -196,6 +202,7 @@ class RouteKPIs(BaseModel):
     min_clearance_m: NonnegativeMeters | None
     compliant: bool
     compliance_percent: Annotated[FiniteFloat, Field(ge=0, le=100)]
+    estimated_battery_percent: NonnegativeMeters = 0
 
 
 class AssessedRoute(RoutePlan):
@@ -246,6 +253,7 @@ class LocationClarification(BaseModel):
     slots: list[LocationSlot]
     options: list[LocationOption]
     map_pick: bool
+    expand_search: bool = False
 
 
 class DispatchNotice(BaseModel):
@@ -277,6 +285,7 @@ class TaskSite(BaseModel, frozen=True):
     position: Position
     reference_name: str
     offset_m: NonnegativeMeters
+    reference_position: GroundPoint | None = None
 
 
 class SpatialRouteOption(BaseModel):
@@ -289,6 +298,7 @@ class SpatialRouteOption(BaseModel):
     airspace_check: AirspaceCheck
     recommendation: str
     route_label: str = "可行航线"
+    planning_note: str | None = None
     route_visits: tuple[RouteVisit, ...] = ()
 
 
@@ -317,3 +327,4 @@ class ReplanResult(MissionResult):
     original_target_id: str
     target_id: str
     temporary_nofly_zone: HazardFeature | None = None
+    arrival_battery_percent: NonnegativeMeters | None = None

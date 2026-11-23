@@ -10,6 +10,7 @@ from fastapi.testclient import TestClient
 
 from backend.config import DATA_DIR, LLMSettings
 from backend.core.airspace import Airspace
+from backend.core.planner import NoRouteError
 from backend.main import create_app
 from backend.schemas import DynamicHazard, Position
 
@@ -54,6 +55,73 @@ def test_spatial_dialog_disambiguates_gate_and_keeps_youth_building(client, gate
     assert route["start"]["reference_name"] == "珞喻门 · 西侧"
     assert route["end"]["reference_name"] == "青年楼"
     assert_clear(client.app.state.agent.airspace, confirm(client, chosen))
+
+
+@pytest.mark.parametrize("side", ["西", "东"])
+def test_dispatch_finds_reachable_landing_near_youth_dormitory(client, side):
+    pending = suggest(client, "从珞瑜门到青年宿舍楼")
+    offered = answer(client, pending, f"{side}边那个")
+    assert offered["status"] == "choose_endpoints", offered
+    option = offered["options"][0]
+    assert option["start"]["reference_name"] == f"珞喻门 · {side}侧"
+    assert option["end"]["reference_name"] == "青年宿舍楼"
+    assert 0 < option["end"]["offset_m"] <= 60
+    assert option["corridor"] == "delivery"
+    assert option["waypoints"][-1]["phase"] == "landing"
+    assert all(30 <= point["alt"] <= 60 for point in option["waypoints"] if point["phase"] == "cruise")
+    planned = confirm(client, offered)
+    assert planned["status"] == "planned"
+    assert_clear(client.app.state.agent.airspace, planned)
+
+
+def test_default_layer_can_recover_but_explicit_layer_stays_locked(client, monkeypatch):
+    agent = client.app.state.agent
+    plan = agent.plan_3d_route
+
+    def fail_default(start, end, mission_type, *args, **kwargs):
+        if mission_type == "delivery":
+            raise NoRouteError("Test disconnected delivery layer")
+        return plan(start, end, mission_type, *args, **kwargs)
+
+    monkeypatch.setattr(agent, "plan_3d_route", fail_default)
+    first = suggest(client, "从珞瑜门到青年宿舍楼")
+    offered = answer(client, first, "西边那个")
+    assert offered["status"] == "choose_endpoints", offered
+    assert offered["options"][0]["corridor"] == "inspection"
+    assert "改用 60–90 米航层" in offered["options"][0]["planning_note"]
+    planned = confirm(client, offered)
+    assert planned["corridor"] == "inspection"
+    assert agent.spatial.active_task(planned["mission_token"]).corridor == "inspection"
+    assert_clear(agent.airspace, planned)
+
+    first = suggest(client, "从珞瑜门到青年宿舍楼，巡航高度30到60米")
+    blocked = answer(client, first, "西边那个")
+    assert blocked["status"] == "constraint_conflict"
+    assert blocked["clarification"]["expand_search"]
+
+
+def test_wider_landing_search_requires_confirmation_and_retains_task(client, monkeypatch):
+    spatial = client.app.state.agent.spatial
+    search = spatial.sites
+
+    def require_wider_radius(reference, role, field, rejected, connects, radius, dense):
+        if role == "终点" and radius <= 96:
+            return []
+        return search(reference, role, field, rejected, connects, radius, dense)
+
+    monkeypatch.setattr(spatial, "sites", require_wider_radius)
+    first = suggest(client, "从珞瑜门到青年宿舍楼，巡航高度30到60米，绕开静谧区")
+    blocked = answer(client, first, "西边那个")
+    assert blocked["status"] == "constraint_conflict"
+    assert blocked["clarification"]["expand_search"]
+    offered = answer(client, blocked, "扩大搜索范围")
+    assert offered["status"] == "choose_endpoints", offered
+    assert offered["options"][0]["end"]["reference_name"] == "青年宿舍楼"
+    planned = confirm(client, offered)
+    assert planned["intent"]["avoid_zone_ids"] == ["NFZ01"]
+    cruise = planned["intent"]["constraints"]["cruise"]
+    assert (cruise["min_alt"], cruise["max_alt"]) == (30, 60)
+    assert_clear(client.app.state.agent.airspace, planned, avoid=("NFZ01",))
 
 
 def test_spatial_dialog_recovers_typo_and_orders_multiple_flyovers(client):
@@ -185,6 +253,48 @@ def test_replan_uses_task_sites_and_task_avoidance(client):
     assert diverted.status_code == 200, diverted.text
     assert diverted.json()["target_id"] != planned["intent"]["end_id"]
     assert_clear(scene, diverted.json(), (nofly,))
+
+
+def test_failed_detour_persists_fence_and_diversion_respects_battery(client):
+    offered = suggest(client, "从珞瑜门西侧到青年宿舍楼")
+    planned = confirm(client, offered)
+    departure, cruise = next((start, end) for start, end in pairwise(planned["waypoints"])
+                             if end["phase"] == "cruise")
+    current = {axis: departure[axis] + .25 * (cruise[axis] - departure[axis]) for axis in ("lon", "lat", "alt")}
+    landing = planned["waypoints"][-1]
+    fence = DynamicHazard(center_lon=landing["lon"], center_lat=landing["lat"],
+                          radius_m=20, min_alt=0, max_alt=100)
+    payload = {
+        "current_pos": current, "target_id": planned["intent"]["end_id"],
+        "mission_token": planned["mission_token"], "scene_version": planned["scene_version"],
+        "emergency_type": "temp_nofly", "dynamic_hazard": fence.model_dump(),
+    }
+    blocked = client.post("/api/agent/replan", json=payload)
+    assert blocked.status_code == 409
+    assert blocked.json()["temporary_nofly_zone"]["geometry"]["type"] == "Polygon"
+    task = client.app.state.agent.spatial.active_task(planned["mission_token"])
+    assert task.active_hazards == (fence,)
+    payload.update(emergency_type="low_battery", dynamic_hazard=None, battery_percent=1)
+    low = client.post("/api/agent/replan", json=payload)
+    assert low.status_code == 409 and "电量" in low.json()["detail"]
+    payload["battery_percent"] = 14
+    response = client.post("/api/agent/replan", json=payload)
+    assert response.status_code == 200, response.text
+    diversion = response.json()
+    assert diversion["waypoints"][0]["lon"] == current["lon"]
+    assert diversion["target_id"] != planned["intent"]["end_id"]
+    assert diversion["arrival_battery_percent"] >= 2
+    assert diversion["arrival_battery_percent"] == pytest.approx(
+        14 - diversion["kpis"]["estimated_battery_percent"], abs=.0051)
+    assert_clear(client.app.state.agent.airspace, diversion, (fence,))
+
+    restart = client.post("/api/agent/restart-mission", json={
+        "mission_token": planned["mission_token"], "scene_version": planned["scene_version"],
+    })
+    assert restart.status_code == 200, restart.text
+    restarted = client.app.state.agent.spatial.active_task(restart.json()["mission_token"])
+    assert restarted.intent == task.intent and restarted.active_hazards == ()
+    assert client.app.state.agent.spatial.active_task(planned["mission_token"]).active_hazards == (fence,)
 
 
 @pytest.mark.parametrize(("query", "origin", "destination"), [

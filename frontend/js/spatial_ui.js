@@ -45,7 +45,7 @@ export function spatialCandidateForm(result, callbacks) {
   const rejectedTitle = document.createElement("summary");
   rejectedTitle.textContent = "查看筛选说明";
   const rejectedText = document.createElement("p");
-  rejectedText.textContent = Object.entries(result.rejected).map(([key, count]) => `${key} ${count} 处`).join(" · ")
+  rejectedText.textContent = Object.entries(result.rejected).map(([key, count]) => `${key} ${count} 次`).join(" · ")
     || "通过场景范围、障碍、地形和航线检查。";
   rejected.append(rejectedTitle, rejectedText);
 
@@ -66,7 +66,12 @@ export function spatialCandidateForm(result, callbacks) {
   form.append(header, fieldset, itinerary, reason, airspace, rejected, actions);
 
   function preview(option) {
-    reason.textContent = option.recommendation;
+    const offsets = [
+      option.start.offset_m > 0 ? `起飞点距${option.start.reference_name} ${number.format(option.start.offset_m)} m` : null,
+      option.end.offset_m > 0 ? `落点距${option.end.reference_name} ${number.format(option.end.offset_m)} m` : null,
+    ].filter(Boolean);
+    const layer = option.corridor === "inspection" ? "60–90 m" : "30–60 m";
+    reason.textContent = [`巡航航层 ${layer}`, option.planning_note, ...offsets].filter(Boolean).join(" · ");
     const visits = option.route_visits ?? [];
     itinerary.hidden = !visits.length;
     itinerary.textContent = "依序飞越 " + visits.map(visit => visit.name).join(" → ");

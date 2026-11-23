@@ -1,4 +1,4 @@
-import { batteryAfterFlight, DroneSim } from "./drone_sim.js?v=4";
+import { DroneSim } from "./drone_sim.js?v=9";
 
 export function flightClock(seconds) {
   const whole = Math.floor(seconds);
@@ -6,13 +6,14 @@ export function flightClock(seconds) {
 }
 
 export class FlightReplay {
-  constructor(map, { onFrame, onSegment, onMode, onOverview, onPlayback }, seekControl) {
+  constructor(map, { onFrame, onSegment, onMode, onOverview, onPlayback, batteryModel }, seekControl) {
     this.map = map;
     this.onFrame = onFrame;
     this.onSegment = onSegment;
     this.onMode = onMode;
     this.onOverview = onOverview;
     this.onPlayback = onPlayback;
+    this.batteryModel = batteryModel;
     this.panel = document.getElementById("flight-review");
     this.outcome = document.getElementById("review-outcome");
     this.list = document.getElementById("review-events");
@@ -77,7 +78,8 @@ export class FlightReplay {
     if (this.active || !this.record || this.start.disabled) return;
     this.segmentIndex = -1;
     this.event = null;
-    this.sim = new DroneSim(this.map, (frame) => this.onFrame(frame, this.record, this.segment));
+    this.activeVolumes = null;
+    this.sim = new DroneSim(this.map, (frame) => this.onFrame(frame, this.record, this.segment), this.batteryModel);
     this.status.textContent = "回放已就绪 · 使用底部时间轴定位";
     this.status.hidden = this.exit.hidden = false;
     this.start.hidden = true;
@@ -101,8 +103,13 @@ export class FlightReplay {
     const index = event?.segmentIndex ?? this.record.segments.findLastIndex(({ start }) => start <= this.seconds);
     const segment = this.record.segments[index];
     const elapsed = this.seconds - segment.start;
-    const battery = event?.battery ?? (this.seconds === this.record.duration ? this.record.battery
-      : batteryAfterFlight(segment.battery, elapsed));
+    const atEnd = this.seconds === this.record.duration;
+    const battery = event?.battery ?? (atEnd ? this.record.battery : undefined);
+    const volumes = event?.volumes ?? (atEnd ? this.record.events.at(-1)?.volumes : null) ?? segment.volumes;
+    if (volumes !== this.activeVolumes) {
+      this.activeVolumes = volumes;
+      this.map.setHazards(volumes);
+    }
     const changedSegment = index !== this.segmentIndex;
     if (changedSegment || event !== this.event) {
       if (!event) this.map.clearPadFocus();
@@ -110,16 +117,17 @@ export class FlightReplay {
       this.segmentIndex = index;
       this.segment = segment;
       const priorPlan = event?.compare ? this.record.segments[index - 1].result.waypoints : null;
-      this.map.setHazards(segment.volumes);
       this.map.drawReplayRoutes(this.record.segments.slice(0, index + 1), priorPlan);
       this.comparison.hidden = !priorPlan;
       this.onSegment(segment, index > 0);
       this.eventButtons.forEach((button, item) => button.setAttribute("aria-pressed", String(this.record.events[item] === event)));
     }
     if (changedSegment) {
-      this.sim.load(segment.result.waypoints, segment.result.corridor, { battery, target: segment.target, elapsed });
+      this.sim.load(segment.result.waypoints, segment.result.corridor, {
+        battery: segment.battery, target: segment.target, elapsed, batteryOverride: battery,
+      });
     } else {
-      this.sim.seek(elapsed, battery, jumped, delta);
+      this.sim.seek(elapsed, battery ?? this.sim.projectBattery(segment.battery, elapsed), jumped, delta);
     }
   }
 
