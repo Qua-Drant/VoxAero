@@ -30,6 +30,100 @@ def suggest(client, query=SURVEY, spatial=None):
     return response.json()
 
 
+def answer(client, previous, query):
+    response = client.post("/api/agent/dispatch", json={
+        "query": query, "clarification_token": previous["clarification_token"],
+        "scene_version": previous["scene_version"],
+    })
+    assert response.status_code in {200, 409}, response.text
+    return response.json()
+
+
+@pytest.mark.parametrize("gate", ["珞瑜门", "珞喻门"])
+def test_spatial_dialog_disambiguates_gate_and_keeps_youth_building(client, gate):
+    first = suggest(client, f"从{gate}到青年楼")
+    assert first["status"] == "needs_spatial_location", first
+    question = first["clarification"]
+    assert question["slot"] == "start"
+    assert question["slots"][-1]["resolved_name"] == "青年楼"
+    assert [option["label"] for option in question["options"]] == ["珞喻门 · 西侧", "珞喻门 · 东侧"]
+    assert question["options"][0]["point"]["lon"] < question["options"][1]["point"]["lon"]
+    chosen = answer(client, first, "西边那个")
+    assert chosen["status"] == "choose_endpoints", chosen
+    route = chosen["options"][0]
+    assert route["start"]["reference_name"] == "珞喻门 · 西侧"
+    assert route["end"]["reference_name"] == "青年楼"
+    assert_clear(client.app.state.agent.airspace, confirm(client, chosen))
+
+
+def test_spatial_dialog_recovers_typo_and_orders_multiple_flyovers(client):
+    first = suggest(client, "从VP07到VP06巡检，依次途经星湖、旧钟楼、青午楼，巡航高度60到80米，绕开静谧区")
+    assert first["clarification"]["slot"] == "via-2"
+    assert "旧钟楼" in first["detail"]
+    assert first["clarification"]["slots"][1]["resolved_name"] == "星湖"
+    second = answer(client, first, "第二个途经点改为星湖南路")
+    assert second["clarification"]["slot"] == "via-3"
+    option = next(item for item in second["clarification"]["options"] if item["label"] == "青年楼")
+    blocked = answer(client, second, option["reply"])
+    assert blocked["status"] == "constraint_conflict", blocked
+    assert blocked["clarification"]["slots"][3]["resolved_name"] == "青年楼"
+    chosen = answer(client, blocked, "第三个途经点改为信息学部操场")
+    assert chosen["status"] == "choose_endpoints", chosen
+    planned = confirm(client, chosen)
+    assert [point["name"] for point in planned["route_visits"]] == ["星湖", "星湖南路", "信息学部操场"]
+    assert planned["intent"]["avoid_zone_ids"] == ["NFZ01"]
+    cruise = planned["intent"]["constraints"]["cruise"]
+    assert (cruise["min_alt"], cruise["max_alt"]) == (60.0, 80.0)
+    assert_clear(client.app.state.agent.airspace, planned, avoid=["NFZ01"])
+
+
+@pytest.mark.parametrize("query", [
+    "从VP07先到星湖，再去星湖南路，最后到VP06巡检",
+    "VP07 → 星湖 → 星湖南路 → VP06 巡检",
+])
+def test_ordered_spatial_itinerary_uses_final_destination(client, query):
+    offered = suggest(client, query)
+    assert offered["status"] == "choose_endpoints", offered
+    assert offered["options"][0]["end"]["id"] == "VP06"
+    assert [point["name"] for point in offered["options"][0]["route_visits"]] == ["星湖", "星湖南路"]
+
+
+def test_spatial_dialog_suggests_grounded_categories_and_accepts_anchor(client):
+    first = suggest(client, "从校门到旧广播站巡检")
+    assert first["clarification"]["slot"] == "start"
+    assert first["clarification"]["options"]
+    second = answer(client, first, first["clarification"]["options"][0]["reply"])
+    assert second["clarification"]["slot"] == "end"
+    assert "旧广播站" in second["detail"]
+    assert second["clarification"]["slots"][0]["resolved_name"]
+    chosen = answer(client, second, "就在星空广场旁边")
+    assert chosen["status"] == "choose_endpoints", chosen
+    assert chosen["options"][0]["end"]["reference_name"] == "星空广场"
+
+
+def test_spatial_dialog_grounds_nearby_landmark_and_preserves_previous_turn(client):
+    first = suggest(client, "从珞喻门到青年楼")
+    unresolved = answer(client, first, "都可以")
+    assert unresolved["clarification"]["options"] == first["clarification"]["options"]
+    chosen = answer(client, unresolved, "靠近友谊广场的那个")
+    assert chosen["status"] == "choose_endpoints", chosen
+    assert chosen["options"][0]["start"]["reference_name"] == "珞喻门 · 东侧"
+
+
+def test_spatial_dialog_accepts_picked_coordinate_without_losing_destination(client):
+    baseline = suggest(client)
+    point = baseline["options"][0]["start"]["position"]
+    pending = suggest(client, "从旧广播站到图书馆西侧巡检，绕开静谧区")
+    out_of_bounds = answer(client, pending, "[114.5, 30.5]")
+    assert "场景范围外" in out_of_bounds["detail"]
+    assert out_of_bounds["clarification"]["slots"][-1]["resolved_name"]
+    chosen = answer(client, out_of_bounds, f"[{point['lon']}, {point['lat']}]")
+    assert chosen["status"] == "choose_endpoints", chosen
+    route = chosen["options"][0]
+    assert route["start"]["position"]["lon"] == point["lon"]
+    assert_clear(client.app.state.agent.airspace, confirm(client, chosen), avoid=["NFZ01"])
+
+
 def confirm(client, proposed, option=None):
     return client.post("/api/agent/confirm-candidate", json={
         "candidate_token": proposed["candidate_token"],

@@ -227,6 +227,27 @@ class DispatchResult(MissionResult):
     task_zones: tuple[HazardFeature, ...] = ()
 
 
+class LocationOption(BaseModel):
+    label: str
+    reply: str
+    point: GroundPoint
+
+
+class LocationSlot(BaseModel):
+    key: str
+    label: str
+    phrase: str
+    resolved_name: str | None = None
+
+
+class LocationClarification(BaseModel):
+    slot: str
+    label: str
+    slots: list[LocationSlot]
+    options: list[LocationOption]
+    map_pick: bool
+
+
 class DispatchNotice(BaseModel):
     status: DispatchNoticeType
     detail: str
@@ -234,6 +255,7 @@ class DispatchNotice(BaseModel):
     mode: LLMMode | None = None
     model_called: bool = False
     clarification_token: str | None = None
+    clarification: LocationClarification | None = None
     scene_version: str | None = None
     airspace_check: AirspaceCheck | None = None
 

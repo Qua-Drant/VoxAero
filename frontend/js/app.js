@@ -3,7 +3,7 @@ import { DroneSim } from "./drone_sim.js?v=8";
 import { FlightReplay, flightClock } from "./flight_replay.js?v=13";
 import { FlightHUD } from "./ar_hud.js?v=15";
 import { batteryReading, paintBattery } from "./battery_display.js";
-import { AgentUI, plainDispatchText } from "./agent_ui.js?v=17";
+import { AgentUI, plainDispatchText } from "./agent_ui.js?v=18";
 
 import { VerticalProfile } from "./flight_profile.js?v=14";
 
@@ -25,7 +25,7 @@ const phaseNames = { takeoff: "垂直起飞", cruise: "巡航", landing: "降落
 const directions = ["北", "北偏东", "东北", "东偏北", "东", "东偏南", "东南", "南偏东", "南", "南偏西", "西南", "西偏南", "西", "西偏北", "西北", "北偏西"];
 const eventNames = { wind_gust: "突发阵风 / 临时禁飞区", low_battery: "低电量强制备降" };
 const format = new Intl.NumberFormat("zh-CN", { minimumFractionDigits: 1, maximumFractionDigits: 1 });
-const ui = new AgentUI(dispatch, clearClarification);
+const ui = new AgentUI(dispatch, clearClarification, pickClarification);
 const hud = new FlightHUD(element("hud"));
 
 let map;
@@ -448,6 +448,7 @@ function setReplayMode(active) {
 
 function clearClarification() {
   if (!clarificationToken) return;
+  if (pickRole === "clarification") stopMapPick();
   clarificationToken = undefined;
   clarificationQuery = undefined;
   ui.setClarification(false);
@@ -455,17 +456,19 @@ function clearClarification() {
 }
 
 function showDispatchNotice(result, query) {
-  if (result.status === "needs_clarification") {
+  if (result.status === "needs_clarification" || result.clarification) {
     clarificationToken = result.clarification_token;
-    clarificationQuery = query;
-    ui.setClarification(true);
+    clarificationQuery ??= query;
+    ui.setClarification(true, result.clarification);
     ui.setInput("");
+    if (result.clarification) ui.showLocationClarification(result.clarification, result.detail);
   } else if (result.status === "constraint_conflict" || result.status === "clarification_closed") {
     clearClarification();
   }
   const conflict = result.status === "constraint_conflict";
   if (result.mode) ui.setMode(result.mode);
-  const message = result.status === "airspace_report" ? "空域核验已完成。" : plainDispatchText(result.detail);
+  const message = result.clarification ? `等待确认${result.clarification.label}。`
+    : result.status === "airspace_report" ? "空域核验已完成。" : plainDispatchText(result.detail);
   ui.status(message, conflict);
 }
 
@@ -542,7 +545,7 @@ async function dispatch(query, { autoPlay = false, newTask = false } = {}) {
     ui.status("已收到回复，正在逐步说明处理过程…");
     await ui.revealSteps(exchange, result.thought_steps, zoneNames);
     if (result.status === "choose_endpoints") {
-      presentChoices(result, query);
+      presentChoices(result, originalQuery);
       return;
     }
     if (result.status !== "planned") {
@@ -673,12 +676,29 @@ function stopMapPick() {
   pickRole = undefined;
   map?.pickLocation(null);
   for (const button of pickButtons) button.setAttribute("aria-pressed", "false");
+  element("clarification-map-pick")?.setAttribute("aria-pressed", "false");
 }
 
 function clearSpatialPicks() {
   stopMapPick();
   spatialPicks = { avoid: [] };
   renderSpatialPicks();
+}
+
+function pickClarification(label) {
+  if (!clarificationToken || !sim || busy || review?.active || isInFlight()) return;
+  const button = element("clarification-map-pick");
+  if (pickRole === "clarification") {
+    stopMapPick();
+    ui.status(`等待确认${label}。`);
+    return;
+  }
+  stopMapPick();
+  setView("overview");
+  pickRole = "clarification";
+  button.setAttribute("aria-pressed", "true");
+  ui.status(`在三维地图上点击${label}，按退出键取消。`);
+  map.pickLocation(({ lon, lat }) => dispatch(`[${lon.toFixed(7)}, ${lat.toFixed(7)}]`));
 }
 
 function beginMapPick(role) {

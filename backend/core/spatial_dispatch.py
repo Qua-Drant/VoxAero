@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import re
 from collections import Counter, OrderedDict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from difflib import SequenceMatcher
 from datetime import datetime, timezone
 from itertools import product
 from math import cos, hypot, pi, sin
@@ -22,11 +23,13 @@ from shapely import transform
 
 from backend.config import CEILING_M, MISSION_LAYERS, STUDY_BOUNDS
 from backend.core.airspace import Obstacle, ObstacleField, Vertiport
-from backend.core.intent import LOW_FLIGHT, intersect_limits, parse_constraints
+from backend.core.intent import ALT_CONTEXT, ALT_RANGE, LOW_FLIGHT, MEASUREMENT, UNSUPPORTED_STOP, intersect_limits, parse_constraints
 from backend.core.planner import NoRouteError
 from backend.schemas import (
-    AssessedRoute, ConfirmSpatialRequest, DispatchIntent, DispatchNotice, DispatchResult, DynamicHazard,
-    CruiseLimits, GroundPoint, HazardFeature, HazardPolygon, LLMMode, MissionType, NoFlyProperties, Position, RouteReference, RouteVisit,
+    AssessedRoute, ConfirmSpatialRequest, CruiseLimits, DispatchCandidate, DispatchConstraints, DispatchIntent,
+    DispatchNotice, DispatchNoticeType, DispatchResult,
+    DynamicHazard, GroundPoint, HazardFeature, HazardPolygon, LLMMode, LocationClarification, LocationOption,
+    LocationSlot, MissionType, NoFlyProperties, Position, RouteReference, RouteVisit,
     SpatialChoices, SpatialOptions, SpatialRouteOption, TaskSite, ThoughtStep, VertiportProperties,
 )
 
@@ -37,7 +40,7 @@ COORDINATES = re.compile(r"[\[(]\s*(-?\d+(?:\.\d+)?)\s*[,，]\s*(-?\d+(?:\.\d+)?
 VIA_WORD = r"中途(?:经过|经由)|(?<!不)(?<!别)(?<!不要)(?:依次|先|再)?(?:经过|途经|途径|经由|飞越|飞过)|(?:先|再)经"
 VIA_MARKER = re.compile(VIA_WORD)
 ROLES = re.compile(r"从|由|起点(?:设在|在|为|是|[:：])|" + VIA_WORD
-                   + r"|(?:最后|再)?(?:飞往|前往|抵达|送往|去|到|至|返回)|→|终点(?:设在|在|为|是|[:：])")
+                   + r"|(?:最后|然后|接着|先|再)?(?:飞往|前往|抵达|送往|去|到|至|返回)|→|终点(?:设在|在|为|是|[:：])")
 ORIGINS = ("从", "由", "起点")
 EXTRA_CONSTRAINT = re.compile(r"[，,。；;]|\s*(?:绕开|避开|绕过|巡航|飞行时限|对比|比较|提供多条)")
 COMPARE = re.compile(r"(?:比较|对比|提供|给我|给出|规划)?\s*(?:多条|多种|备选|替代|[两三二23]条)\s*(?:可行)?(?:航线|路线|方案)|(?:比较|对比)(?:可行)?(?:航线|路线|方案)")
@@ -51,6 +54,14 @@ DIRECTION = {"东": (1, 0), "西": (-1, 0), "北": (0, 1), "南": (0, -1)}
 CONTEXT_LIMIT = 128
 CANDIDATE_TTL = 600
 TASK_TTL = 4 * 60 * 60
+SLOT_EDIT = re.compile(r"^(?:把|将)?(起点|终点|第\s*([一二三123])\s*个?途经点)\s*(?:换成|改成|改为|设为|是|在|[:：])\s*(.+)$")
+SLOT_LABELS = {"start": "起点", "end": "终点", **{f"via-{i}": f"第 {i} 个途经点" for i in range(1, MAX_VISITS + 1)}}
+GENERIC_PLACES = {
+    "校门": ("entrance", ("门",)), "门口": ("entrance", ("门",)),
+    "操场": ("open_area", ("操场", "运动场")), "运动场": ("open_area", ("操场", "运动场")),
+    "广场": ("open_area", ("广场",)), "空地": ("open_area", ()),
+}
+REPLY_CONTEXT = re.compile(r"^(?:(?:就)?在|靠近|离|挨着)\s*(.+?)(?:旁边|附近|最近|那边|那个)?$")
 
 
 class SpatialExtraction(BaseModel):
@@ -74,6 +85,34 @@ class Reference:
     place: Place
     exact: bool = False
     direction: tuple[int, int] | None = None
+
+
+@dataclass(frozen=True)
+class SpatialDraft:
+    slots: dict[str, str]
+    selected: dict[str, Reference]
+    parsed: DispatchCandidate
+    constraints: DispatchConstraints
+    hazards: tuple[DynamicHazard, ...]
+    mission_type: MissionType
+    compare: bool
+    mode: LLMMode
+    model_called: bool
+
+
+@dataclass(frozen=True)
+class LocationIssue:
+    reason: str
+    options: tuple[Reference, ...] = ()
+    map_pick: bool = True
+
+
+@dataclass(frozen=True)
+class LocationTurn:
+    draft: SpatialDraft
+    resolved: dict[str, Reference]
+    slot: str
+    issue: LocationIssue
 
 
 @dataclass(frozen=True)
@@ -105,6 +144,13 @@ class CandidateSet:
     model_called: bool
 
 
+class AmbiguousPlace(ValueError):
+    def __init__(self, places: list[Place]) -> None:
+        names = "、".join(dict.fromkeys(place.name for place in places[:4]))
+        super().__init__(f"地点有多个匹配（{names}），请选择具体位置。")
+        self.places = places
+
+
 def event(steps: list[ThoughtStep], role, content: str) -> None:
     steps.append(ThoughtStep(step=len(steps) + 1, role=role, content=content))
 
@@ -114,14 +160,29 @@ def bounded(point: GroundPoint) -> bool:
     return west <= point.lon <= east and south <= point.lat <= north
 
 
+def place_key(text: str) -> str:
+    return text.casefold().replace("珞瑜", "珞喻")
+
+
+def location_phrase(text: str) -> str:
+    return re.sub(r"(?:起飞|出发|降落|巡检|巡逻|配送|投送|送餐|送件|吧)+$", "", text.strip(" ，,。！？!?")).strip()
+
+
 def route_texts(query: str) -> tuple[dict[str, str], list[str]]:
     # Keep the comma within a bracketed coordinate distinct from a clause separator.
     pairs = [match.span() for match in COORDINATES.finditer(query)]
-    marks = list(ROLES.finditer(query))
+    altitude_spans = [match.span() for match in ALT_RANGE.finditer(query)]
+    marks = [mark for mark in ROLES.finditer(query)
+             if not any(start <= mark.start() < end for start, end in altitude_spans)]
+    destinations = [index for index, mark in enumerate(marks)
+                    if not mark[0].startswith(ORIGINS) and not VIA_MARKER.fullmatch(mark[0])]
+    ordered = (sum(mark[0] == "→" for mark in marks) > 1
+               or any(marks[index][0].startswith(("先", "再", "然后", "接着", "最后")) for index in destinations))
+    intermediate = set(destinations[:-1]) if ordered else set()
     values = {}
     via = []
     for index, mark in enumerate(marks):
-        role = "via" if VIA_MARKER.fullmatch(mark[0]) else "start" if mark[0].startswith(ORIGINS) else "end"
+        role = "via" if index in intermediate or VIA_MARKER.fullmatch(mark[0]) else "start" if mark[0].startswith(ORIGINS) else "end"
         stop = marks[index + 1].start() if index + 1 < len(marks) else len(query)
         for delimiter in EXTRA_CONSTRAINT.finditer(query, mark.end(), stop):
             if not any(first < delimiter.start() < last for first, last in pairs):
@@ -136,7 +197,7 @@ def route_texts(query: str) -> tuple[dict[str, str], list[str]]:
             values.setdefault(role, clause)
     if "start" not in values and "end" in values and marks[0][0] in {"到", "至", "→"}:
         prefix = query[:marks[0].start()].strip()
-        if prefix:
+        if prefix and not re.search(r"^(?:把|请|帮我)|送|运|配送|巡检|巡逻|飞|规划|任务", prefix):
             values["start"] = prefix
     return values, via
 
@@ -153,7 +214,7 @@ class SpatialDispatch:
         self.places: dict[str, list[Place]] = {}
         for alias, pad_id in agent.pad_aliases.items():
             pad = self.airspace.vertiports[pad_id]
-            self.places[alias] = [Place(pad.properties.name, pad.position, pad_id)]
+            self.places[place_key(alias)] = [Place(pad.properties.name, pad.position, pad_id)]
 
         zones = {}
         for layer in ("buildings", "nofly_zones"):
@@ -166,12 +227,12 @@ class SpatialDispatch:
                 place = Place(name, GroundPoint(lon=center.x, lat=center.y))
                 if layer == "nofly_zones":
                     zones[props["id"]] = place
-                if not any(item.pad_id for item in self.places.get(name, [])):
-                    self.places.setdefault(name.casefold(), []).append(place)
+                if not any(item.pad_id for item in self.places.get(place_key(name), [])):
+                    self.places.setdefault(place_key(name), []).append(place)
 
         for alias, identifier in agent.zone_aliases.items():
             if identifier in zones:
-                self.places.setdefault(alias, [zones[identifier]])
+                self.places.setdefault(place_key(alias), [zones[identifier]])
         self.pads_by_source = {}
         for feature in self.airspace.geojson.get("vertiports", {}).get("features", []):
             props = feature["properties"]
@@ -192,10 +253,9 @@ class SpatialDispatch:
                 center = geometry.representative_point()
             place = Place(name, GroundPoint(lon=center.x, lat=center.y), kind=kind,
                           osm_ref=props["osm_ref"], geometry=geometry)
-            for alias in dict.fromkeys((name, name.replace("珞瑜", "珞喻"))):
-                key = alias.casefold()
-                if not any(item.pad_id for item in self.places.get(key, [])):
-                    self.places.setdefault(key, []).append(place)
+            key = place_key(name)
+            if not any(item.pad_id for item in self.places.get(key, [])):
+                self.places.setdefault(key, []).append(place)
             if kind == "water":
                 waters.append(transform(geometry, self.airspace.frame.project_xy).buffer(4))
         roads = [transform(shape(feature["geometry"]), self.airspace.frame.project_xy).buffer(5)
@@ -206,6 +266,9 @@ class SpatialDispatch:
         pad = self.airspace.vertiports.get("VP01")
         if pad:
             self.places.setdefault("信息学部", [Place("信息学部", pad.position)])
+        self.catalog = tuple(dict.fromkeys(place for group in self.places.values() for place in group))
+        self.match_keys = sorted(self.places, key=len, reverse=True)
+        self.dialogs: OrderedDict[str, tuple[float, LocationTurn]] = OrderedDict()
         self.pending: OrderedDict[str, tuple[float, CandidateSet]] = OrderedDict()
         self.active: OrderedDict[str, tuple[float, ActiveTask]] = OrderedDict()
         self.lock = Lock()
@@ -216,8 +279,17 @@ class SpatialDispatch:
         roles, via = route_texts(AVOID_CLAUSE.sub("", query))
         if via or VIA_MARKER.search(query) or COMPARE.search(query):
             return True
+        if len(roles) == 2 and len(mentioned) < 2:
+            return True
+        if any(location_phrase(text) in GENERIC_PLACES for text in roles.values()):
+            return True
         return any(any(not place.pad_id and (place.kind or len(mentioned) < 2)
                        for place in self.matches(text)) for text in roles.values())
+
+    @staticmethod
+    def is_new_route(query: str) -> bool:
+        roles, _ = route_texts(AVOID_CLAUSE.sub("", query))
+        return len(roles) == 2 and not SLOT_EDIT.fullmatch(query)
 
     @staticmethod
     def is_airspace_query(query: str) -> bool:
@@ -226,9 +298,9 @@ class SpatialDispatch:
     def matches(self, text: str) -> list[Place]:
         matched = []
         spans = []
-        for key in sorted(self.places, key=len, reverse=True):
+        for key in self.match_keys:
             token = rf"(?<![a-z0-9]){re.escape(key)}(?![a-z0-9])" if key.isascii() else re.escape(key)
-            for match in re.finditer(token, text.casefold()):
+            for match in re.finditer(token, place_key(text)):
                 if any(start <= match.start() and match.end() <= stop for start, stop in spans):
                     continue
                 spans.append(match.span())
@@ -256,8 +328,14 @@ class SpatialDispatch:
             return Reference(Place("与".join(place.name for place in matches) + "路口",
                                    GroundPoint(lon=intersection.x, lat=intersection.y), kind="road"))
         if len(matches) > 1:
-            names = "、".join(dict.fromkeys(place.name for place in matches[:4]))
-            raise ValueError(f"地点有多个匹配（{names}），请补充名称或在地图上点选。")
+            side = re.search(r"([东西南北])(?:边|侧|面)(?:那[个处座])?$", location_phrase(text))
+            if side and not ROOFTOP.search(text):
+                options = tuple(Reference(place, exact=bool(place.pad_id)) for place in matches)
+                directional = [ref for ref in options
+                               if self.option_label(ref.place, options).endswith(f" · {side[1]}侧")]
+                if len(directional) == 1:
+                    return self.named_reference(directional[0], options)
+            raise AmbiguousPlace(matches)
         if not matches:
             return None
         place = matches[0]
@@ -345,33 +423,224 @@ class SpatialDispatch:
         kind = mission_type if mission_type and not re.search(r"巡检|巡逻|安防|配送|投送|送餐|送件", query) else parsed.mission_type
         if LOW_FLIGHT.search(query) and (kind == "inspection" or parsed.prefer_high_altitude):
             return self.notice("constraint_conflict", "避开高空与本次 60–90 米巡检航层冲突，请调整任务或航层。", steps)
-        try:
-            start_text = roles.get("start", parsed.start_id or "")
-            end_text = roles.get("end", parsed.end_id or "")
-            if start_text in {"信息学部起飞", "信息学部出发"} and parsed.start_id == "VP01":
-                start_text = "VP01"
-            start = self.reference(start_text, options.start)
-            end = self.reference(end_text, options.end)
-            via = self.resolve_visits(via_texts, task_query)
-        except ValueError as exc:
-            return self.notice("needs_spatial_location", str(exc), steps)
-        if not start or not end:
-            missing = "起点" if end else "终点" if start else "起点和终点"
-            return self.notice("needs_spatial_location", f"请补充{missing}的校门、广场、道路、起降点编号或坐标。", steps)
 
+        if len(via_texts) > MAX_VISITS:
+            return self.notice("needs_spatial_location", "每次任务最多支持 3 个途经点，请拆成多次任务。", steps)
+        if not via_texts and VIA_MARKER.search(task_query):
+            via_texts = [""]
+        start_text = roles.get("start", parsed.start_id or "")
+        if start_text in {"信息学部起飞", "信息学部出发"} and parsed.start_id == "VP01":
+            start_text = "VP01"
+        slots = {"start": start_text, **{f"via-{i}": text for i, text in enumerate(via_texts, 1)},
+                 "end": roles.get("end", parsed.end_id or "")}
+        selected = {slot: Reference(Place("地图点选位置", point), exact=True)
+                    for slot, point in (("start", options.start), ("end", options.end)) if point}
+        draft = SpatialDraft(slots, selected, parsed, constraints, hazards, kind, bool(COMPARE.search(query)), mode, called)
+        return self.advance(draft, steps, model_called=called)
+
+    def resolve_location(self, text: str, slot: str, resolved: dict[str, Reference]) -> Reference | LocationIssue:
+        phrase = location_phrase(text)
+        label = SLOT_LABELS[slot]
+        roof = bool(ROOFTOP.search(phrase))
+        generic = GENERIC_PLACES.get(phrase)
+        if generic:
+            kind, words = generic
+            places = [place for place in self.catalog if place.kind == kind
+                      and (not words or any(word in place.name for word in words))]
+            anchor = resolved.get("end" if slot == "start" else "start")
+            if anchor:
+                places.sort(key=lambda place: self.distance_to(place, anchor.place))
+            options = tuple(Reference(place) for place in places[:4])
+            if options:
+                return LocationIssue(f"你说的{label}「{phrase}」在场景内有多个选择，请选具体位置。", options)
+        try:
+            reference = self.reference(text)
+        except AmbiguousPlace as exc:
+            places = exc.places
+            if roof:
+                places = [place for place in places if place.pad_id
+                          and self.airspace.vertiports[place.pad_id].roof_obstacle is not None]
+            if not places:
+                return LocationIssue(f"{label}「{phrase}」没有可核对的屋顶起降坪，请填写已登记的屋顶起降坪编号。", map_pick=False)
+            choices = sorted(places, key=lambda place: (place.name, place.point.lon, place.point.lat))[:4]
+            options = tuple(Reference(place, exact=bool(place.pad_id)) for place in choices)
+            return LocationIssue(f"{label}「{phrase}」匹配到多个位置，请选择一个，也可以描述方位或附近地标。", options, not roof)
+        except ValueError as exc:
+            return LocationIssue(f"{label}「{phrase}」：{exc}", map_pick=not roof)
+        if reference:
+            if not bounded(reference.place.point):
+                return LocationIssue(f"{label}「{phrase}」在校园场景范围外，请点选场景内的位置或换一个地标。")
+            if slot.startswith("via-") and reference.direction:
+                return LocationIssue(f"{label}「{phrase}」只描述了方位，请在地图上点出具体飞越位置。")
+            return reference
+        if not phrase:
+            return LocationIssue(f"还没有指定{label}。可以选校门、道路、广场或在地图上点选。")
+        ranked = [(SequenceMatcher(None, place_key(phrase), place_key(place.name), autojunk=False).ratio(), place)
+                  for place in self.catalog
+                  if (not roof or place.pad_id and self.airspace.vertiports[place.pad_id].roof_obstacle is not None)]
+        choices = sorted(((score, place) for score, place in ranked if score >= .65), key=lambda item: -item[0])[:3]
+        options = tuple(Reference(place, exact=bool(place.pad_id)) for _, place in choices)
+        if options:
+            return LocationIssue(f"地图未找到{label}「{phrase}」的确切位置。你指的是下面哪一处？", options, not roof)
+        if roof:
+            return LocationIssue(f"未找到{label}「{phrase}」对应的屋顶起降坪，请填写已登记的屋顶起降坪编号。", map_pick=False)
+        return LocationIssue(f"地图未收录{label}「{phrase}」。可以说它靠近哪条路、哪处校门或广场，也可以直接在地图上点选。")
+
+    def distance_to(self, place: Place, anchor: Place) -> float:
+        x, y, _ = self.airspace.frame.to_local(Position(lon=place.point.lon, lat=place.point.lat, alt=0))
+        ax, ay, _ = self.airspace.frame.to_local(Position(lon=anchor.point.lon, lat=anchor.point.lat, alt=0))
+        return hypot(x - ax, y - ay)
+
+    @staticmethod
+    def option_label(place: Place, options: tuple[Reference, ...]) -> str:
+        group = [item.place for item in options if item.place.name == place.name]
+        if len(group) == 2:
+            first, last = group
+            lon_span = abs(first.point.lon - last.point.lon)
+            lat_span = abs(first.point.lat - last.point.lat)
+            if lon_span * cos(place.point.lat * pi / 180) >= lat_span:
+                side = "西侧" if place.point.lon == min(item.point.lon for item in group) else "东侧"
+            else:
+                side = "南侧" if place.point.lat == min(item.point.lat for item in group) else "北侧"
+            return f"{place.name} · {side}"
+        return f"{place.name} · 位置 {group.index(place) + 1}" if len(group) > 1 else place.name
+
+    def named_reference(self, reference: Reference, options: tuple[Reference, ...]) -> Reference:
+        label = self.option_label(reference.place, options)
+        return replace(reference, place=replace(reference.place, name=label))
+
+    def ask(
+        self, turn: LocationTurn, steps: list[ThoughtStep], *, model_called: bool = False,
+        status: DispatchNoticeType = "needs_spatial_location",
+    ) -> DispatchNotice:
+        draft, issue = turn.draft, turn.issue
+        token = self.store(self.dialogs, turn, CANDIDATE_TTL)
+        slots = [LocationSlot(key=key, label=SLOT_LABELS[key], phrase=location_phrase(phrase),
+                              resolved_name=turn.resolved[key].place.name if key in turn.resolved else None)
+                 for key, phrase in draft.slots.items()]
+        options = [LocationOption(label=self.option_label(ref.place, issue.options),
+                                  reply=f"选项{i}", point=ref.place.point)
+                   for i, ref in enumerate(issue.options, 1)]
+        detail = issue.reason
+        event(steps, "observation", detail)
+        return DispatchNotice(status=status, detail=detail, thought_steps=steps, mode=draft.mode, model_called=model_called,
+                              clarification_token=f"geo-{token}", clarification=LocationClarification(
+                                  slot=turn.slot, label=SLOT_LABELS[turn.slot], slots=slots, options=options,
+                                  map_pick=issue.map_pick))
+
+    def advance(
+        self, draft: SpatialDraft, steps: list[ThoughtStep], *, model_called: bool = False,
+    ) -> SpatialChoices | DispatchNotice:
+        resolved = draft.selected.copy()
+        missing = {}
+        for slot, text in draft.slots.items():
+            if slot in resolved:
+                if resolved[slot].place.name == "地图点选位置" and ROOFTOP.search(text):
+                    resolved.pop(slot)
+                    missing[slot] = LocationIssue(f"{SLOT_LABELS[slot]}要求屋顶起降，请填写已登记的屋顶起降坪编号。", map_pick=False)
+                elif not bounded(resolved[slot].place.point):
+                    resolved.pop(slot)
+                    missing[slot] = LocationIssue(f"{SLOT_LABELS[slot]}的点选坐标超出校园场景，请在场景内重新点选。")
+                continue
+            candidate = self.resolve_location(text, slot, resolved)
+            if isinstance(candidate, LocationIssue):
+                missing[slot] = candidate
+            else:
+                resolved[slot] = candidate
+        if missing:
+            slot = next(iter(missing))
+            issue = missing[slot]
+            if location_phrase(draft.slots[slot]) in GENERIC_PLACES:
+                issue = self.resolve_location(draft.slots[slot], slot, resolved)
+            return self.ask(LocationTurn(draft, resolved, slot, issue), steps, model_called=model_called)
+        return self.plan_draft(draft, resolved, steps)
+
+    def reply(self, query: str, token: str, steps: list[ThoughtStep]) -> SpatialChoices | DispatchNotice:
+        turn = self.get(self.dialogs, token)
+        if not turn:
+            return self.notice("clarification_closed", "这次地点确认已过期，请重新发送原始调度指令。", steps)
+        event(steps, "action", f"继续确认{SLOT_LABELS[turn.slot]}，沿用已识别的地点、航层和避让要求。")
+        draft = turn.draft
+        slot = turn.slot
+        if (AVOID_CLAUSE.search(query) or LOW_FLIGHT.search(query) or UNSUPPORTED_STOP.search(query)
+                or ALT_CONTEXT.search(query) and MEASUREMENT.search(query)):
+            detail = f"当前在确认{SLOT_LABELS[slot]}，原航层和避让要求仍保留。若要同时修改约束，请点「另起任务」并发送更新后的指令。"
+            return self.ask(replace(turn, issue=replace(turn.issue, reason=detail)), steps)
+        edit = SLOT_EDIT.fullmatch(query.rstrip("。！!"))
+        if edit:
+            key = {"起点": "start", "终点": "end"}.get(edit[1])
+            slot = key or f"via-{'一二三'.find(edit[2]) + 1 if not edit[2].isascii() else edit[2]}"
+            query = edit[3]
+            if slot not in draft.slots:
+                detail = f"原任务中没有{SLOT_LABELS[slot]}。这里正在确认{SLOT_LABELS[turn.slot]}。{turn.issue.reason}"
+                return self.ask(replace(turn, issue=replace(turn.issue, reason=detail)), steps)
+
+        options = turn.issue.options if slot == turn.slot else ()
+        phrase = query.strip(" ，,。！？!?")
+        index = re.fullmatch(r"(?:选项|选|第)\s*([一二三四1234])(?:[个项处])?(?:那个|就行|吧)?", phrase)
+        reference = None
+        if index:
+            number = int(index[1]) if index[1].isascii() else "一二三四".index(index[1]) + 1
+            if number <= len(options):
+                reference = options[number - 1]
+            else:
+                return self.ask(turn, steps)
+        elif options:
+            side = re.fullmatch(r"(?:选|要)?\s*([东西南北])(?:边|侧|面)(?:那[个处座])?(?:吧)?", phrase)
+            labels = [(self.option_label(ref.place, options), ref) for ref in options]
+            matched = [ref for label, ref in labels if place_key(label) == place_key(phrase)
+                       or side and label.endswith(f" · {side[1]}侧")]
+            if len(matched) == 1:
+                reference = matched[0]
+
+        context = REPLY_CONTEXT.fullmatch(phrase)
+        original = draft.slots[slot]
+        keep_roof = ROOFTOP.search(original) and not edit
+        if reference is None and context and options:
+            anchors = self.matches(context[1])
+            if len(anchors) == 1:
+                ranked = sorted((self.distance_to(ref.place, anchors[0]), index)
+                                for index, ref in enumerate(options))
+                if len(ranked) == 1 or ranked[1][0] - ranked[0][0] >= 10:
+                    reference = options[ranked[0][1]]
+        if reference is None and not edit and (re.fullmatch(r"(?:都行|随便|不知道|哪个|哪个都可以|都可以|继续|好的?|是的?)(?:吧)?", phrase)
+                                                or not phrase):
+            return self.ask(turn, steps)
+        if reference is None and keep_roof:
+            phrase = f"{phrase}楼顶" if not ROOFTOP.search(phrase) else phrase
+        if reference is None and context and not options and not keep_roof:
+            phrase = context[1]
+        slots = {**draft.slots, slot: phrase}
+        selected = {key: ref for key, ref in turn.resolved.items() if key != slot}
+        if reference:
+            slots[slot] = original
+            selected[slot] = self.named_reference(reference, options)
+        return self.advance(replace(draft, slots=slots, selected=selected), steps)
+
+    def plan_draft(self, draft: SpatialDraft, resolved: dict[str, Reference], steps: list[ThoughtStep]) -> SpatialChoices | DispatchNotice:
+        parsed, hazards = draft.parsed, draft.hazards
+        start, end = resolved["start"], resolved["end"]
+        via = tuple(RouteReference(name=place.name, lon=place.point.lon, lat=place.point.lat, osm_ref=place.osm_ref)
+                    for key in draft.slots if key.startswith("via-") for place in (resolved[key].place,))
         field, _ = self.airspace.with_hazards(hazards, parsed.avoid_zone_ids)
-        rejected: Counter[str] = Counter()
-        starts = self.sites(start, "起点", field, rejected)
-        ends = self.sites(end, "终点", field, rejected)
+        start_rejected, end_rejected = Counter(), Counter()
+        starts = self.sites(start, "起点", field, start_rejected)
+        ends = self.sites(end, "终点", field, end_rejected)
         if not starts or not ends:
-            cause = "、".join(rejected) or "缺少可用地面位置"
-            return self.notice("constraint_conflict", f"未找到可用起降点：{cause}。请换一处地面位置。", steps)
+            slot = "start" if not starts else "end"
+            place = resolved[slot].place
+            cause = "、".join(start_rejected if not starts else end_rejected) or "缺少可用地面位置"
+            detail = f"{SLOT_LABELS[slot]}「{place.name}」无法安全起降（{cause}）。试试附近的另一处地标或重新点选。"
+            issue = LocationIssue(detail)
+            return self.ask(LocationTurn(draft, resolved, slot, issue), steps, status="constraint_conflict")
+        rejected = start_rejected + end_rejected
 
         event(steps, "action", "用场景地形、障碍包络及已载入围栏筛选地面点，逐组校验起降与航线。")
         accepted = []
         for origin, target in sorted(product(starts, ends), key=lambda pair: sum(item.site.offset_m for item in pair))[:8]:
             intent = DispatchIntent(**parsed.model_dump(exclude={"start_id", "end_id", "mission_type"}),
-                                    start_id=origin.site.id, end_id=target.site.id, mission_type=kind, constraints=constraints, via=via)
+                                    start_id=origin.site.id, end_id=target.site.id, mission_type=draft.mission_type,
+                                    constraints=draft.constraints, via=via)
             pads = {item.site.id: item.pad for item in (origin, target)}
             task = ActiveTask(intent, pads, hazards)
             try:
@@ -381,10 +650,26 @@ class SpatialDispatch:
                 continue
             accepted.append((origin.site, target.site, task, route, corridor, preferred, None))
         if not accepted:
-            missing = "、".join(place.name for place in via)
-            detail = f"无法按顺序飞越 {missing}，请核对途经点、避让范围或巡航高度。" if missing else "候选起降点间没有满足空域和高度条件的航线。"
-            return self.notice("constraint_conflict", detail, steps)
-        compare = bool(COMPARE.search(query) or via)
+            visit_slots = [key for key in draft.slots if key.startswith("via-")]
+            corridor = "inspection" if parsed.prefer_high_altitude else draft.mission_type
+            layer = MISSION_LAYERS[corridor]
+            altitudes = [self.airspace.grid.center((0, 0, level))[2]
+                         for level in self.agent.planner.cruise_levels(layer, draft.constraints.cruise)]
+            if not altitudes:
+                return self.notice("constraint_conflict", "指定巡航高度与当前任务航层不兼容，请调整航层后重新规划。", steps)
+            slot = "end"
+            detail = "当前航层和避让要求下，起终点之间没有可行航线。可换一个终点或另起任务调整要求。"
+            if via:
+                slot = visit_slots[0]
+                detail = "无法按当前顺序和约束连接所有地点。可指定要替换的途经点，例如「第一个途经点改为……」。"
+                for key, place in zip(visit_slots, via, strict=True):
+                    x, y, _ = self.airspace.frame.to_local(Position(lon=place.lon, lat=place.lat, alt=0))
+                    if not any(field.segment_clear((x, y, alt), (x, y, alt)) for alt in altitudes):
+                        slot = key
+                        detail = f"{SLOT_LABELS[key]}「{place.name}」在当前航层内没有可飞越的高度。请选择附近的另一处途经点。"
+                        break
+            return self.ask(LocationTurn(draft, resolved, slot, LocationIssue(detail)), steps, status="constraint_conflict")
+        compare = draft.compare or bool(via)
         if compare:
             best = min(accepted, key=self.rank)
             accepted.extend(self.alternatives(best))
@@ -408,29 +693,14 @@ class SpatialDispatch:
             event(steps, "observation", "依序飞越：" + " → ".join(place.name for place in via) + "。")
         event(steps, "observation", f"完成起降及避障复核，共 {len(plans)} 条可行航线。")
         task_zones = self.task_zones(hazards)
-        token = self.store(self.pending, CandidateSet(plans, task_zones, tuple(steps), mode, called), CANDIDATE_TTL)
+        token = self.store(self.pending, CandidateSet(plans, task_zones, tuple(steps), draft.mode, draft.model_called), CANDIDATE_TTL)
         return SpatialChoices(
-            candidate_token=token, detail="请选择可行航线，核对起降和途经位置后确认。", mode=mode,
+            candidate_token=token, detail="请选择可行航线，核对起降和途经位置后确认。", mode=draft.mode,
             choice_type="routes" if compare else "sites",
-            model_called=called, thought_steps=steps, options=[plan.option for plan in plans.values()],
+            model_called=draft.model_called, thought_steps=steps, options=[plan.option for plan in plans.values()],
             rejected=dict(rejected), task_zones=task_zones,
         )
 
-    def resolve_visits(self, texts: list[str], query: str) -> tuple[RouteReference, ...]:
-        if not texts and VIA_MARKER.search(query):
-            raise ValueError("请明确要依序飞越的地点。")
-        if len(texts) > MAX_VISITS:
-            raise ValueError("每次任务最多支持 3 个途经点，请缩短路线或拆成多次任务。")
-        visits = []
-        for text in texts:
-            reference = self.reference(text)
-            if not reference or not bounded(reference.place.point):
-                raise ValueError(f"未找到途经点「{text}」，请使用场景地名或经纬度。")
-            place = reference.place
-            if reference.direction:
-                raise ValueError(f"途经点「{text}」需明确位置，可填写经纬度。")
-            visits.append(RouteReference(name=place.name, lon=place.point.lon, lat=place.point.lat, osm_ref=place.osm_ref))
-        return tuple(visits)
 
     @staticmethod
     def rank(item):

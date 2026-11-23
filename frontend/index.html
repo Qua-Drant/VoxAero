@@ -8,10 +8,10 @@
   <link rel="stylesheet" href="https://cesium.com/downloads/cesiumjs/releases/1.119/Build/Cesium/Widgets/widgets.css">
   <link rel="preload" href="/assets/fonts/Inter-Latin.woff2" as="font" type="font/woff2" crossorigin>
   <link rel="stylesheet" href="/css/tokens.css?v=13">
-  <link rel="stylesheet" href="/css/style.css?v=19">
+  <link rel="stylesheet" href="/css/style.css?v=20">
   <script src="https://cdn.tailwindcss.com/3.4.17" defer></script>
   <script src="https://cesium.com/downloads/cesiumjs/releases/1.119/Build/Cesium/Cesium.js" defer></script>
-  <script src="/js/app.js?v=18" type="module"></script>
+  <script src="/js/app.js?v=19" type="module"></script>
 </head>
 <body>
   <svg class="icon-definitions" aria-hidden="true" focusable="false" width="0" height="0">
@@ -216,7 +216,7 @@
         <p>在武大信息学部规划配送、巡检和应急仿真。</p>
         <ol class="welcome-steps">
           <li><strong>描述任务</strong><span>说明要做什么、从哪里飞到哪里。可以按顺序补充途经地点、巡航高度和避让区域。</span></li>
-          <li><strong>核对航线</strong><span>地点不清楚时，调度台会请你补充。确认起终点和航线后，再开始仿真。</span></li>
+          <li><strong>核对航线</strong><span>地点有歧义时，可选地点、描述附近地标或在地图上点选。确认起终点和航线后，再开始仿真。</span></li>
           <li><strong>体验应急</strong><span>巡航中可能随机遇到阵风或低电量，也可手动触发。结束后可回放任务。</span></li>
         </ol>
         <p class="welcome-note">可用校门、道路、广场、操场、经纬度或地图点选。说「比较多条航线」可查看可行方案。</p>
@@ -226,6 +226,12 @@
           <button type="button" data-welcome-example="spatial"><span class="welcome-emoji" aria-hidden="true">📍</span> 选址示例</button>
           <button type="button" data-welcome-example="route"><span class="welcome-emoji" aria-hidden="true">🧭</span> 多点巡检</button>
         </div>
+      </section>
+      <section id="location-clarification" class="location-clarification" aria-labelledby="clarification-heading" hidden>
+        <h3 id="clarification-heading" tabindex="-1"></h3>
+        <p id="clarification-detail"></p>
+        <dl id="clarification-slots"></dl>
+        <div id="clarification-actions" class="clarification-actions" role="group" aria-label="地点确认选项"></div>
       </section>
       <div id="agent-messages"></div>
       <template id="agent-exchange-template">

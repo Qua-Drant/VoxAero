@@ -252,6 +252,28 @@ body[data-view="fpv"] .scene-vignette {
 .welcome .welcome-note { color: var(--text-muted); }
 .welcome-actions { display: flex; flex-wrap: wrap; gap: 7px; margin-top: 10px; }
 .welcome-actions button { min-height: 28px; font-size: var(--font-small); }
+.location-clarification {
+  display: grid; gap: 7px; padding: 11px 13px; border-bottom: 1px solid var(--border-hairline);
+  background: var(--surface-well); overflow-wrap: anywhere;
+}
+.location-clarification h3 { font-size: var(--font-title); font-weight: 700; }
+.location-clarification p { color: var(--text-secondary); font-size: var(--font-small); line-height: 1.55; }
+.location-clarification dl { display: grid; gap: 3px; padding-block: 5px; border-block: 1px solid var(--border-hairline); }
+.location-clarification dl > div { display: grid; grid-template-columns: 6.7em minmax(0, 1fr); gap: 6px; font-size: var(--font-label); }
+.location-clarification dt { color: var(--text-muted); }
+.location-clarification dd { color: var(--text-secondary); }
+.location-clarification [data-current] dt { color: var(--accent-vector); }
+.clarification-actions { display: flex; flex-wrap: wrap; gap: 6px; }
+.clarification-actions button { min-height: 34px; white-space: normal; text-align: start; }
+.clarification-actions button[aria-pressed="true"] { border-color: var(--accent-vector); color: var(--accent-vector); }
+.dispatch:has(.location-clarification:not([hidden])) .active-mission { display: none; }
+@media (min-width: 1021px) {
+  .dispatch:has(.location-clarification:not([hidden])) #location-clarification {
+    flex: 0 1 auto; min-block-size: 98px; overflow-y: auto; overscroll-behavior: contain;
+    scrollbar-width: thin; scrollbar-color: var(--text-dim) transparent;
+  }
+}
+
 .plan-kicker, .plan-heading { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
 .plan-heading { margin-block: 4px 8px; }
 .plan-heading h3 { font-size: var(--font-title); font-weight: 720; letter-spacing: -.018em; }

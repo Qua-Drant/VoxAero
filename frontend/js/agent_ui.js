@@ -89,7 +89,7 @@ function planRequirements({ intent, waypoints }, zoneNames) {
 }
 
 export class AgentUI {
-  constructor(dispatch, clearClarification) {
+  constructor(dispatch, clearClarification, pickClarification) {
     this.mode = document.getElementById("mode");
     this.input = document.getElementById("query");
     this.form = document.getElementById("dispatch-form");
@@ -98,6 +98,13 @@ export class AgentUI {
     this.exchangeTemplate = document.getElementById("agent-exchange-template");
     this.planTemplate = document.getElementById("dispatch-plan-template");
     this.guide = document.getElementById("agent-welcome");
+    this.clarification = document.getElementById("location-clarification");
+    this.clarificationHeading = document.getElementById("clarification-heading");
+    this.clarificationDetail = document.getElementById("clarification-detail");
+    this.clarificationSlots = document.getElementById("clarification-slots");
+    this.clarificationActions = document.getElementById("clarification-actions");
+    this.pickClarification = pickClarification;
+    this.dispatch = dispatch;
     this.panel = this.form.closest(".dispatch");
     this.feedback = document.getElementById("dispatch-status");
     this.submit = this.form.querySelector("#submit");
@@ -259,6 +266,8 @@ export class AgentUI {
         ["约束核验", checked?.text ?? `航层 ${corridor} · 避开禁飞区`],
         ["航线生成", `生成 ${decimal(kpis.distance_m)} m 三维航迹${body.route_visits?.length ? ` · 飞越 ${body.route_visits.length} 处` : ""}`],
       ]);
+    } else if (body?.clarification) {
+      this.setTraceSummary(exchange, [["地点核对", "已保留当前任务，等待确认上方标出的地点。"]]);
     } else if (body?.detail) {
       const readback = [[RESPONSE_LABELS[body.status] ?? "调度反馈", plainDispatchText(body.detail)]];
       if (body.airspace_check) readback.push(["来源核验", body.airspace_check.detail]);
@@ -266,10 +275,55 @@ export class AgentUI {
     }
   }
 
-  setClarification(active) {
+  showLocationClarification(question, detail) {
+    this.clarificationHeading.textContent = `确认${question.label}`;
+    this.clarificationDetail.textContent = plainDispatchText(detail);
+    const rows = question.slots.map(({ key, label, phrase, resolved_name }) => {
+      const row = document.createElement("div");
+      const title = document.createElement("dt");
+      const value = document.createElement("dd");
+      row.toggleAttribute("data-current", key === question.slot);
+      title.textContent = label;
+      value.textContent = resolved_name
+        ? `${resolved_name} · 已识别`
+        : phrase ? `${phrase} · 待确认` : "待指定";
+      row.append(title, value);
+      return row;
+    });
+    this.clarificationSlots.replaceChildren(...rows);
+    const actions = question.options.map(({ label, reply }) => {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "action-button";
+      button.textContent = label;
+      button.addEventListener("click", () => this.dispatch(reply));
+      return button;
+    });
+    if (question.map_pick) {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "action-button";
+      button.textContent = "地图点选";
+      button.id = "clarification-map-pick";
+      button.setAttribute("aria-pressed", "false");
+      button.addEventListener("click", () => this.pickClarification(question.label));
+      actions.push(button);
+    }
+    this.clarificationActions.replaceChildren(...actions);
+    this.clarificationActions.hidden = !actions.length;
+    this.clarification.hidden = false;
+    this.clarificationHeading.focus({ preventScroll: true });
+  }
+
+  setClarification(active, question) {
     this.clear.hidden = !active;
     document.getElementById("submit-label").textContent = active ? "提交补答" : "规划航线";
-    this.input.placeholder = active ? "例如：食堂" : "例如：从 VP01 巡检至 VP04";
+    this.input.placeholder = question ? `回复${question.label}的方位或附近地标`
+      : active ? "例如：食堂" : "例如：从 VP01 巡检至 VP04";
+    if (!question) {
+      this.clarification.hidden = true;
+      this.clarificationActions.replaceChildren();
+    }
   }
 
   setAvailable(available, decisionPending) {
@@ -281,6 +335,7 @@ export class AgentUI {
     }
     this.submit.disabled = !available;
     this.clear.disabled = !available;
+    for (const button of this.clarificationActions.querySelectorAll("button")) button.disabled = !available;
     for (const button of this.presets) button.disabled = !available;
   }
 

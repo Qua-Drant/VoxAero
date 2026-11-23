@@ -287,6 +287,10 @@ class DispatchAgent:
 
         if self.spatial.is_airspace_query(query):
             return self.spatial.inspect_airspace(query, spatial, steps)
+        if clarification_token and clarification_token.startswith("geo-"):
+            if not self.spatial.is_new_route(query):
+                return self.spatial.reply(query, clarification_token[4:], steps)
+
         locations = self._locations(query)
         mentioned = self._pad_mentions(locations)
         task_text = self.pad_pattern.sub("地点", locations)
