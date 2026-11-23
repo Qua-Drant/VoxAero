@@ -15,6 +15,7 @@ const resetButton = element("reset-flight");
 const focusButton = element("focus-route");
 const windButton = element("wind");
 const batteryButton = element("battery");
+const automaticEmergency = element("automatic-emergency");
 const closeEmergency = setupEmergencyMenu();
 const phaseNames = { takeoff: "垂直起飞", cruise: "巡航", landing: "降落", transition: "调整高度" };
 const directions = ["北", "北偏东", "东北", "东偏北", "东", "东偏南", "东南", "南偏东", "南", "南偏西", "西南", "西偏南", "西", "西偏北", "西北", "北偏西"];
@@ -49,6 +50,33 @@ const clock = new Intl.DateTimeFormat("zh-CN", { hour: "2-digit", minute: "2-dig
 function tickClock() { text("sim-clock", clock.format()); }
 tickClock();
 setInterval(tickClock, 1000);
+
+const guide = element("user-guide");
+const guideKey = "voxaero.user-guide.v1";
+element("open-user-guide").addEventListener("click", () => guide.showModal());
+guide.addEventListener("close", () => {
+  try { localStorage.setItem(guideKey, "seen"); } catch { /* Storage can be blocked. */ }
+});
+let seenGuide = false;
+try { seenGuide = localStorage.getItem(guideKey) === "seen"; } catch { /* Show the guide without storage. */ }
+if (!seenGuide) guide.showModal();
+
+function sampleEmergency(legs, demo) {
+  if (!demo && Math.random() >= .35) return null;
+  const cruise = legs.filter((leg) => leg.phase === "cruise" && leg.horizontal > 1);
+  const cruiseSeconds = cruise.reduce((total, leg) => total + leg.end - leg.start, 0);
+  if (cruiseSeconds < 3) return null;
+  // Sample along the accumulated cruise time, leaving room to respond before landing.
+  let offset = cruiseSeconds * (.2 + Math.random() * .35);
+  for (const leg of cruise) {
+    const length = leg.end - leg.start;
+    if (offset < length) {
+      return { at: leg.start + offset, type: Math.random() < .5 ? "wind_gust" : "low_battery" };
+    }
+    offset -= length;
+  }
+  return null;
+}
 
 function setupEmergencyMenu() {
   const fallback = element("emergency-menu");
@@ -142,7 +170,7 @@ function updateControls() {
   text("emergency-hint", replaying ? "回放中。退出回放后可操作当前任务。"
     : busy === "replan" ? "仿真已暂停，正在计算新航线。"
     : cruising ? "应急事件将从当前飞行位置重新规划。"
-      : "进入巡航后可注入应急事件。");
+      : "进入巡航后可手动模拟应急。");
 }
 
 function isInFlight() {
@@ -202,6 +230,11 @@ function onFrame(next) {
   if (!previous || previous.playing !== next.playing || previous.leg !== next.leg || previous.complete !== next.complete
       || (next.leg.phase === "takeoff" && (previous.coordinates.alt < 30) !== (next.coordinates.alt < 30))) {
     refreshFlightState();
+  }
+  if (next.elapsed > previous?.elapsed && next.playing && next.leg.phase === "cruise" && next.leg.horizontal > 1
+      && automaticEmergency.checked && !busy && !review?.active
+      && mission.automaticEvent && next.elapsed >= mission.automaticEvent.at) {
+    void replan(mission.automaticEvent.type, { automatic: true });
   }
 }
 
@@ -324,7 +357,10 @@ function installRoute(result, target, battery = 100, rerouted = false) {
   sim.load(result.waypoints, result.corridor, { battery, target });
   profile.setTrack(sim.track, result.corridor, rerouted ? "改航点" : mission.original.intent.start_id, target);
   profile.paint(frame);
-  if (!rerouted) mission.climbEnds = sim.track.legs.find((leg) => leg.phase !== "takeoff")?.start ?? sim.track.duration;
+  if (!rerouted) {
+    mission.climbEnds = sim.track.legs.find((leg) => leg.phase !== "takeoff")?.start ?? sim.track.duration;
+    mission.automaticEvent = sampleEmergency(sim.track.legs, mission.demo);
+  }
   setMissionTimeline();
 }
 
@@ -416,12 +452,12 @@ function discardDraft() {
   renderSpatialPicks();
 }
 
-function startMission(result) {
+function startMission(result, demo = false) {
   clearSpatialPicks();
   mission = {
     original: result, hazards: [], volumes: [...(result.task_zones ?? [])],
     avoid: new Set(result.intent.avoid_zone_ids), diverted: false, hold: false, elapsedBeforeSegment: 0,
-    segments: [], events: [],
+    segments: [], events: [], demo, automaticEvent: null,
   };
   map.clearPadFocus();
   map.setTaskSites(result.task_sites);
@@ -432,12 +468,18 @@ function startMission(result) {
 
 function confirmDraft() {
   if (busy || !draft || isInFlight()) return;
-  const { result } = draft;
+  const { result, demo } = draft;
   draft = null;
   ui.acceptPlan();
-  startMission(result);
-  ui.status("已确认任务，仿真运行中。");
+  startMission(result, demo);
+  announceFlightStart();
   playButton.focus({ preventScroll: true });
+}
+
+function announceFlightStart() {
+  ui.status(mission.demo && mission.automaticEvent && automaticEmergency.checked
+    ? "应急演示已开始，巡航时会随机触发一次应急。"
+    : "已确认任务，仿真运行中。");
 }
 
 function editDraft() {
@@ -509,13 +551,13 @@ function presentDraft(result, query, autoPlay = false) {
   const actions = { confirm: confirmDraft, edit: editDraft, locate: (id) => map.focusPad(id) };
   if (autoPlay && !(result.model_fallback && mission)) {
     ui.showPlan(result, zoneNames, actions, true);
-    startMission(result);
+    startMission(result, true);
     ui.setInput("");
-    ui.status("应急演示已开始，进入巡航后可注入事件。");
+    announceFlightStart();
     return;
   }
   proposal = null;
-  draft = { result, query };
+  draft = { result, query, demo: autoPlay };
   element("spatial-input").open = false;
   setView("overview");
   renderSpatialPicks();
@@ -650,14 +692,21 @@ function beginMapPick(role) {
   });
 }
 
-async function replan(type) {
+async function replan(type, { automatic = false } = {}) {
   const button = type === "wind_gust" ? windButton : batteryButton;
   if (button.disabled || busy || !mission) return;
   const hazard = type === "wind_gust" ? sim.proposeHazard(mission.hazards) : null;
   if (type === "wind_gust" && !hazard) {
-    ui.status("前方巡航航段不足，无法在避开当前位置与目的地的情况下放置禁飞区。", true);
-    return;
+    if (automatic && !batteryButton.disabled) {
+      type = "low_battery";
+    } else {
+      ui.status("前方巡航航段不足，无法在避开当前位置与目的地的情况下放置禁飞区。", true);
+      return;
+    }
   }
+
+  const incident = automatic ? `自动应急 · ${eventNames[type]}` : eventNames[type];
+  mission.automaticEvent = null;
 
   const before = sim.snapshot();
   const constraints = mission.original.intent.constraints;
@@ -666,11 +715,11 @@ async function replan(type) {
   const event = { at: elapsed, position: before.coordinates };
   const deadline = mission.diverted ? null : constraints.deadline_seconds;
   busy = "replan";
-  closeEmergency();
+  if (!automatic) closeEmergency();
   if (type === "low_battery") sim.battery = Math.min(sim.battery, 14);
   sim.pause();
   refreshFlightState();
-  ui.status("已冻结当前位置，正在请求应急航线…");
+  ui.status(`${incident}，正在从当前位置规划新航线…`);
   const path = "/api/agent/replan";
   const payload = {
     current_pos: before.coordinates,
@@ -702,19 +751,19 @@ async function replan(type) {
     const detail = hazard ? `临时禁飞区半径 ${format.format(hazard.radius_m)} 米`
       : `改降 ${targetLabel(result.target_id)}`;
     mission.events.push({
-      ...event, segmentIndex: segmentIndex + 1, name: `${eventNames[type]} · ${action}获准`, compare: true,
+      ...event, segmentIndex: segmentIndex + 1, name: `${incident} · ${action}获准`, compare: true,
       detail,
     });
-    ui.status(action + "航线已接入。");
+    ui.status(`${incident}，${action}航线已接入。`);
     if (before.playing) sim.play();
     void ui.revealSteps(exchange, result.thought_steps, zoneNames);
   } catch (error) {
     const detail = plainDispatchText(error.message);
     mission.hold = true;
-    mission.events.push({ ...event, segmentIndex, name: `${eventNames[type]} · 仿真悬停`,
+    mission.events.push({ ...event, segmentIndex, name: `${incident} · 仿真悬停`,
       detail, battery: sim.battery });
     saveReview(sim.snapshot(), "仿真悬停 · 应急规划未成功");
-    ui.status("已悬停 · " + detail, true);
+    ui.status(`${incident}，已悬停 · ${detail}`, true);
     void ui.revealSteps(exchange, error.steps);
   } finally {
     busy = null;
@@ -891,7 +940,7 @@ element("clear-spatial").addEventListener("click", () => {
   ui.status("已清除地图选点和任务避让区。");
 });
 document.addEventListener("keydown", (event) => {
-  if (event.key === "Escape" && pickRole) {
+  if (event.key === "Escape" && pickRole && !guide.open) {
     stopMapPick();
     ui.status("已取消地图点选。");
   }
