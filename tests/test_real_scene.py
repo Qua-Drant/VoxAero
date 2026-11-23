@@ -110,7 +110,7 @@ def test_real_dispatch_routes_and_version(scene, client, query, destination, lay
     assert stale.status_code == 409 and "刷新" in stale.json()["detail"]
 
 
-def test_real_dispatch_respects_cruise_and_time_constraints(scene, client):
+def test_real_dispatch_enforces_cruise_and_ignores_time_requirements(scene, client):
     base = "从食堂把午餐送到测国重楼顶，避开图书馆禁飞区"
     planned = client.post("/api/agent/dispatch", json={"query": base + "，不要飞高空，巡航不要高于 50 米"})
     assert planned.status_code == 200, planned.text
@@ -120,15 +120,18 @@ def test_real_dispatch_respects_cruise_and_time_constraints(scene, client):
     _verify_api_route(plan, scene, "VP01", "VP03", field)
     assert all(max(a.alt, b.alt) <= 50 for a, b in pairwise(plan.waypoints) if b.phase == "cruise")
 
-    for suffix, reason in (("巡航必须低于二十米", "30–60"), ("必须在10秒内送达", "超过 10 秒")):
-        response = client.post("/api/agent/dispatch", json={"query": base + "，" + suffix})
-        body = response.json()
-        assert response.status_code == 409 and body["status"] == "constraint_conflict", body
-        assert "waypoints" not in body and reason in body["detail"]
+    incompatible = client.post("/api/agent/dispatch", json={"query": base + "，巡航必须低于二十米"})
+    assert incompatible.status_code == 409 and incompatible.json()["status"] == "constraint_conflict"
+    assert "30–60" in incompatible.json()["detail"]
 
-    preferred = client.post("/api/agent/dispatch", json={"query": base + "，尽量 10 秒内送到"})
-    assert preferred.status_code == 200 and preferred.json()["intent"]["constraints"]["deadline_seconds"] is None
-    assert any("超过偏好" in step["content"] for step in preferred.json()["thought_steps"])
+    for suffix in ("必须在10秒内送达", "尽量 10 秒内送到", "12:00 前送达"):
+        result = client.post("/api/agent/dispatch", json={"query": base + "，" + suffix})
+        assert result.status_code == 200, result.text
+        body = result.json()
+        limits = body["intent"]["constraints"]
+        assert limits["deadline_seconds"] is None and limits["preferred_deadline_seconds"] is None
+        assert body["kpis"]["estimated_seconds"] > 10
+        assert any("预计耗时仅供参考" in step["content"] for step in body["thought_steps"])
 
 
 @pytest.fixture(scope="module")
@@ -161,7 +164,7 @@ def test_real_temporary_restriction_and_diversion(scene, client, real_detour, em
     assert limited.status_code == 200, limited.text
     limited_route = ReplanResult.model_validate(limited.json())
     assert all(65 <= p.alt <= 85 for p in limited_route.waypoints if p.phase == "cruise")
-    assert any("超出原任务剩余时限" in step.content for step in limited_route.thought_steps)
+    assert not any("时限" in step.content for step in limited_route.thought_steps)
     battery = client.post("/api/agent/replan", json={
         **request, "target_id": "VP03", "emergency_type": "low_battery",
         "active_hazards": [hazard.model_dump()],

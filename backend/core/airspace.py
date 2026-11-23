@@ -308,7 +308,7 @@ class Airspace:
             "vertiports": "vertiports.geojson",
             "nofly_zones": "nofly_zones.geojson",
         }
-        for key, filename in (("terrain", "whu_terrain.json"), ("roads", "whu_roads.geojson")):
+        for key, filename in (("terrain", "whu_terrain.json"), ("roads", "whu_roads.geojson"), ("places", "whu_places.geojson")):
             if (directory / filename).is_file():
                 sources[key] = filename
         version = sha256()

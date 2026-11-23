@@ -1,7 +1,8 @@
-import { renderAirspaceCheck, spatialCandidateForm } from "./spatial_ui.js?v=2";
+import { renderAirspaceCheck, spatialCandidateForm } from "./spatial_ui.js?v=3";
 
 const PRESETS = {
   spatial: "从信息学部附近找一个可起飞的地面点，去图书馆西侧巡检，绕开静谧区。",
+  route: "从星空广场起飞，依次途经星湖、星湖南路，最后到信息学部操场巡检，比较多条航线。",
   delivery: "中午高峰配送：将餐食从信息学部食堂送至测国重楼顶，避开图书馆静谧区",
   inspection: "夜间高空安防巡检：从信息学部起飞，沿 60–90m 巡检层前往图书馆西侧巡检点",
   emergency: "应急航线演示：从 VP02 沿 60–90m 巡检层前往 VP03",
@@ -32,7 +33,6 @@ export function plainDispatchText(content) {
     .replaceAll("候选航线", "找到的路线")
     .replaceAll("合规航线", "符合飞行要求的路线")
     .replaceAll("硬约束", "必须满足的要求")
-    .replaceAll("硬时限", "的到达时限")
     .replaceAll("全高度绕开", "从任何高度都绕开")
     .replace("并应用其余空域限制", "并遵守其他飞行限制")
     .replace("应用建筑缓冲区和全部静态空域限制", "让航线远离建筑并避开禁飞区")
@@ -55,7 +55,7 @@ function readableStep({ role, content }) {
   }
   if (role === "thought") return content.startsWith("保持飞行当前位置")
     ? ["机位锁定", "记录当前位置作为改航起点。"]
-    : ["约束提取", "提取航层、时限与避让要求。"];
+    : ["约束提取", "提取航层与避让要求。"];
   const endpoints = content.match(/^\S+ (.+) → \S+ (.+)$/);
   if (endpoints) return ["地点匹配", `${endpoints[1]} → ${endpoints[2]}`];
   const route = content.match(/^规划成功，\d+ 个航点，([\d.]+) m。$/);
@@ -70,11 +70,10 @@ function altitudeText(limits) {
   return parts.join(" 且 ");
 }
 
-function planRequirements({ intent, waypoints, kpis }, zoneNames) {
-  const { cruise, deadline_seconds, preferred_cruise, preferred_deadline_seconds } = intent.constraints;
+function planRequirements({ intent, waypoints }, zoneNames) {
+  const { cruise, preferred_cruise } = intent.constraints;
   const rows = [];
   if (cruise) rows.push({ text: `巡航 ${altitudeText(cruise)}（场景高度）` });
-  if (deadline_seconds !== null) rows.push({ text: `起飞后 ${number.format(deadline_seconds)} 秒内到达` });
   if (intent.avoid_zone_ids.length) {
     rows.push({ text: "全高度避让 " + intent.avoid_zone_ids.map((id) => zoneNames.get(id) ?? id).join("、") });
   }
@@ -85,10 +84,6 @@ function planRequirements({ intent, waypoints, kpis }, zoneNames) {
     const missed = waypoints.some((point, index) => index > 0 && point.phase === "cruise"
       && (!allows(waypoints[index - 1]) || !allows(point)));
     rows.push({ text: `巡航偏好 ${altitudeText(limits)}（场景高度）${missed ? " · 未满足" : ""}`, warning: missed });
-  }
-  if (preferred_deadline_seconds !== null) {
-    const missed = kpis.estimated_seconds > preferred_deadline_seconds;
-    rows.push({ text: `到达时限偏好 ${number.format(preferred_deadline_seconds)} 秒${missed ? " · 预计超时" : ""}`, warning: missed });
   }
   return rows.length ? rows : [{ text: "采用默认空域与建筑避障规则" }];
 }
@@ -248,21 +243,21 @@ export class AgentUI {
     }
     if (choosing && ok) {
       this.setTraceSummary(exchange, [
-        ["地点筛选", "在场景中匹配参考地点并检查地面候选。"],
-        ["航线复核", `已有 ${body.options.length} 组候选通过仿真路线检查。`],
-        ["候选确认", "选择候选后可核对航线并开始仿真。"],
+        ["地点筛选", "核对起降点及途经地点。"],
+        ["航线复核", `共 ${body.options.length} 条航线通过场景检查。`],
+        ["候选确认", "可预览航线，比较净空与航程。"],
       ]);
     } else if (planned && ok) {
       const { kpis, intent } = body;
       const corridor = CORRIDORS[body.corridor];
       const constraints = intent ? planRequirements(body, zoneNames) : [];
-      const checked = constraints.find(({ text }) => text.includes("避让") || text.includes("时限"));
+      const checked = constraints.find(({ text }) => text.includes("避让"));
       this.setTraceSummary(exchange, [
         ["指令解析", intent
           ? `确认${intent.mission_type === "inspection" ? "巡检" : "配送"}任务 · ${intent.start_id} → ${intent.end_id}`
           : `重新研判当前机位与目的地 ${body.target_id}`],
         ["约束核验", checked?.text ?? `航层 ${corridor} · 避开禁飞区`],
-        ["航线生成", `生成 ${decimal(kpis.distance_m)} m 避障三维航迹`],
+        ["航线生成", `生成 ${decimal(kpis.distance_m)} m 三维航迹${body.route_visits?.length ? ` · 飞越 ${body.route_visits.length} 处` : ""}`],
       ]);
     } else if (body?.detail) {
       const readback = [[RESPONSE_LABELS[body.status] ?? "调度反馈", plainDispatchText(body.detail)]];
@@ -312,13 +307,14 @@ export class AgentUI {
     const { intent } = result;
     part("type").textContent = intent.mission_type === "inspection" ? "校园巡检任务" : "校园配送任务";
     part("id").textContent = "#MSN-" + String(++this.missionNumber).padStart(3, "0");
-    this.plan = { card, part, locate, zoneNames };
+    this.plan = { card, part, locate, zoneNames, visits: result.route_visits ?? [] };
     this.setPlanEndpoint("start", intent.start_id, result.start_name);
     this.setPlanEndpoint("end", intent.end_id, result.end_name);
     part("confirm").addEventListener("click", confirm);
     part("edit").addEventListener("click", edit);
     this.mission.replaceChildren(card);
     this.updatePlan(result, intent.end_id, result.end_name);
+    this.setVisitProgress(0);
     if (running) this.acceptPlan();
   }
 
@@ -340,7 +336,8 @@ export class AgentUI {
     const { part, zoneNames } = this.plan;
     const { kpis, intent } = result;
     this.setPlanEndpoint("end", target, targetName);
-    part("corridor").textContent = CORRIDORS[result.corridor];
+    part("corridor").textContent = result.cruise_altitude_m == null
+      ? CORRIDORS[result.corridor] : `${number.format(result.cruise_altitude_m)} m`;
     part("compliance").textContent = kpis.compliant
       ? `${Math.round(kpis.compliance_percent)}% · 校验 ${zoneNames.size + (result.temporary_nofly_zone ? 1 : 0)} 区` : "未通过";
     part("clearance").textContent = kpis.min_clearance_m == null ? "—" : `≥ ${(Math.floor(kpis.min_clearance_m * 10) / 10).toFixed(1)} m`;
@@ -349,6 +346,18 @@ export class AgentUI {
       : result.mode === "live_llm" ? "模型识别" : "本地规则";
     renderAirspaceCheck(part("airspace"), result.airspace_check);
     part("kpis").textContent = `规划航程 ${decimal(kpis.distance_m)} m · 预计 ${decimal(kpis.estimated_seconds)} s`;
+  }
+
+  setVisitProgress(completed, diverted = false) {
+    if (!this.plan?.visits.length) return;
+    const { part, visits } = this.plan;
+    const panel = part("visits");
+    panel.hidden = false;
+    const status = diverted ? `原任务中止 · 已飞越 ${completed}/${visits.length}`
+      : `飞越进度 ${completed}/${visits.length}`;
+    if (part("visit-progress").textContent !== status) part("visit-progress").textContent = status;
+    const itinerary = visits.map(visit => visit.name).join(" → ");
+    if (part("visit-names").textContent !== itinerary) part("visit-names").textContent = itinerary;
   }
 
   setMissionState(label, tone = "neutral") {

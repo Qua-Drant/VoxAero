@@ -43,6 +43,7 @@ class RoutePlanner:
         *,
         avoid_zone_ids: tuple[str, ...] = (),
         cruise_limits: CruiseLimits | None = None,
+        via: tuple[Position, ...] = (),
     ) -> RoutePlan:
         """Plan from a registered or validated task pad, or an airborne WGS84 position."""
         if mission_type not in MISSION_LAYERS:
@@ -52,7 +53,7 @@ class RoutePlanner:
         origin_is_pad = not isinstance(start, Position)
         if origin_is_pad:
             start_pad = self._pad(start) if isinstance(start, str) else start
-            if start_pad.properties.id == end_pad.properties.id or start_pad.position == end_pad.position:
+            if not via and (start_pad.properties.id == end_pad.properties.id or start_pad.position == end_pad.position):
                 raise NoRouteError("Origin and destination vertiports must be different")
             origin = start_pad.position
             origin_roof = start_pad.roof_obstacle
@@ -63,14 +64,14 @@ class RoutePlanner:
                 raise NoRouteError("An airborne origin must be at or above 30 m")
 
         min_lon, min_lat, max_lon, max_lat = STUDY_BOUNDS
-        for position in (origin, end_pad.position):
+        places = (origin, *via, end_pad.position)
+        for position in places:
             if not (min_lon <= position.lon <= max_lon and min_lat <= position.lat <= max_lat):
                 raise NoRouteError("Route endpoints must be inside the study area")
         frame = self.airspace.frame
-        start_point = frame.to_local(origin)
-        end_point = frame.to_local(end_pad.position)
+        anchors = tuple(frame.to_local(place) for place in places)
         west, south, east, north = self.grid.bounds
-        for x, y, z in (start_point, end_point):
+        for x, y, z in anchors:
             if not (west <= x <= east and south <= y <= north and 0 <= z <= CEILING_M):
                 raise NoRouteError("Route endpoints must be inside the planning volume")
 
@@ -78,39 +79,42 @@ class RoutePlanner:
         if not levels:
             raise NoRouteError("No grid levels satisfy the cruise altitude limits")
         field, blocked = self.airspace.with_hazards(extra_nofly_zones, avoid_zone_ids)
-        starts = self._attachments(start_point, levels, field, blocked, origin_roof, origin_is_pad)
-        goals = self._attachments(end_point, levels, field, blocked, end_pad.roof_obstacle, True)
-        if not starts or not goals:
-            raise NoRouteError("No safe connection between an endpoint and its mission layer")
+        points: list[tuple[LocalPoint, FlightPhase]] = []
+        visits = []
+        for index, (start_point, end_point) in enumerate(pairwise(anchors)):
+            first = index == 0
+            terminal = index == len(anchors) - 2
+            if via and start_point[:2] == end_point[:2]:
+                raise NoRouteError("Consecutive route locations must be different")
+            departure_pad = first and origin_is_pad
+            starts = self._attachments(start_point, levels, field, blocked, origin_roof if first else None, departure_pad)
+            goals = self._attachments(end_point, levels, field, blocked, end_pad.roof_obstacle if terminal else None, terminal)
+            if not starts or not goals:
+                raise NoRouteError("No safe connection between a route location and its mission layer")
 
-        voxels = self._search(starts, goals, end_point, levels, blocked, layer)
-        centers = [self.grid.center(voxel) for voxel in voxels]
-        departure = (*start_point[:2], centers[0][2])
-        arrival = (*end_point[:2], centers[-1][2])
-        cruise = self._smooth([departure, *centers, arrival], field)
+            voxels = self._search(starts, goals, end_point, levels, blocked, layer)
+            centers = [self.grid.center(voxel) for voxel in voxels]
+            departure = (*start_point[:2], centers[0][2])
+            arrival = (*end_point[:2], centers[-1][2])
+            cruise = self._smooth([departure, *centers, arrival], field)
+            if first:
+                phase: FlightPhase = "takeoff" if departure_pad else "transition" if start_point != cruise[0] else "cruise"
+                points.append((start_point, phase))
+            if start_point != cruise[0]:
+                points.append((cruise[0], "takeoff" if departure_pad else "transition"))
+            points.extend((point, "cruise") for point in cruise[1:])
+            if points[-1][0] != end_point:
+                points.append((end_point, "landing" if terminal else "cruise"))
+            if not terminal:
+                visits.append(len(points) - 1)
 
-        initial_phase: FlightPhase = "takeoff" if origin_is_pad else "transition"
-        points: list[tuple[LocalPoint, FlightPhase]] = [(start_point, initial_phase)]
-        if start_point != cruise[0]:
-            points.append((cruise[0], initial_phase))
-        elif not origin_is_pad:
-            points[0] = (start_point, "cruise")
-        points.extend((point, "cruise") for point in cruise[1:])
-        if points[-1][0] != end_point:
-            points.append((end_point, "landing"))
-
+        exact = {anchor[:2]: place for anchor, place in zip(anchors, places, strict=True)}
         waypoints = []
         for point, phase in points:
-            if point[:2] == start_point[:2]:
-                lon, lat = origin.lon, origin.lat
-            elif point[:2] == end_point[:2]:
-                lon, lat = end_pad.position.lon, end_pad.position.lat
-            else:
-                position = frame.to_position(point)
-                lon, lat = position.lon, position.lat
-            waypoints.append(Waypoint(lon=lon, lat=lat, alt=point[2], phase=phase))
+            position = exact.get(point[:2]) or frame.to_position(point)
+            waypoints.append(Waypoint(lon=position.lon, lat=position.lat, alt=point[2], phase=phase))
         length = sum(dist(a, b) for (a, _), (b, _) in pairwise(points))
-        return RoutePlan(waypoints=waypoints, distance_m=length)
+        return RoutePlan(waypoints=waypoints, distance_m=length, visit_indices=tuple(visits))
 
     def cruise_levels(self, layer: AirspaceLayer, limits: CruiseLimits | None = None) -> tuple[int, ...]:
         return tuple(

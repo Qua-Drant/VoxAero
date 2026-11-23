@@ -16,15 +16,15 @@ from shapely.geometry.polygon import orient
 from backend.config import LLMSettings, MISSION_LAYERS
 from backend.core.airspace import Airspace, Obstacle, Vertiport
 from backend.core.intent import (
-    ALT_CONTEXT, CHAT, CLARIFY_INTENT_MESSAGE, DEADLINE, DISPATCH_WORDS, HELP, HELP_MESSAGE, LOW_FLIGHT, MEASUREMENT,
-    ROUTE_WORDS, SCOPE_MESSAGE, UNSUPPORTED_WAYPOINT, intersect_limits, parse_constraints,
+    ALT_CONTEXT, CHAT, CLARIFY_INTENT_MESSAGE, DISPATCH_WORDS, HELP, HELP_MESSAGE, LOW_FLIGHT, MEASUREMENT,
+    ROUTE_WORDS, SCOPE_MESSAGE, TIME_REQUEST, UNSUPPORTED_STOP, intersect_limits, parse_constraints,
 )
 from backend.core.planner import NoRouteError, RoutePlanner
-from backend.core.spatial_dispatch import SpatialDispatch
+from backend.core.spatial_dispatch import SpatialDispatch, route_visits
 from backend.schemas import (
     AssessedRoute, CruiseLimits, DispatchCandidate, DispatchConstraints, DispatchIntent, DispatchNotice,
     DispatchNoticeType, DispatchResult, DynamicHazard, HazardFeature, HazardPolygon, LLMMode, MissionType,
-    NoFlyProperties, Position, ReplanRequest, ReplanResult, RouteKPIs, RoutePlan, SpatialChoices, SpatialOptions, ThoughtStep,
+    NoFlyProperties, Position, ReplanRequest, ReplanResult, RouteKPIs, RoutePlan, RouteReference, SpatialChoices, SpatialOptions, ThoughtStep,
 )
 
 PAD_ALIASES = {
@@ -60,7 +60,6 @@ PENDING_LIMIT = 128
 
 class ModelDispatchIntent(DispatchCandidate):
     cruise_requirement: str | None = None
-    deadline_requirement: str | None = None
 
 
 @dataclass(frozen=True)
@@ -107,7 +106,8 @@ class DispatchAgent:
             item["properties"]["id"]: item["properties"]["name"]
             for item in airspace.geojson.get("nofly_zones", {}).get("features", [])
         }
-        self.pad_aliases = _aliases(self.pad_names, PAD_ALIASES)
+        aliases = PAD_ALIASES | {"VP05": ("星湖备降坪",)} if "places" in airspace.geojson else PAD_ALIASES
+        self.pad_aliases = _aliases(self.pad_names, aliases)
         self.zone_aliases = _aliases(self.zone_names, {"NFZ01": ("图书馆", "静谧区")})
         alternatives = [
             re.escape(alias) if not alias.isascii() else rf"(?<![a-z0-9]){re.escape(alias)}(?![a-z0-9])"
@@ -183,7 +183,7 @@ class DispatchAgent:
         prompt = (
             "Call the intent tool once using valid IDs. Use null for missing or ambiguous endpoints and never guess. "
             "Interpret 信息学部起飞 as VP01 when available. Negative wording such as 不要飞高空 is not a high-altitude preference. "
-            "For cruise_requirement quote only an altitude request; for deadline_requirement quote only a time request. "
+            "For cruise_requirement quote only an altitude request. Ignore delivery deadlines and time preferences. "
             "Quote the complete relevant phrase verbatim, or use null when absent. Include comparators, units and any preference or obligation. "
             f"Vertiports: {self.pad_names}. No-fly zones: {self.zone_names}. "
             "Avoidance applies only to explicitly requested zones. Preserve the requested mission type."
@@ -250,12 +250,29 @@ class DispatchAgent:
         *,
         avoid_zone_ids: tuple[str, ...] = (),
         cruise_limits: CruiseLimits | None = None,
+        via: tuple[RouteReference, ...] = (),
     ) -> AssessedRoute:
-        route = self.planner.plan_3d_route(
-            start, end_id, mission_type, extra_nofly_zones, avoid_zone_ids=avoid_zone_ids, cruise_limits=cruise_limits,
-        )
+        if via:
+            layer = MISSION_LAYERS[mission_type]
+            levels = self.planner.cruise_levels(layer, cruise_limits)
+            altitudes = [self.airspace.grid.center((0, 0, level))[2] for level in levels]
+            for altitude in sorted(altitudes, key=lambda height: abs(height - layer.midpoint)):
+                positions = tuple(Position(lon=site.lon, lat=site.lat, alt=altitude) for site in via)
+                limits = CruiseLimits(min_alt=altitude, max_alt=altitude)
+                try:
+                    route = self.planner.plan_3d_route(start, end_id, mission_type, extra_nofly_zones,
+                                                       avoid_zone_ids=avoid_zone_ids, cruise_limits=limits, via=positions)
+                    break
+                except NoRouteError:
+                    continue
+            else:
+                raise NoRouteError("No route visits all requested locations in order")
+        else:
+            route = self.planner.plan_3d_route(
+                start, end_id, mission_type, extra_nofly_zones, avoid_zone_ids=avoid_zone_ids, cruise_limits=cruise_limits,
+            )
         kpis, flight_seconds = self._metrics(route, mission_type, start, end_id, extra_nofly_zones, avoid_zone_ids)
-        return AssessedRoute(waypoints=route.waypoints, distance_m=route.distance_m, kpis=kpis, flight_seconds=flight_seconds)
+        return AssessedRoute(**route.model_dump(), kpis=kpis, flight_seconds=flight_seconds)
 
     def dispatch(
         self, query: str, clarification_token: str | None = None, spatial: SpatialOptions | None = None
@@ -285,8 +302,10 @@ class DispatchAgent:
             return self._notice(steps, "out_of_scope", SCOPE_MESSAGE)
 
         _add(steps, "thought", "提取有输入依据的起降坪、任务类型与约束。")
-        if UNSUPPORTED_WAYPOINT.search(locations):
-            return self._notice(steps, "constraint_conflict", "当前支持单段配送或巡检，请直接指定起点和终点。")
+        if UNSUPPORTED_STOP.search(locations):
+            return self._notice(steps, "constraint_conflict", "途经点采用空中飞越；如需中途落地，请拆成两次任务。")
+        if TIME_REQUEST.search(query):
+            _add(steps, "observation", "时限不参与规划，预计耗时仅供参考。")
         if use_spatial:
             return self.spatial.propose(query, spatial or SpatialOptions(), steps)
         try:
@@ -313,17 +332,12 @@ class DispatchAgent:
                 altitude_quote = model.cruise_requirement
                 if altitude_quote and altitude_quote in query and (
                     MEASUREMENT.search(altitude_quote)
-                    or (ALT_CONTEXT.search(altitude_quote) and not DEADLINE.search(altitude_quote))
+                    or (ALT_CONTEXT.search(altitude_quote) and not TIME_REQUEST.search(altitude_quote))
                 ) and not (
                     constraints.cruise or constraints.preferred_cruise or LOW_FLIGHT.search(query)
                     or HIGH_PATTERN.search(query)
                 ):
                     return self._notice(steps, "constraint_conflict", "请明确巡航高度，例如‘巡航不超过 50 米’。",
-                                        mode=mode, model_called=True)
-                if model.deadline_requirement and model.deadline_requirement in query and (
-                    constraints.deadline_seconds is None and constraints.preferred_deadline_seconds is None
-                ):
-                    return self._notice(steps, "constraint_conflict", "请明确飞行时限，例如‘起飞后 60 秒内送达’。",
                                         mode=mode, model_called=True)
         if mode == "fallback_mock":
             _add(steps, "action", "parse_dispatch_intent · 本地关键词与起降坪匹配")
@@ -339,7 +353,7 @@ class DispatchAgent:
                 if len(self.pending) > PENDING_LIMIT:
                     self.pending.popitem(last=False)
             missing = "起点" if candidate.end_id else "终点" if candidate.start_id else "起点和终点"
-            return self._notice(steps, "needs_clarification", f"请补充{missing}的起降坪名称或编号。",
+            return self._notice(steps, "needs_clarification", f"请补充{missing}的起降点编号或场景地名。",
                                 mode=mode, model_called=model_called, token=token)
         return self._plan_dispatch(candidate, constraints, mode, steps, model_called, model_fallback)
 
@@ -420,9 +434,7 @@ class DispatchAgent:
                 except NoRouteError:
                     _add(steps, "observation", "巡航高度偏好下没有合规航线，继续按硬约束规划。")
                 else:
-                    if constraints.deadline_seconds is None or route.flight_seconds <= constraints.deadline_seconds:
-                        return self._finish_dispatch(intent, route, corridor, mode, steps, model_called, model_fallback)
-                    _add(steps, "observation", "巡航高度偏好下的候选航线超过硬时限，继续按硬约束规划。")
+                    return self._finish_dispatch(intent, route, corridor, mode, steps, model_called, model_fallback)
             route = self.plan_3d_route(
                 intent.start_id, intent.end_id, corridor, avoid_zone_ids=intent.avoid_zone_ids, cruise_limits=limits,
             )
@@ -437,14 +449,6 @@ class DispatchAgent:
         self, intent: DispatchIntent, route: AssessedRoute, corridor: MissionType, mode: LLMMode,
         steps: list[ThoughtStep], model_called: bool, model_fallback: bool,
     ) -> DispatchResult | DispatchNotice:
-        elapsed = route.kpis.estimated_seconds
-        deadline = intent.constraints.deadline_seconds
-        preferred_deadline = intent.constraints.preferred_deadline_seconds
-        if deadline is not None and route.flight_seconds > deadline:
-            return self._notice(steps, "constraint_conflict", f"候选航线预计 {elapsed:g} 秒，超过 {deadline:g} 秒硬时限。请放宽时限或调整起降坪。",
-                                mode=mode, model_called=model_called)
-        if preferred_deadline is not None and route.flight_seconds > preferred_deadline:
-            _add(steps, "observation", f"预计飞行 {elapsed:g} 秒，超过偏好的 {preferred_deadline:g} 秒。")
         _add(steps, "observation", f"规划成功，{len(route.waypoints)} 个航点，{route.distance_m:.0f} m。")
         return DispatchResult(
             intent=intent, mode=mode, model_called=model_called, model_fallback=model_fallback,
@@ -491,6 +495,10 @@ class DispatchAgent:
             _add(steps, "observation", f"已应用半径 {request.dynamic_hazard.radius_m:g} m 的临时禁飞区。")
 
         target = request.target_id
+        via = task.intent.via if task and target == task.intent.end_id else ()
+        if request.completed_visits > len(via):
+            raise _error(steps, "途经进度与当前任务不匹配。", 422)
+        remaining = via[request.completed_visits:] if request.emergency_type != "low_battery" else ()
         try:
             if request.emergency_type == "low_battery":
                 _add(steps, "action", "plan_3d_route · 比较可达应急坪的合规航线")
@@ -500,24 +508,18 @@ class DispatchAgent:
                 _add(steps, "action", f"plan_3d_route · 从当前坐标绕飞至 {target}")
                 route = self.plan_3d_route(
                     request.current_pos, pads[target], corridor, hazards, avoid_zone_ids=request.avoid_zone_ids,
-                    cruise_limits=request.cruise_limits,
+                    cruise_limits=request.cruise_limits, via=remaining,
                 )
         except NoRouteError as exc:
             raise _error(steps, "当前位置和空域限制下没有合规应急航线。", 409) from exc
 
         _add(steps, "observation", f"新航线已通过空域校验，剩余航程 {route.distance_m:.0f} m。")
-        deadline = request.remaining_deadline_seconds
-        if deadline is not None:
-            if request.emergency_type == "low_battery":
-                _add(steps, "observation", "原送达任务因低电量转为备降，原时限停止计入。")
-            elif route.flight_seconds > deadline:
-                _add(steps, "observation", "绕飞预计超出原任务剩余时限，优先采用合规应急航线。")
-            else:
-                _add(steps, "observation", "绕飞预计仍可在原任务剩余时限内完成。")
+        if remaining:
+            _add(steps, "observation", "改航保留剩余途经点：" + " → ".join(site.name for site in remaining) + "。")
         return ReplanResult(
             emergency_type=request.emergency_type, original_target_id=request.target_id, target_id=target,
             corridor=corridor, waypoints=route.waypoints, kpis=route.kpis, thought_steps=steps,
-            temporary_nofly_zone=feature,
+            temporary_nofly_zone=feature, route_visits=route_visits(remaining, route),
             airspace_check=self.airspace.check_airspace(route.waypoints, route.flight_seconds),
         )
 
@@ -566,8 +568,8 @@ class DispatchAgent:
                            abs(b[2] - a[2]) / VERTICAL_SPEED_MPS)
             roof = start_roof if arrival.phase == "takeoff" else end_roof if arrival.phase == "landing" else None
             clearance = min(clearance, field.segment_clearance(a, b, roof_access=roof))
-        first, last = positions[0], positions[-1]
-        ground_route = hypot(last[0] - first[0], last[1] - first[1]) * GROUND_DETOUR_FACTOR
+        checkpoints = (positions[0], *(positions[index] for index in route.visit_indices), positions[-1])
+        ground_route = sum(hypot(b[0] - a[0], b[1] - a[1]) for a, b in pairwise(checkpoints)) * GROUND_DETOUR_FACTOR
         ground_time = ground_route / GROUND_SPEED_MPS
         kpis = RouteKPIs(
             distance_m=round(route.distance_m, 2),

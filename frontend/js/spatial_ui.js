@@ -30,10 +30,11 @@ export function spatialCandidateForm(result, callbacks) {
   const header = document.createElement("h3");
   header.id = "spatial-candidates-heading";
   header.tabIndex = -1;
-  header.textContent = "候选起降点";
+  const compare = result.choice_type === "routes";
+  header.textContent = compare ? "候选航线" : "候选起降点";
   const fieldset = document.createElement("fieldset");
   const legend = document.createElement("legend");
-  legend.textContent = "选择一组起终点";
+  legend.textContent = compare ? `比较 ${result.options.length} 条通过检查的方案` : "选择起终点及对应航线";
   fieldset.append(legend);
   const reason = document.createElement("p");
   reason.className = "candidate-reason";
@@ -58,12 +59,17 @@ export function spatialCandidateForm(result, callbacks) {
   const use = document.createElement("button");
   use.type = "submit";
   use.className = "action-button primary";
-  use.textContent = "采用候选";
+  use.textContent = compare ? "采用航线" : "采用候选";
   actions.append(cancel, use);
-  form.append(header, fieldset, reason, airspace, rejected, actions);
+  const itinerary = document.createElement("p");
+  itinerary.className = "candidate-itinerary";
+  form.append(header, fieldset, itinerary, reason, airspace, rejected, actions);
 
   function preview(option) {
     reason.textContent = option.recommendation;
+    const visits = option.route_visits ?? [];
+    itinerary.hidden = !visits.length;
+    itinerary.textContent = "依序飞越 " + visits.map(visit => visit.name).join(" → ");
     renderAirspaceCheck(airspace, option.airspace_check);
     callbacks.preview(option);
   }
@@ -78,10 +84,19 @@ export function spatialCandidateForm(result, callbacks) {
     radio.addEventListener("change", () => preview(option));
     const content = document.createElement("span");
     const route = document.createElement("strong");
-    route.textContent = `${option.start.name} → ${option.end.name}`;
+    const endpoints = `${option.start.name} → ${option.end.name}`;
+    route.textContent = compare ? option.route_label : endpoints;
+    route.title = endpoints;
     const measurements = document.createElement("small");
-    measurements.textContent = `${number.format(option.kpis.distance_m)} m · ${number.format(option.kpis.estimated_seconds)} s`;
-    content.append(route, measurements);
+    const kpis = option.kpis;
+    measurements.textContent = `${number.format(kpis.distance_m)} m · ${kpis.min_clearance_m == null ? "净空待估" : `净空 ${number.format(kpis.min_clearance_m)} m`}`;
+    if (compare) {
+      const location = document.createElement("small");
+      location.className = "candidate-endpoints";
+      location.textContent = endpoints;
+      location.title = endpoints;
+      content.append(route, location, measurements);
+    } else content.append(route, measurements);
     label.append(radio, content);
     fieldset.append(label);
   });

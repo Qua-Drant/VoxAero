@@ -72,6 +72,15 @@ class GroundPoint(BaseModel, frozen=True):
     lat: Latitude
 
 
+class RouteReference(GroundPoint):
+    name: NonemptyString
+    osm_ref: str | None = None
+
+
+class RouteVisit(RouteReference):
+    waypoint_index: Annotated[int, Field(ge=1)]
+
+
 class Position(GroundPoint):
     alt: NonnegativeMeters
 
@@ -104,6 +113,7 @@ class Waypoint(Position):
 class RoutePlan(BaseModel):
     waypoints: list[Waypoint]
     distance_m: NonnegativeMeters
+    visit_indices: tuple[int, ...] = ()
 
 
 class CruiseLimits(BaseModel, frozen=True):
@@ -121,6 +131,7 @@ class CruiseLimits(BaseModel, frozen=True):
 
 
 class DispatchConstraints(BaseModel, frozen=True):
+    # Legacy deadline fields remain null in newly planned missions.
     cruise: CruiseLimits | None = None
     deadline_seconds: NonnegativeMeters | None = None
     preferred_cruise: CruiseLimits | None = None
@@ -147,6 +158,7 @@ class DispatchIntent(DispatchCandidate):
     start_id: NonemptyString
     end_id: NonemptyString
     constraints: DispatchConstraints = Field(default_factory=DispatchConstraints)
+    via: tuple[RouteReference, ...] = ()
 
 
 class ReplanRequest(BaseModel):
@@ -159,7 +171,8 @@ class ReplanRequest(BaseModel):
     avoid_zone_ids: Annotated[tuple[str, ...], Field(max_length=20)] = ()
     scene_version: str | None = None
     cruise_limits: CruiseLimits | None = None
-    remaining_deadline_seconds: FiniteFloat | None = None
+    remaining_deadline_seconds: FiniteFloat | None = None  # Accepted for older clients.
+    completed_visits: Annotated[int, Field(ge=0, le=3)] = 0
     mission_token: Annotated[str, StringConstraints(min_length=1, max_length=80)] | None = None
 
     @model_validator(mode="after")
@@ -197,6 +210,7 @@ class MissionResult(BaseModel):
     kpis: RouteKPIs
     thought_steps: list[ThoughtStep]
     scene_version: str | None = None
+    route_visits: tuple[RouteVisit, ...] = ()
 
 
 class DispatchResult(MissionResult):
@@ -207,6 +221,7 @@ class DispatchResult(MissionResult):
     intent: DispatchIntent
     start_name: str
     end_name: str
+    cruise_altitude_m: NonnegativeMeters | None = None
     mission_token: str | None = None
     task_sites: tuple[TaskSite, ...] = ()
     task_zones: tuple[HazardFeature, ...] = ()
@@ -251,10 +266,13 @@ class SpatialRouteOption(BaseModel):
     kpis: RouteKPIs
     airspace_check: AirspaceCheck
     recommendation: str
+    route_label: str = "可行航线"
+    route_visits: tuple[RouteVisit, ...] = ()
 
 
 class SpatialChoices(BaseModel):
     status: Literal["choose_endpoints"] = "choose_endpoints"
+    choice_type: Literal["sites", "routes"] = "sites"
     detail: str
     candidate_token: str
     scene_version: str | None = None

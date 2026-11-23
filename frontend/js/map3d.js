@@ -478,8 +478,9 @@ export class CampusMap {
             : [[0, -11], [21, -13], [-22, -10], [0, 15], [-28, 11]],
       });
     }
-    if (this.routeAltitudeLabel && this.layers.get("route").show) {
-      points.push(this.routeAltitudeLabel);
+    if (this.layers.get("route").show) {
+      points.push(...(this.routeVisitLabels ?? []));
+      if (this.routeAltitudeLabel) points.push(this.routeAltitudeLabel);
     }
     for (const { position, label, width, offsets } of points) {
       const height = 19;
@@ -600,11 +601,12 @@ export class CampusMap {
     this.viewer.scene.requestRender();
   }
 
-  drawRoute(waypoints, rerouted, preview = false) {
+  drawRoute(waypoints, rerouted, preview = false, visits = []) {
     const entities = this.layers.get("route").entities;
     entities.removeAll();
     this.addRoute(entities, waypoints, rerouted, preview ? "#7dd3fc" : null);
     this.addRouteDepth(entities, waypoints, rerouted);
+    this.routeVisitLabels = this.addVisitMarkers(entities, waypoints, visits);
     this.viewer.scene.requestRender();
   }
 
@@ -614,7 +616,33 @@ export class CampusMap {
     if (comparison) this.addRoute(entities, comparison, false, "#6588aa");
     segments.forEach(({ flown }, index) => this.addRoute(entities, flown, index > 0));
     this.addRouteDepth(entities, segments.at(-1)?.flown ?? [], segments.length > 1);
+    this.routeVisitLabels = segments.flatMap(({ result, flown }) => this.addVisitMarkers(entities, flown,
+      (result.route_visits ?? []).filter(visit => {
+        const point = flown[visit.waypoint_index];
+        return point && point.lon === visit.lon && point.lat === visit.lat;
+      })));
     this.viewer.scene.requestRender();
+  }
+
+  addVisitMarkers(entities, waypoints, visits) {
+    return visits.flatMap((visit, index) => {
+      const point = waypoints[visit.waypoint_index];
+      if (!point) return [];
+      const position = degrees([point.lon, point.lat], point.alt);
+      const { label } = entities.add({
+        position,
+        properties: { hoverText: `飞越 ${visit.name}` },
+        point: { pixelSize: 8, color: color("#9df5d8"), outlineColor: color("#10241f"), outlineWidth: 2,
+          disableDepthTestDistance: Number.POSITIVE_INFINITY },
+        label: {
+          text: `途经 ${index + 1}`, font: `650 11px ${labelFont}`, fillColor: color("#b5f3df"),
+          showBackground: true, backgroundColor: color("#0d211d", .94),
+          backgroundPadding: new Cesium.Cartesian2(6, 3), pixelOffset: new Cesium.Cartesian2(0, -14),
+          disableDepthTestDistance: Number.POSITIVE_INFINITY,
+        },
+      });
+      return [{ position, label, width: 58, offsets: [[0, -14], [23, -26], [-26, -15], [24, 18]] }];
+    });
   }
 
   addRoute(entities, waypoints, rerouted, dashedTint = null) {

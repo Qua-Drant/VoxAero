@@ -8,10 +8,10 @@
   <link rel="stylesheet" href="https://cesium.com/downloads/cesiumjs/releases/1.119/Build/Cesium/Widgets/widgets.css">
   <link rel="preload" href="/assets/fonts/Inter-Latin.woff2" as="font" type="font/woff2" crossorigin>
   <link rel="stylesheet" href="/css/tokens.css?v=13">
-  <link rel="stylesheet" href="/css/style.css?v=18">
+  <link rel="stylesheet" href="/css/style.css?v=19">
   <script src="https://cdn.tailwindcss.com/3.4.17" defer></script>
   <script src="https://cesium.com/downloads/cesiumjs/releases/1.119/Build/Cesium/Cesium.js" defer></script>
-  <script src="/js/app.js?v=17" type="module"></script>
+  <script src="/js/app.js?v=18" type="module"></script>
 </head>
 <body>
   <svg class="icon-definitions" aria-hidden="true" focusable="false" width="0" height="0">
@@ -93,7 +93,7 @@
     </div>
     <aside id="left-rail" class="left-rail cockpit-panel" aria-label="飞行遥测与空域图层">
       <section class="flight-board" aria-label="实时飞行遥测">
-        <div class="panel-heading"><h2>飞行遥测</h2><span id="flight-state" class="status-label" role="status">待命</span></div>
+        <div class="panel-heading"><h2><svg class="icon" aria-hidden="true"><use href="#icon-telemetry"/></svg>飞行遥测</h2><span id="flight-state" class="status-label" role="status">待命</span></div>
         <div class="aircraft mono"><svg class="icon" aria-hidden="true"><use href="#icon-aircraft"/></svg><strong>VOXAERO-01</strong></div>
         <p id="mission-target" class="mission-target">等待任务分配</p>
         <dl class="telemetry telemetry-major">
@@ -215,15 +215,16 @@
         <h3 id="welcome-heading"><span class="welcome-emoji" aria-hidden="true">🧭</span> 使用帮助</h3>
         <p>在武大信息学部规划配送、巡检和应急仿真。</p>
         <ol class="welcome-steps">
-          <li><strong>描述任务</strong><span>说明要做什么、从哪里飞到哪里。你也可以补充限高、到达时限或避让区域。</span></li>
+          <li><strong>描述任务</strong><span>说明要做什么、从哪里飞到哪里。可以按顺序补充途经地点、巡航高度和避让区域。</span></li>
           <li><strong>核对航线</strong><span>地点不清楚时，调度台会请你补充。确认起终点和航线后，再开始仿真。</span></li>
           <li><strong>体验应急</strong><span>巡航中可能随机遇到阵风或低电量，也可手动触发。结束后可回放任务。</span></li>
         </ol>
-        <p class="welcome-note">可用登记点、经纬度或地图点选。说「在信息学部附近找地面起点」可比较候选。</p>
+        <p class="welcome-note">可用校门、道路、广场、操场、经纬度或地图点选。说「比较多条航线」可查看可行方案。</p>
         <div class="welcome-actions">
           <button type="button" data-welcome-example="delivery"><span class="welcome-emoji" aria-hidden="true">📦</span> 配送示例</button>
           <button type="button" data-welcome-example="inspection"><span class="welcome-emoji" aria-hidden="true">🔎</span> 巡检示例</button>
           <button type="button" data-welcome-example="spatial"><span class="welcome-emoji" aria-hidden="true">📍</span> 选址示例</button>
+          <button type="button" data-welcome-example="route"><span class="welcome-emoji" aria-hidden="true">🧭</span> 多点巡检</button>
         </div>
       </section>
       <div id="agent-messages"></div>
@@ -251,6 +252,9 @@
             <button type="button" class="plan-location" data-plan="start"></button>
             <p class="route-kpis tabular" data-plan="kpis"></p>
             <button type="button" class="plan-location" data-plan="end"></button>
+          </div>
+          <div data-plan="visits" class="plan-visits" hidden>
+            <strong data-plan="visit-progress"></strong><p data-plan="visit-names"></p>
           </div>
           <dl class="plan-fields">
             <div><dt>巡航航层 · 场景高度</dt><dd class="mono" data-plan="corridor"></dd></div>
@@ -300,8 +304,8 @@
     <div class="user-guide-grid" role="group" aria-label="操作说明" tabindex="0">
       <section>
         <h3><span class="welcome-emoji" aria-hidden="true">📋</span> 右侧 · 任务调度</h3>
-        <p>点选「中午配送」或「夜间巡检」，也可输入起点、终点、任务类型和避让要求。按回车发送，按 Ctrl + 回车换行。</p>
-        <p>展开「地图选址与避让」可在地图上标记位置。地点不明确时，按提示补充或选择候选点。核对航线和调度校验结果后，点「确认并开始仿真」。</p>
+        <p>点选「中午配送」或「夜间巡检」，也可输入校门、广场等起终点和有序途经点。按回车发送，按 Ctrl + 回车换行。</p>
+        <p>展开「地图选址与避让」可在地图上标记位置。地点不明确时按提示补充。可要求比较多条可行航线，核对后点「确认并开始仿真」。</p>
       </section>
       <section>
         <h3><span class="welcome-emoji" aria-hidden="true">🗺️</span> 中间与左侧 · 地图和遥测</h3>

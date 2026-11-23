@@ -327,7 +327,7 @@ def test_dispatch_input_errors(client):
     result = client.post("/api/agent/dispatch", json={"query": "帮忙配送"})
     assert result.status_code == 422
     assert result.json()["thought_steps"][-1]["role"] == "observation"
-    assert "起降坪" in result.json()["detail"]
+    assert "起降点" in result.json()["detail"]
     unknown_zone = client.post("/api/agent/dispatch", json={"query": "从 VP01 配送至 VP03，避开 NFZ010 禁飞区"})
     assert unknown_zone.status_code == 422
     assert "禁飞区" in unknown_zone.json()["detail"]
@@ -458,7 +458,8 @@ def test_openai_compatible_intent_and_fallback(scenario):
     if not successful:
         assert any("切换至本地规则" in event.content for event in result.thought_steps)
     if scenario == "deadline_in_cruise_field":
-        assert result.intent.constraints.preferred_deadline_seconds == 10
+        assert result.intent.constraints.preferred_deadline_seconds is None
+        assert any("预计耗时仅供参考" in event.content for event in result.thought_steps)
         assert result.intent.constraints.cruise is None
 
 
@@ -509,5 +510,5 @@ def test_dispatch_classification_and_grounded_one_turn_tool_workflow():
             assert result.mode == "live_llm" and not result.model_called and len(calls) == 2
             assert result.intent.start_id == "VP01" and result.intent.end_id == "VP03"
             assert result.intent.avoid_zone_ids == ("NFZ01",)
-            assert result.intent.constraints.deadline_seconds == 120
+            assert result.intent.constraints.deadline_seconds is None
             assert api.post("/api/agent/dispatch", json=reply).json()["status"] == "clarification_closed"

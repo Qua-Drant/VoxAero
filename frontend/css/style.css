@@ -263,6 +263,9 @@ body[data-view="fpv"] .scene-vignette {
 .plan-location::before { content: ""; flex: none; width: 7px; height: 7px; margin-right: 2px; border-radius: 50%; background: var(--accent-vector); box-shadow: 0 0 0 2px var(--surface-well); }
 .plan-location[data-plan="end"]::before { border: 1px solid var(--accent-route-end); background: var(--surface-well); }
 .route-kpis { padding-left: 15px; color: var(--text-muted); font-size: var(--font-label); }
+.plan-visits { display: grid; gap: 2px; padding: 6px 0; margin-top: 6px; border-bottom: 1px solid var(--border-hairline); font-size: var(--font-label); }
+.plan-visits strong { color: var(--accent-route-end); font-variant-numeric: tabular-nums; }
+.plan-visits p { color: var(--text-secondary); overflow-wrap: anywhere; }
 .plan-fields { display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); margin-top: 8px; }
 .plan-fields > div { padding: 5px 7px 5px 0; min-width: 0; }
 .plan-fields > div:nth-child(even) { padding-left: 9px; border-left: 1px solid var(--border-hairline); }
@@ -400,6 +403,7 @@ body[data-replay] .flight-timeline { color: var(--text-secondary); }
 .candidate-form { padding: 11px 13px; border-bottom: 1px solid var(--border-hairline); }
 
 .dispatch:has(.candidate-form) .trace-body:has(.trace-details[hidden]) { display: none; }
+.dispatch:has(.candidate-form) .composer > :is(.micro, .presets) { display: none; }
 .candidate-form h3 { font-size: var(--font-title); font-weight: 720; }
 .candidate-form fieldset { min-inline-size: 0; margin: 4px 0 6px; border: 0; padding: 0; }
 .candidate-form legend { margin-bottom: 4px; color: var(--text-muted); font-size: var(--font-label); }
@@ -407,6 +411,9 @@ body[data-replay] .flight-timeline { color: var(--text-secondary); }
 .candidate-form label:has(:checked) { background: var(--surface-control-active); }
 .candidate-form input { flex: none; margin: 0; accent-color: var(--accent-vector); appearance: auto; }
 .candidate-form label strong { display: block; color: var(--text-primary); font-size: var(--font-small); font-weight: 620; }
+.candidate-form label > span { min-width: 0; }
+.candidate-endpoints { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.candidate-itinerary { margin-top: 4px; color: var(--accent-route-end); font-size: var(--font-label); overflow-wrap: anywhere; }
 .candidate-form label small, .candidate-reason { color: var(--text-secondary); font-size: var(--font-label); font-variant-numeric: tabular-nums; }
 .candidate-reason { min-height: 1.4em; overflow-wrap: anywhere; }
 .candidate-rejected, .airspace-readback { color: var(--text-muted); font-size: var(--font-label); }
@@ -435,6 +442,7 @@ body[data-replay] .flight-timeline { color: var(--text-secondary); }
   .dispatch #agent-messages:not(:empty), .validation, .trace-body, .trace-details {
     display: flex; flex-direction: column; min-block-size: 0;
   }
+  .dispatch #agent-messages:not(:empty), .validation { min-block-size: 67px; }
   .validation > :not(.trace-body), .trace-scroll-hint { flex: 0 0 auto; }
   .trace-list { min-block-size: 0; }
   body[data-view="fpv"] .fpv-panels { position: absolute; inset: 14px var(--edge) auto; z-index: 2; display: flex; justify-content: space-between; pointer-events: none; }

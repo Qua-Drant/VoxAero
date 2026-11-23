@@ -16,14 +16,17 @@ from typing import TYPE_CHECKING
 from openai import OpenAIError
 from pydantic import BaseModel
 from shapely.geometry import Point, shape
+from shapely.geometry.base import BaseGeometry
+from shapely.ops import unary_union
+from shapely import transform
 
-from backend.config import CEILING_M, STUDY_BOUNDS
+from backend.config import CEILING_M, MISSION_LAYERS, STUDY_BOUNDS
 from backend.core.airspace import Obstacle, ObstacleField, Vertiport
 from backend.core.intent import LOW_FLIGHT, intersect_limits, parse_constraints
 from backend.core.planner import NoRouteError
 from backend.schemas import (
     AssessedRoute, ConfirmSpatialRequest, DispatchIntent, DispatchNotice, DispatchResult, DynamicHazard,
-    GroundPoint, HazardFeature, HazardPolygon, LLMMode, MissionType, NoFlyProperties, Position,
+    CruiseLimits, GroundPoint, HazardFeature, HazardPolygon, LLMMode, MissionType, NoFlyProperties, Position, RouteReference, RouteVisit,
     SpatialChoices, SpatialOptions, SpatialRouteOption, TaskSite, ThoughtStep, VertiportProperties,
 )
 
@@ -31,9 +34,14 @@ if TYPE_CHECKING:
     from backend.core.agent import DispatchAgent
 
 COORDINATES = re.compile(r"[\[(]\s*(-?\d+(?:\.\d+)?)\s*[,，]\s*(-?\d+(?:\.\d+)?)\s*[\])]")
-ROLES = re.compile(r"从|由|起点(?:设在|在|为|是|[:：])|飞往|前往|抵达|送往|去|到|至|→|终点(?:设在|在|为|是|[:：])")
+VIA_WORD = r"中途(?:经过|经由)|(?<!不)(?<!别)(?<!不要)(?:依次|先|再)?(?:经过|途经|途径|经由|飞越|飞过)|(?:先|再)经"
+VIA_MARKER = re.compile(VIA_WORD)
+ROLES = re.compile(r"从|由|起点(?:设在|在|为|是|[:：])|" + VIA_WORD
+                   + r"|(?:最后|再)?(?:飞往|前往|抵达|送往|去|到|至|返回)|→|终点(?:设在|在|为|是|[:：])")
 ORIGINS = ("从", "由", "起点")
-EXTRA_CONSTRAINT = re.compile(r"[，,。；;]|\s*(?:绕开|避开|绕过|巡航|飞行时限)")
+EXTRA_CONSTRAINT = re.compile(r"[，,。；;]|\s*(?:绕开|避开|绕过|巡航|飞行时限|对比|比较|提供多条)")
+COMPARE = re.compile(r"(?:比较|对比|提供|给我|给出|规划)?\s*(?:多条|多种|备选|替代|[两三二23]条)\s*(?:可行)?(?:航线|路线|方案)|(?:比较|对比)(?:可行)?(?:航线|路线|方案)")
+MAX_VISITS = 3
 ROOFTOP = re.compile(r"楼顶|屋顶|屋面")
 SEARCH = re.compile(r"附近|空地|地面(?:点|起降|位置)|找.{0,8}(?:起飞|降落|起降|地面)|择优|任选|候选")
 AIRSPACE_QUERY = re.compile(r"(?:查(?:询|看)?|核验|确认).{0,36}(?:空域|禁飞|围栏)|(?:是否|能否|会不会).{0,8}禁飞|是不是禁飞")
@@ -56,6 +64,9 @@ class Place:
     name: str
     point: GroundPoint
     pad_id: str | None = None
+    kind: str | None = None
+    osm_ref: str | None = None
+    geometry: BaseGeometry | None = None
 
 
 @dataclass(frozen=True)
@@ -82,6 +93,7 @@ class ActiveTask:
 class CandidatePlan:
     option: SpatialRouteOption
     task: ActiveTask
+    fixed_altitude: float | None = None
 
 
 @dataclass(frozen=True)
@@ -102,22 +114,36 @@ def bounded(point: GroundPoint) -> bool:
     return west <= point.lon <= east and south <= point.lat <= north
 
 
-def role_texts(query: str) -> dict[str, str]:
+def route_texts(query: str) -> tuple[dict[str, str], list[str]]:
     # Keep the comma within a bracketed coordinate distinct from a clause separator.
     pairs = [match.span() for match in COORDINATES.finditer(query)]
     marks = list(ROLES.finditer(query))
     values = {}
+    via = []
     for index, mark in enumerate(marks):
-        role = "start" if mark[0].startswith(ORIGINS) else "end"
+        role = "via" if VIA_MARKER.fullmatch(mark[0]) else "start" if mark[0].startswith(ORIGINS) else "end"
         stop = marks[index + 1].start() if index + 1 < len(marks) else len(query)
         for delimiter in EXTRA_CONSTRAINT.finditer(query, mark.end(), stop):
             if not any(first < delimiter.start() < last for first, last in pairs):
                 stop = delimiter.start()
                 break
         clause = query[mark.end():stop].strip()
-        if clause:
+        if not clause:
+            continue
+        if role == "via":
+            via.extend(part.strip() for part in re.split(r"、|以及|(?<=.)和(?=.)", clause) if part.strip())
+        else:
             values.setdefault(role, clause)
-    return values
+    if "start" not in values and "end" in values and marks[0][0] in {"到", "至", "→"}:
+        prefix = query[:marks[0].start()].strip()
+        if prefix:
+            values["start"] = prefix
+    return values, via
+
+
+def route_visits(references: tuple[RouteReference, ...], route: AssessedRoute) -> tuple[RouteVisit, ...]:
+    return tuple(RouteVisit(**reference.model_dump(), waypoint_index=index)
+                 for reference, index in zip(references, route.visit_indices, strict=True))
 
 
 class SpatialDispatch:
@@ -146,6 +172,37 @@ class SpatialDispatch:
         for alias, identifier in agent.zone_aliases.items():
             if identifier in zones:
                 self.places.setdefault(alias, [zones[identifier]])
+        self.pads_by_source = {}
+        for feature in self.airspace.geojson.get("vertiports", {}).get("features", []):
+            props = feature["properties"]
+            if props.get("osm_ref"):
+                self.pads_by_source.setdefault(props["osm_ref"], []).append(props["id"])
+        waters = []
+        for feature in self.airspace.geojson.get("places", {}).get("features", []):
+            props = feature["properties"]
+            geometry = shape(feature["geometry"])
+            name, kind = props["name"], props["kind"]
+            if kind == "road":
+                if geometry.geom_type == "MultiLineString":
+                    line = max(geometry.geoms, key=lambda segment: segment.length)
+                else:
+                    line = geometry
+                center = line.interpolate(.5, normalized=True)
+            else:
+                center = geometry.representative_point()
+            place = Place(name, GroundPoint(lon=center.x, lat=center.y), kind=kind,
+                          osm_ref=props["osm_ref"], geometry=geometry)
+            for alias in dict.fromkeys((name, name.replace("珞瑜", "珞喻"))):
+                key = alias.casefold()
+                if not any(item.pad_id for item in self.places.get(key, [])):
+                    self.places.setdefault(key, []).append(place)
+            if kind == "water":
+                waters.append(transform(geometry, self.airspace.frame.project_xy).buffer(4))
+        roads = [transform(shape(feature["geometry"]), self.airspace.frame.project_xy).buffer(5)
+                 for feature in self.airspace.geojson.get("roads", {}).get("features", [])
+                 if feature["properties"].get("highway") not in {"footway", "path", "steps", "cycleway"}]
+        self.ground_exclusions = unary_union([*waters, *roads])
+
         pad = self.airspace.vertiports.get("VP01")
         if pad:
             self.places.setdefault("信息学部", [Place("信息学部", pad.position)])
@@ -156,14 +213,15 @@ class SpatialDispatch:
     def applies(self, query: str, options: SpatialOptions | None, mentioned: list[str]) -> bool:
         if (options and (options.start or options.end or options.avoid)) or COORDINATES.search(query) or SEARCH.search(query):
             return True
-        roles = role_texts(query)
-        if len(mentioned) >= 2 or len(roles) < 2:
-            return False
-        return any(any(not place.pad_id for place in self.matches(text)) for text in roles.values())
+        roles, via = route_texts(AVOID_CLAUSE.sub("", query))
+        if via or VIA_MARKER.search(query) or COMPARE.search(query):
+            return True
+        return any(any(not place.pad_id and (place.kind or len(mentioned) < 2)
+                       for place in self.matches(text)) for text in roles.values())
 
     @staticmethod
     def is_airspace_query(query: str) -> bool:
-        return bool(AIRSPACE_QUERY.search(query) and not (len(role_texts(query)) == 2 and re.search(r"配送|巡检|起飞", query)))
+        return bool(AIRSPACE_QUERY.search(query) and not (len(route_texts(query)[0]) == 2 and re.search(r"配送|巡检|起飞", query)))
 
     def matches(self, text: str) -> list[Place]:
         matched = []
@@ -191,6 +249,12 @@ class SpatialDispatch:
             lon, lat = map(float, coords[0].groups())
             return Reference(Place("指令坐标", GroundPoint(lon=lon, lat=lat)), exact=True)
         matches = self.matches(text)
+        if len(matches) == 2 and all(place.kind == "road" for place in matches) and "路口" in text:
+            intersection = matches[0].geometry.intersection(matches[1].geometry)
+            if intersection.geom_type != "Point" or intersection.is_empty:
+                raise ValueError("场景路网中无唯一交点，请补充附近地标或在地图上点选。")
+            return Reference(Place("与".join(place.name for place in matches) + "路口",
+                                   GroundPoint(lon=intersection.x, lat=intersection.y), kind="road"))
         if len(matches) > 1:
             names = "、".join(dict.fromkeys(place.name for place in matches[:4]))
             raise ValueError(f"地点有多个匹配（{names}），请补充名称或在地图上点选。")
@@ -209,21 +273,23 @@ class SpatialDispatch:
         direction = DIRECTION[side[1]] if side and side[0] not in place.name else None
         return Reference(place, direction=direction)
 
-    def extract(self, query: str, steps: list[ThoughtStep]) -> tuple[dict[str, str], LLMMode, bool, MissionType | None]:
+    def extract(self, query: str, steps: list[ThoughtStep]) -> tuple[dict[str, str], list[str], LLMMode, bool, MissionType | None]:
         locations = AVOID_CLAUSE.sub("", query)
-        roles = role_texts(locations)
+        roles, via = route_texts(locations)
         called = self.agent.settings.mode == "live_llm"
         if not called:
             event(steps, "action", "按本地规则识别地名、坐标及任务角色。")
-            return roles, "fallback_mock", False, None
+            return roles, via, "fallback_mock", False, None
         event(steps, "action", "模型提取地点和任务类型，地名交由场景数据核对。")
         function = {"name": "extract_spatial_task", "description": "Quote origin and destination phrases",
                     "parameters": SpatialExtraction.model_json_schema()}
         prompt = ("Use exactly one tool call. Quote the user's origin and destination verbatim, including words "
                   "like 西侧 or 附近 that qualify a location. Do not invent coordinates or locations. Use null for "
-                  "missing or ambiguous roles. Choose delivery or inspection only when supported by the query.")
+                  "missing or ambiguous roles. Phrases after 途经/经过/经由 describe fly-over points, not destinations. "
+                  "Ignore time requirements. Choose delivery or inspection only when supported by the query.")
         try:
             model = SpatialExtraction.model_validate_json(self.agent.request_model(query, function, prompt))
+            grounded = roles.copy()
             for role, quote in (("start", model.origin_quote), ("end", model.destination_quote)):
                 if quote is not None:
                     if not quote.strip() or quote not in locations:
@@ -231,11 +297,13 @@ class SpatialDispatch:
                     other = roles.get("end" if role == "start" else "start")
                     if other and quote in other and role not in roles:
                         raise ValueError("The model reused the other endpoint")
-                    roles.setdefault(role, quote)
-            return roles, "live_llm", True, model.mission_type
+                    if role not in roles and any(quote in location for location in via):
+                        raise ValueError("The model reused a fly-over location")
+                    grounded.setdefault(role, quote)
+            return grounded, via, "live_llm", True, model.mission_type
         except (OpenAIError, ValueError):
             event(steps, "observation", "模型地点未能核对，继续按本地场景匹配。")
-            return role_texts(locations), "fallback_mock", True, None
+            return roles, via, "fallback_mock", True, None
 
     def inspect_airspace(self, query: str, options: SpatialOptions | None, steps: list[ThoughtStep]) -> DispatchNotice:
         try:
@@ -273,22 +341,23 @@ class SpatialDispatch:
         except ValueError as exc:
             return self.notice("constraint_conflict", str(exc), steps)
 
-        roles, mode, called, mission_type = self.extract(task_query, steps)
+        roles, via_texts, mode, called, mission_type = self.extract(task_query, steps)
         kind = mission_type if mission_type and not re.search(r"巡检|巡逻|安防|配送|投送|送餐|送件", query) else parsed.mission_type
         if LOW_FLIGHT.search(query) and (kind == "inspection" or parsed.prefer_high_altitude):
             return self.notice("constraint_conflict", "避开高空与本次 60–90 米巡检航层冲突，请调整任务或航层。", steps)
         try:
-            start_text, end_text = roles.get("start", ""), roles.get("end", "")
-            if parsed.start_id and parsed.end_id and not (SEARCH.search(task_query) or COORDINATES.search(task_query)):
-                start_text = parsed.start_id if not ROOFTOP.search(start_text) else start_text
-                end_text = parsed.end_id if not ROOFTOP.search(end_text) else end_text
+            start_text = roles.get("start", parsed.start_id or "")
+            end_text = roles.get("end", parsed.end_id or "")
+            if start_text in {"信息学部起飞", "信息学部出发"} and parsed.start_id == "VP01":
+                start_text = "VP01"
             start = self.reference(start_text, options.start)
             end = self.reference(end_text, options.end)
+            via = self.resolve_visits(via_texts, task_query)
         except ValueError as exc:
             return self.notice("needs_spatial_location", str(exc), steps)
         if not start or not end:
             missing = "起点" if end else "终点" if start else "起点和终点"
-            return self.notice("needs_spatial_location", f"请补充{missing}的场景地名、经纬度或地图点选位置。", steps)
+            return self.notice("needs_spatial_location", f"请补充{missing}的校门、广场、道路、起降点编号或坐标。", steps)
 
         field, _ = self.airspace.with_hazards(hazards, parsed.avoid_zone_ids)
         rejected: Counter[str] = Counter()
@@ -300,9 +369,9 @@ class SpatialDispatch:
 
         event(steps, "action", "用场景地形、障碍包络及已载入围栏筛选地面点，逐组校验起降与航线。")
         accepted = []
-        for origin, target in sorted(product(starts, ends), key=lambda pair: sum(item.site.offset_m for item in pair))[:6]:
+        for origin, target in sorted(product(starts, ends), key=lambda pair: sum(item.site.offset_m for item in pair))[:8]:
             intent = DispatchIntent(**parsed.model_dump(exclude={"start_id", "end_id", "mission_type"}),
-                                    start_id=origin.site.id, end_id=target.site.id, mission_type=kind, constraints=constraints)
+                                    start_id=origin.site.id, end_id=target.site.id, mission_type=kind, constraints=constraints, via=via)
             pads = {item.site.id: item.pad for item in (origin, target)}
             task = ActiveTask(intent, pads, hazards)
             try:
@@ -310,29 +379,84 @@ class SpatialDispatch:
             except NoRouteError:
                 rejected["起降或航线不满足约束"] += 1
                 continue
-            accepted.append((origin.site, target.site, task, route, corridor, preferred))
+            accepted.append((origin.site, target.site, task, route, corridor, preferred, None))
         if not accepted:
-            return self.notice("constraint_conflict", "起降点附近无法生成满足空域、高度和时限要求的航线，请调整地点或要求。", steps)
-
-        ranked = sorted(accepted, key=lambda item: (not item[5], item[0].offset_m + item[1].offset_m, item[3].flight_seconds))
+            missing = "、".join(place.name for place in via)
+            detail = f"无法按顺序飞越 {missing}，请核对途经点、避让范围或巡航高度。" if missing else "候选起降点间没有满足空域和高度条件的航线。"
+            return self.notice("constraint_conflict", detail, steps)
+        compare = bool(COMPARE.search(query) or via)
+        if compare:
+            best = min(accepted, key=self.rank)
+            accepted.extend(self.alternatives(best))
+        ranked = sorted(accepted, key=self.rank)
         plans = {}
-        for number, (origin, target, task, route, corridor, _) in enumerate(ranked[:3], start=1):
+        for number, (origin, target, task, route, corridor, _, fixed) in enumerate(ranked[:3], start=1):
+            clearance = route.kpis.min_clearance_m
+            label = f"{fixed:g} m 巡航" if fixed is not None else "可行航线"
+            label = ("推荐" if number == 1 else f"方案 {number}") + " · " + label
             option = SpatialRouteOption(
                 id=f"choice-{number}", start=origin, end=target, corridor=corridor,
-                waypoints=route.waypoints, kpis=route.kpis,
+                waypoints=route.waypoints, kpis=route.kpis, route_label=label,
+                route_visits=route_visits(via, route),
                 airspace_check=self.airspace.check_airspace(route.waypoints, route.flight_seconds),
-                recommendation=("优先推荐 · " if number == 1 else "可选路线 · ")
-                + f"距指定参考位置合计 {origin.offset_m + target.offset_m:.1f} 米，预计 {route.kpis.estimated_seconds:.1f} 秒。",
+                recommendation=f"已校验 {len(via) + 2} 个任务位置 · 航程 {route.kpis.distance_m:.1f} m"
+                + (f" · 最小净空 {clearance:.1f} m" if clearance is not None else "")
+                + f" · 起终点偏移 {origin.offset_m + target.offset_m:.1f} m。",
             )
-            plans[option.id] = CandidatePlan(option, task)
-        event(steps, "observation", f"找到 {len(plans)} 组可用起降点，等待选择。")
+            plans[option.id] = CandidatePlan(option, task, fixed)
+        if via:
+            event(steps, "observation", "依序飞越：" + " → ".join(place.name for place in via) + "。")
+        event(steps, "observation", f"完成起降及避障复核，共 {len(plans)} 条可行航线。")
         task_zones = self.task_zones(hazards)
         token = self.store(self.pending, CandidateSet(plans, task_zones, tuple(steps), mode, called), CANDIDATE_TTL)
         return SpatialChoices(
-            candidate_token=token, detail="请选择一组起降点，再核对并开始仿真。", mode=mode,
+            candidate_token=token, detail="请选择可行航线，核对起降和途经位置后确认。", mode=mode,
+            choice_type="routes" if compare else "sites",
             model_called=called, thought_steps=steps, options=[plan.option for plan in plans.values()],
             rejected=dict(rejected), task_zones=task_zones,
         )
+
+    def resolve_visits(self, texts: list[str], query: str) -> tuple[RouteReference, ...]:
+        if not texts and VIA_MARKER.search(query):
+            raise ValueError("请明确要依序飞越的地点。")
+        if len(texts) > MAX_VISITS:
+            raise ValueError("每次任务最多支持 3 个途经点，请缩短路线或拆成多次任务。")
+        visits = []
+        for text in texts:
+            reference = self.reference(text)
+            if not reference or not bounded(reference.place.point):
+                raise ValueError(f"未找到途经点「{text}」，请使用场景地名或经纬度。")
+            place = reference.place
+            if reference.direction:
+                raise ValueError(f"途经点「{text}」需明确位置，可填写经纬度。")
+            visits.append(RouteReference(name=place.name, lon=place.point.lon, lat=place.point.lat, osm_ref=place.osm_ref))
+        return tuple(visits)
+
+    @staticmethod
+    def rank(item):
+        origin, target, _, route, _, preferred, _ = item
+        clearance = route.kpis.min_clearance_m
+        return (not preferred, origin.offset_m + target.offset_m,
+                -(clearance if clearance is not None else -1), route.distance_m)
+
+    def alternatives(self, candidate):
+        origin, target, task, original, corridor, _, _ = candidate
+        levels = self.agent.planner.cruise_levels(MISSION_LAYERS[corridor], task.intent.constraints.cruise)
+        signature = lambda route: tuple((p.lon, p.lat, p.alt) for p in route.waypoints)
+        seen = {signature(original)}
+        alternatives = []
+        for level in levels:
+            altitude = self.airspace.grid.center((0, 0, level))[2]
+            try:
+                route, _, preferred = self.route(task, altitude)
+            except NoRouteError:
+                continue
+            path = signature(route)
+            if path in seen:
+                continue
+            seen.add(path)
+            alternatives.append((origin, target, task, route, corridor, preferred, altitude))
+        return alternatives
 
     def sites(self, reference: Reference, role: str, field: ObstacleField, rejected: Counter[str]) -> list[SiteChoice]:
         place = reference.place
@@ -350,7 +474,7 @@ class SpatialDispatch:
         offsets = [(0, 0)]
         if not reference.exact:
             offsets.extend((radius * cos(angle * pi / 4), radius * sin(angle * pi / 4))
-                           for radius in (18, 36, 60, 84) for angle in range(8))
+                           for radius in (12, 18, 24, 36, 48, 60, 84, 96) for angle in range(8))
         candidates = []
         terrain = field.terrain
         registered = [self.airspace.frame.to_local(pad.position)[:2] for pad in self.airspace.vertiports.values()]
@@ -367,7 +491,11 @@ class SpatialDispatch:
             if not bounded(position):
                 rejected["位置超出场景范围"] += 1
                 continue
-            indexes = field.index.query(Point(east, north).buffer(5), predicate="intersects")
+            point = Point(east, north)
+            if self.ground_exclusions.covers(point):
+                rejected["位置落在道路或水面"] += 1
+                continue
+            indexes = field.index.query(point.buffer(5), predicate="intersects")
             if any(field.obstacles[index].min_alt <= alt + 3 and field.obstacles[index].max_alt >= alt
                    for index in indexes):
                 rejected["起降净空不足或落在围栏内"] += 1
@@ -379,11 +507,19 @@ class SpatialDispatch:
                     continue
             candidates.append((hypot(east - x, north - y), position))
         chosen: list[SiteChoice] = []
+        if not reference.exact and not reference.direction and place.osm_ref:
+            for pad_id in self.pads_by_source.get(place.osm_ref, []):
+                pad = self.airspace.vertiports[pad_id]
+                px, py, _ = self.airspace.frame.to_local(pad.position)
+                chosen.append(SiteChoice(TaskSite(id=pad_id, name=pad.properties.name, position=pad.position,
+                                                  reference_name=place.name, offset_m=round(hypot(px - x, py - y), 1)), pad))
         for offset, position in sorted(candidates, key=lambda value: value[0]):
             local = self.airspace.frame.to_local(position)
             if any(hypot(*(a - b for a, b in zip(local[:2], self.airspace.frame.to_local(item.pad.position)[:2]))) < 14
                    for item in chosen):
                 continue
+            if len(chosen) >= 5:
+                break
             index = len(chosen) + 1
             identifier = f"TMP-{'S' if role == '起点' else 'E'}{index}"
             name = f"{place.name} · {role}候选 {index}"
@@ -391,28 +527,25 @@ class SpatialDispatch:
                            position, None)
             chosen.append(SiteChoice(TaskSite(id=identifier, name=name, position=position, reference_name=place.name,
                                               offset_m=round(offset, 1)), pad))
-            if len(chosen) == 3:
-                break
         return chosen
 
-    def route(self, task: ActiveTask) -> tuple[AssessedRoute, MissionType, bool]:
+    def route(self, task: ActiveTask, fixed_altitude: float | None = None) -> tuple[AssessedRoute, MissionType, bool]:
         intent = task.intent
         corridor = "inspection" if intent.prefer_high_altitude else intent.mission_type
         constraints = intent.constraints
         strict = constraints.cruise
+        if fixed_altitude is not None:
+            strict = intersect_limits(strict, CruiseLimits(min_alt=fixed_altitude, max_alt=fixed_altitude))
         softer = intersect_limits(strict, constraints.preferred_cruise)
         variants = [(softer, True), (strict, False)] if softer != strict else [(strict, True)]
         for limits, preferred in variants:
             try:
                 route = self.agent.plan_3d_route(task.pads[intent.start_id], task.pads[intent.end_id],
                                                  corridor, task.hazards, avoid_zone_ids=intent.avoid_zone_ids,
-                                                 cruise_limits=limits)
+                                                 cruise_limits=limits, via=intent.via)
             except NoRouteError:
                 continue
-            if constraints.deadline_seconds is not None and route.flight_seconds > constraints.deadline_seconds:
-                continue
-            deadline = constraints.preferred_deadline_seconds
-            return route, corridor, preferred and (deadline is None or route.flight_seconds <= deadline)
+            return route, corridor, preferred
         raise NoRouteError("No compliant candidate route")
 
     def confirm(self, payload: ConfirmSpatialRequest) -> DispatchResult | DispatchNotice:
@@ -422,7 +555,7 @@ class SpatialDispatch:
         plan = selection.plans[payload.option_id]
         steps = list(selection.steps)
         try:
-            route, corridor, preferred = self.route(plan.task)
+            route, corridor, preferred = self.route(plan.task, plan.fixed_altitude)
         except NoRouteError:
             return self.notice("constraint_conflict", "复核时发现所选路线不可用，请重新规划。", steps)
         event(steps, "observation", "所选起降点及航线已复核。" if preferred else "航线满足必须条件，部分偏好未满足。")
@@ -433,6 +566,7 @@ class SpatialDispatch:
             model_fallback=selection.model_called and selection.mode == "fallback_mock",
             intent=task.intent, corridor=corridor, start_name=plan.option.start.name, end_name=plan.option.end.name,
             waypoints=route.waypoints, kpis=route.kpis, thought_steps=steps, mission_token=token,
+            route_visits=route_visits(task.intent.via, route), cruise_altitude_m=plan.fixed_altitude,
             task_sites=tuple(site for site in (plan.option.start, plan.option.end) if site.id.startswith("TMP-")),
             task_zones=selection.zones, airspace_check=self.airspace.check_airspace(route.waypoints, route.flight_seconds),
         )

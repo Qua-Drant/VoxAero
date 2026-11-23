@@ -4,6 +4,7 @@ import argparse
 import gzip
 import json
 import re
+from collections import defaultdict
 from hashlib import sha256
 from math import ceil, floor, sqrt
 from pathlib import Path
@@ -91,10 +92,8 @@ def feature(geometry, **properties):
 class OsmMap:
     def __init__(self, path):
         root = ElementTree.parse(path).getroot()
-        self.nodes = {
-            e.attrib["id"]: (float(e.attrib["lon"]), float(e.attrib["lat"]))
-            for e in root.findall("node")
-        }
+        self.node_elements = {e.attrib["id"]: e for e in root.findall("node")}
+        self.nodes = {key: (float(e.attrib["lon"]), float(e.attrib["lat"])) for key, e in self.node_elements.items()}
         self.ways = {e.attrib["id"]: e for e in root.findall("way")}
         self.relations = {e.attrib["id"]: e for e in root.findall("relation")}
 
@@ -174,6 +173,72 @@ class OsmMap:
                 yield feature(segment, id=f"osm-way-{key}-{index:02d}", name=name_of(data), highway=highway)
 
 
+def place_kind(data):
+    if data.get("leisure") in {"park", "garden", "pitch", "sports_centre", "playground"}:
+        return "open_area"
+    if data.get("place") == "square":
+        return "open_area"
+    if data.get("natural") == "water":
+        return "water"
+    if data.get("barrier") in {"gate", "lift_gate"} or data.get("entrance"):
+        return "entrance"
+    if data.get("highway") == "bus_stop":
+        return "transit"
+    if data.get("highway") not in {None, "construction", "proposed"}:
+        return "road"
+    return None
+
+
+def osm_places(osm):
+    named_roads = defaultdict(list)
+    points = defaultdict(list)
+    for key, element in osm.node_elements.items():
+        data = tags(element)
+        name, kind = name_of(data), place_kind(data)
+        if not name or kind not in {"open_area", "entrance", "transit"}:
+            continue
+        point = Point(osm.nodes[key])
+        if not AOI.covers(point):
+            continue
+        if kind == "transit" and not name.endswith("站"):
+            name += "公交站"
+        if any(point.distance(previous) < .00038 for previous in points[name]):
+            continue
+        points[name].append(point)
+        yield feature(point, id=f"node/{key}", name=name, kind=kind, osm_ref=f"node/{key}")
+
+    for key, element in osm.ways.items():
+        data = tags(element)
+        name, kind = name_of(data), place_kind(data)
+        if not name or kind not in {"open_area", "water", "road"}:
+            continue
+        if kind == "road":
+            named_roads[name].append((key, osm.line(key).intersection(AOI)))
+        else:
+            try:
+                geometry = osm.polygon(key).intersection(AOI)
+            except ValueError:
+                continue
+            for index, polygon in enumerate(parts(geometry, "Polygon"), 1):
+                yield feature(polygon, id=f"way/{key}-{index}", name=name, kind=kind, osm_ref=f"way/{key}")
+    for name, segments in named_roads.items():
+        lines = [part for _, geometry in segments for part in parts(geometry, "LineString")]
+        if lines:
+            reference = next(f"way/{key}" for key, geometry in segments if list(parts(geometry, "LineString")))
+            yield feature(unary_union(lines), id=reference, name=name, kind="road", osm_ref=reference)
+    for key, element in osm.relations.items():
+        data = tags(element)
+        name, kind = name_of(data), place_kind(data)
+        if data.get("type") != "multipolygon" or not name or kind not in {"open_area", "water"}:
+            continue
+        try:
+            geometry, _ = osm.multipolygon(key)
+        except (KeyError, ValueError):
+            continue
+        for index, polygon in enumerate(parts(geometry.intersection(AOI), "Polygon"), 1):
+            yield feature(polygon, id=f"relation/{key}-{index}", name=name, kind=kind, osm_ref=f"relation/{key}")
+
+
 def heightmap(hgt):
     samples = np.frombuffer(gzip.decompress(hgt), dtype=">i2")
     n = int(sqrt(len(samples)))
@@ -205,7 +270,7 @@ def vertiports(osm, buildings, terrain, restricted):
     def point_of(geometry):
         return shapely.transform(geometry, FRAME.project_xy)
 
-    def safe_point(anchor, *, within=None):
+    def safe_point(anchor, *, within=None, occupied=None):
         x, y = anchor.coords[0]
         dx, dy = np.meshgrid(np.arange(-85, 86, 2), np.arange(-85, 86, 2))
         candidates = shapely.points(np.column_stack((x + dx.ravel(), y + dy.ravel())))
@@ -215,6 +280,11 @@ def vertiports(osm, buildings, terrain, restricted):
         valid &= shapely.covers(point_of(AOI), candidates)
         if within is not None:
             valid &= shapely.covers(within, candidates)
+        if occupied is not None:
+            valid &= ~shapely.intersects(occupied, candidates)
+            samples = np.array([terrain.elevation(shapely.get_x(candidates) + a, shapely.get_y(candidates) + b)
+                                for a, b in ((5, 0), (-5, 0), (0, 5), (0, -5))])
+            valid &= np.ptp(samples, axis=0) <= 1.5
         if not valid.any():
             raise ValueError("No safe candidate within the landmark surroundings")
         ranked = candidates[valid]
@@ -238,7 +308,7 @@ def vertiports(osm, buildings, terrain, restricted):
     west_field, east_field = point_of(park), point_of(osm.polygon("1382683958"))
     east_half = east_field.intersection(box(east_field.centroid.x, east_field.bounds[1],
                                             east_field.bounds[2], east_field.bounds[3]))
-    return [
+    pads = [
         ground("VP01", "信息学部一食堂起降坪", "logistics", "node/13513425337",
                point_of(Point(osm.nodes["13513425337"]))),
         ground("VP02", "菜鸟驿站物流站", "logistics", "node/13266231640",
@@ -254,6 +324,45 @@ def vertiports(osm, buildings, terrain, restricted):
         ground("VP06", "信息学部操场东侧应急备降坪", "emergency", "way/1382683958",
                east_half.representative_point(), within=east_half),
     ]
+    roadbed = unary_union([
+        point_of(shapely.geometry.shape(road["geometry"])).buffer(6)
+        for road in osm.roads() if road["properties"]["highway"] not in {"footway", "path", "steps", "cycleway"}
+    ])
+    keep_clear = roadbed.union(restrictions.buffer(6))
+    landmarks = (
+        ("VP07", "星空广场仿真坪", "logistics", "way", "1155391715"),
+        ("VP08", "一教公交站附近仿真坪", "logistics", "node", "9558228576"),
+        ("VP09", "信息学部操场西侧仿真坪", "inspection", "way", "1382683958"),
+        ("VP10", "星湖运动场北侧仿真坪", "inspection", "relation", "19149478"),
+        ("VP11", "露天篮球场仿真坪", "inspection", "way", "1480437168"),
+        ("VP12", "竹园网球场仿真坪", "logistics", "way", "1382564211"),
+        ("VP13", "友谊广场仿真坪", "logistics", "relation", "19073122"),
+        ("VP14", "珞喻门西段仿真坪", "logistics", "node", "13518537639"),
+        ("VP15", "珞喻二门附近仿真坪", "logistics", "node", "3148705291"),
+        ("VP16", "玉兰亭附近仿真坪", "inspection", "node", "12862472452"),
+    )
+    for key, name, kind, element, reference in landmarks:
+        if element == "node":
+            anchor, within = point_of(Point(osm.nodes[reference])), None
+        else:
+            polygon = osm.polygon(reference) if element == "way" else osm.multipolygon(reference)[0]
+            within = point_of(polygon)
+            if key == "VP09":
+                within = within.intersection(box(within.bounds[0], within.bounds[1], within.centroid.x, within.bounds[3]))
+            if key == "VP10":
+                within = within.intersection(box(within.bounds[0], within.centroid.y, within.bounds[2], within.bounds[3]))
+            if within.is_empty:
+                continue
+            anchor = within.representative_point()
+        near_pad = unary_union([point_of(shapely.geometry.shape(pad["geometry"])).buffer(18) for pad in pads])
+        try:
+            pad = ground(key, name, kind, f"{element}/{reference}", anchor,
+                         within=within, occupied=keep_clear.union(near_pad))
+        except ValueError:
+            print(f"Skipped {key}: no safe candidate")
+            continue
+        pads.append(pad)
+    return pads
 
 
 def nofly_zones(osm):
@@ -301,6 +410,7 @@ def main():
         "vertiports.geojson": collection(pads, **source),
         "nofly_zones.geojson": collection(zones, **source),
         "whu_roads.geojson": collection(osm.roads(), **source),
+        "whu_places.geojson": collection(osm_places(osm), **source),
         "whu_terrain.json": json.dumps(terrain_asset, separators=(",", ":")) + "\n",
     }
     for filename, contents in products.items():

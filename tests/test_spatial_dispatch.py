@@ -93,6 +93,69 @@ def test_replan_uses_task_sites_and_task_avoidance(client):
     assert_clear(scene, diverted.json(), (nofly,))
 
 
+@pytest.mark.parametrize(("query", "origin", "destination"), [
+    ("星湖南路到星空广场巡检", "星湖南路", "星空广场"),
+    ("从珞喻二门到友谊广场巡检", "珞瑜二门", "友谊广场"),
+])
+def test_osm_references_support_nonbuilding_endpoints(client, query, origin, destination):
+    offered = suggest(client, query)
+    assert offered["status"] == "choose_endpoints", offered
+    chosen = offered["options"][0]
+    assert chosen["start"]["reference_name"] == origin
+    assert chosen["end"]["reference_name"] == destination
+    planned = confirm(client, offered)
+    assert planned["status"] == "planned", planned
+    assert_clear(client.app.state.agent.airspace, planned)
+
+
+def test_ordered_osm_flyovers_and_checked_alternatives_survive_replan(client):
+    scene = client.app.state.agent.airspace
+    query = "从星空广场起飞，依次途经星湖、星湖南路，最后到信息学部操场巡检，比较多条航线，2 秒内完成。"
+    offered = suggest(client, query)
+    assert offered["choice_type"] == "routes" and len(offered["options"]) >= 2, offered
+    assert len({tuple((p["lon"], p["lat"], p["alt"]) for p in choice["waypoints"])
+                for choice in offered["options"]}) == len(offered["options"])
+    for choice in offered["options"]:
+        visits = choice["route_visits"]
+        assert [visit["name"] for visit in visits] == ["星湖", "星湖南路"]
+        assert visits[0]["osm_ref"] == "way/295111844"
+        first, second = (visit["waypoint_index"] for visit in visits)
+        assert 0 < first < second < len(choice["waypoints"]) - 1
+        for visit in visits:
+            point = choice["waypoints"][visit["waypoint_index"]]
+            assert point["phase"] == "cruise" and 60 <= point["alt"] <= 90
+            assert (point["lon"], point["lat"]) == (visit["lon"], visit["lat"])
+        assert choice["kpis"]["estimated_seconds"] > 2
+        assert_clear(scene, choice)
+
+    choice = offered["options"][-1]
+    planned = confirm(client, offered, choice["id"])
+    assert planned["status"] == "planned" and planned["waypoints"] == choice["waypoints"]
+    assert [ref["name"] for ref in planned["intent"]["via"]] == ["星湖", "星湖南路"]
+    assert planned["intent"]["constraints"]["deadline_seconds"] is None
+    current = planned["waypoints"][planned["route_visits"][0]["waypoint_index"]]
+    event = DynamicHazard(center_lon=114.3615, center_lat=30.5245, radius_m=14, min_alt=0, max_alt=100)
+    payload = {
+        "current_pos": current, "target_id": planned["intent"]["end_id"],
+        "scene_version": planned["scene_version"], "mission_type": planned["corridor"],
+        "emergency_type": "temp_nofly", "dynamic_hazard": event.model_dump(),
+        "mission_token": planned["mission_token"], "completed_visits": 1,
+    }
+    redirected = client.post("/api/agent/replan", json=payload)
+    assert redirected.status_code == 200, redirected.text
+    assert [site["name"] for site in redirected.json()["route_visits"]] == ["星湖南路"]
+    assert_clear(scene, redirected.json(), (event,))
+    payload.update(emergency_type="low_battery", dynamic_hazard=None)
+    diverted = client.post("/api/agent/replan", json=payload)
+    assert diverted.status_code == 200 and diverted.json()["route_visits"] == []
+    assert_clear(scene, diverted.json())
+
+
+def test_unmatched_flyover_is_not_dropped(client):
+    result = suggest(client, "从 VP07 经由不存在的地标到 VP09 巡检")
+    assert result["status"] == "needs_spatial_location" and "途经点" in result["detail"]
+
+
 def test_explicit_point_and_unknown_locations(client):
     result = suggest(client, "从不存在的地标附近找空地去图书馆西侧巡检")
     assert result["status"] == "needs_spatial_location", result
