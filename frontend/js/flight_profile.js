@@ -20,7 +20,7 @@ export class VerticalProfile {
   setTrack(track, corridor, start, end) {
     const nodes = this.nodes;
     const [floor, ceiling] = CORRIDORS[corridor];
-    nodes.band.textContent = `场景航层 ${floor}–${ceiling} 米`;
+    nodes.band.textContent = `场景航层 ${floor}–${ceiling} m`;
     nodes.start.textContent = "出发 " + start;
     nodes.end.textContent = "到达 " + end;
     this.track = track;

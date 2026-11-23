@@ -6,33 +6,26 @@ export function flightClock(seconds) {
 }
 
 export class FlightReplay {
-  constructor(map, { onFrame, onSegment, onMode, onOverview }) {
+  constructor(map, { onFrame, onSegment, onMode, onOverview, onPlayback }, seekControl) {
     this.map = map;
     this.onFrame = onFrame;
     this.onSegment = onSegment;
     this.onMode = onMode;
     this.onOverview = onOverview;
+    this.onPlayback = onPlayback;
     this.panel = document.getElementById("flight-review");
     this.outcome = document.getElementById("review-outcome");
     this.list = document.getElementById("review-events");
     this.comparison = document.getElementById("review-comparison");
-    this.sliderRow = document.getElementById("review-slider-row");
-    this.slider = document.getElementById("replay-time");
-    this.clock = document.getElementById("replay-clock");
+    this.status = document.getElementById("replay-status");
     this.start = document.getElementById("replay-start");
-    this.play = document.getElementById("replay-play");
     this.exit = document.getElementById("replay-exit");
     this.eventButtons = [];
     this.rate = 1;
     this.playing = false;
-    this.start.addEventListener("click", () => { this.open(); this.slider.focus({ preventScroll: true }); });
-    this.play.addEventListener("click", () => this.playing ? this.pause() : this.resume());
+    this.start.addEventListener("click", () => { this.open(); seekControl.focus({ preventScroll: true }); });
     this.exit.addEventListener("click", () => { this.close(); this.start.focus({ preventScroll: true }); });
     this.panel.addEventListener("toggle", () => { if (!this.panel.open) this.close(); });
-    this.slider.addEventListener("input", () => {
-      this.pause();
-      this.seek(this.slider.valueAsNumber);
-    });
   }
 
   get active() {
@@ -85,8 +78,8 @@ export class FlightReplay {
     this.segmentIndex = -1;
     this.event = null;
     this.sim = new DroneSim(this.map, (frame) => this.onFrame(frame, this.record, this.segment));
-    this.slider.max = Math.ceil(this.record.duration * 10) / 10;
-    this.sliderRow.hidden = this.play.hidden = this.exit.hidden = false;
+    this.status.textContent = "回放已就绪 · 使用底部时间轴定位";
+    this.status.hidden = this.exit.hidden = false;
     this.start.hidden = true;
     this.onMode(true);
     this.seek(0);
@@ -96,7 +89,7 @@ export class FlightReplay {
     if (!this.active) return;
     this.pause();
     this.sim = null;
-    this.sliderRow.hidden = this.play.hidden = this.exit.hidden = this.comparison.hidden = true;
+    this.status.hidden = this.exit.hidden = this.comparison.hidden = true;
     this.start.hidden = false;
     for (const button of this.eventButtons) button.setAttribute("aria-pressed", "false");
     this.map.clearPadFocus();
@@ -128,26 +121,24 @@ export class FlightReplay {
     } else {
       this.sim.seek(elapsed, battery, jumped, delta);
     }
-    const position = flightClock(this.seconds);
-    this.slider.value = this.seconds === this.record.duration ? this.slider.max : this.seconds;
-    if (this.slider.getAttribute("aria-valuetext") !== position) this.slider.setAttribute("aria-valuetext", position);
-    const label = `${position} / ${flightClock(this.record.duration)}`;
-    if (this.clock.textContent !== label) this.clock.textContent = label;
   }
 
   resume() {
     if (this.seconds === this.record.duration) this.seek(0);
     this.playing = true;
     this.previous = null;
-    this.play.textContent = "暂停回放";
+    this.status.textContent = "正在回放 · 使用底部时间轴定位";
+    this.onPlayback();
     this.request = requestAnimationFrame(this.tick);
   }
 
   pause() {
+    if (!this.playing) return;
     if (this.request !== undefined) cancelAnimationFrame(this.request);
     this.request = undefined;
     this.playing = false;
-    this.play.textContent = "播放回放";
+    this.status.textContent = "回放已暂停 · 使用底部时间轴定位";
+    this.onPlayback();
   }
 
   tick = (now) => {

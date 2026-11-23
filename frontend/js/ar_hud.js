@@ -1,3 +1,5 @@
+import { paintBattery } from "./battery_display.js";
+
 const CYAN = "#38bdf8";
 const TEXT = "#f8fafc";
 const MUTED = "#9baabd";
@@ -82,8 +84,15 @@ function drawTape(ctx, { x, y, width, height, right, name, value, unit, step, ra
   ctx.shadowBlur = 0;
 }
 
+function drawCompactReadout(ctx, x, y, name, value, unit) {
+  const width = 76;
+  plate(ctx, x - width / 2, y, width, 36, "#6a9ecb6b");
+  text(ctx, name, x, y + 10, { color: MUTED, size: 10, align: "center", font: LABEL_FONT });
+  text(ctx, value.toFixed(1) + " " + unit, x, y + 24, { color: CYAN, size: 12, align: "center" });
+}
+
 function drawHeading(ctx, x, y, span, heading, compact) {
-  const rise = compact ? 22 : 34;
+  const rise = compact ? 12 : 25;
   const degrees = (Math.round(heading) % 360 + 360) % 360;
   const arcY = (offset) => y + rise * offset * offset;
   const arc = ctx.createLinearGradient(x - span, 0, x + span, 0);
@@ -116,32 +125,32 @@ function drawHeading(ctx, x, y, span, heading, compact) {
   ctx.shadowBlur = 0;
   ctx.strokeStyle = TEXT;
   line(ctx, [[x, y + 8], [x - 6, y + 16], [x + 6, y + 16], [x, y + 8]]);
-  text(ctx, String(degrees).padStart(3, "0") + "°", x, y + 30,
+  text(ctx, String(degrees).padStart(3, "0") + "°", x, y + (compact ? 26 : 30),
     { color: CYAN, size: compact ? 13 : 15, weight: 720, align: "center" });
 }
 
-function drawPitch(ctx, x, y, width, height, pitch) {
-  const radius = clamp(width * .11, 42, 142);
+function drawPitch(ctx, x, y, width, height, pitch, compact) {
+  const radius = clamp(width * .105, 34, 104);
   const gap = clamp(radius * .38, 17, 44);
   const scale = clamp(height / 112, 3.8, 8);
-  const clip = Math.min(height * .24, 172);
+  const clip = Math.min(height * (compact ? .17 : .21), 138);
   ctx.save();
   ctx.strokeStyle = CYAN;
   ctx.lineWidth = 1.2;
   ctx.shadowColor = "#06141f";
   ctx.shadowBlur = 4;
-  for (let angle = -40; angle <= 40; angle += 5) {
+  for (let angle = -40; angle <= 40; angle += compact ? 10 : 5) {
     const offset = (pitch - angle) * scale;
     if (Math.abs(offset) > clip || Math.abs(offset) < 13) continue;
     const ty = y + offset;
     const major = angle % 10 === 0;
     const arm = major ? radius : radius * .72;
-    ctx.globalAlpha = (major ? .94 : .53) * (1 - .45 * Math.abs(offset) / clip);
+    ctx.globalAlpha = (major ? .78 : .38) * (1 - .5 * Math.abs(offset) / clip);
     ctx.setLineDash(angle < 0 ? [5, 4] : []);
     line(ctx, [[x - arm, ty], [x - gap, ty]]);
     line(ctx, [[x + gap, ty], [x + arm, ty]]);
     ctx.setLineDash([]);
-    if (major) {
+    if (major && !compact) {
       const label = (angle > 0 ? "+" : "") + angle;
       const size = width < 630 ? 11 : 12;
       text(ctx, label, x - arm - 8, ty, { color: CYAN, align: "right", size });
@@ -184,24 +193,23 @@ export class FlightHUD {
     layout.observe(this.readouts.parentElement);
   }
 
-  update(active, frame, clearance) {
+  update(active, frame, clearance, emergencyPhase) {
     this.overlay.hidden = !active;
     this.readouts.hidden = !active;
     this.frame = frame;
     if (!active) return;
 
     const alarm = !frame.onGround && clearance !== null && clearance < 12;
-    const low = !frame.onGround && frame.battery < 18;
-    const phase = frame.complete ? "已停机" : frame.onGround ? "地面待命" : PHASE_LABELS[frame.leg?.phase] ?? "飞行";
+    const low = !frame.onGround && frame.charge.tone !== "normal";
+    const phase = emergencyPhase ?? (frame.complete ? "已停机" : frame.onGround ? "地面待命" : PHASE_LABELS[frame.leg?.phase] ?? "飞行");
     const warnings = [alarm && "净空过近", low && "低电量"].filter(Boolean);
     setText(this.phase, phase);
     setText(this.alert, warnings.join(" · ") || (frame.onGround ? "地面状态" : clearance === null ? "等待净空数据" : "净空正常"));
-    this.alert.dataset.tone = warnings.length ? "warn" : frame.onGround || clearance === null ? "neutral" : "normal";
+    this.alert.dataset.tone = low && frame.charge.tone === "critical" ? "critical"
+      : warnings.length ? "warn" : frame.onGround || clearance === null ? "neutral" : "normal";
     this.alert.toggleAttribute("data-live-warning", Boolean(frame.playing && warnings.length));
-    setText(this.battery, Math.round(frame.battery) + "%");
-    setText(this.clearance, clearance === null ? "—" : clearance.toFixed(1) + " 米");
-    this.meter.value = frame.battery;
-    this.readouts.toggleAttribute("data-low", low);
+    paintBattery(this.battery, this.meter, frame.charge);
+    setText(this.clearance, clearance === null ? "—" : clearance.toFixed(1) + " m");
     this.readouts.toggleAttribute("data-clearance-alert", alarm);
     this.draw();
   }
@@ -225,19 +233,28 @@ export class FlightHUD {
     ctx.lineJoin = "round";
     ctx.lineCap = "round";
 
-    const compact = width < 630;
-    const margin = compact ? 10 : 20;
+    const compact = width < 570 || height < 500;
     const centerX = width / 2;
-    const tapeWidth = compact ? 65 : 112;
-    const tapeHeight = Math.min(height * .42, 365);
-    const centerY = Math.min(height * .48, (this.readoutsTop ?? height) - 10 - tapeHeight / 2);
-    const headingY = Math.max((this.headerBottom || 53) + 16, height * .13);
+    const centerY = height * .48;
+    const headerBottom = this.headerBottom || 48;
+    const headingY = Math.max(headerBottom + (compact ? 14 : 28), height * .13);
+    const instruments = [
+      { name: "机位离地", value: frame.agl, unit: "m", step: 10, range: 40 },
+      { name: "地速", value: frame.groundSpeed, unit: "m/s", step: 2, range: 8 },
+    ];
 
-    drawHeading(ctx, centerX, headingY, Math.min(width * .255, 220), frame.heading ?? 0, compact);
-    drawPitch(ctx, centerX, centerY, compact ? width * .66 : width, height, (frame.pitch ?? 0) * 180 / Math.PI);
-    drawTape(ctx, { x: margin, y: centerY, width: tapeWidth, height: tapeHeight, right: false,
-      name: "离地高度", value: frame.agl, unit: "米", step: 5, range: 35, compact });
-    drawTape(ctx, { x: width - margin - tapeWidth, y: centerY, width: tapeWidth, height: tapeHeight, right: true,
-      name: "飞行速度", value: frame.speed, unit: "米/秒", step: 1, range: 7, compact });
+    const headingSpan = compact ? Math.max(25, Math.min(width / 2 - 91, width * .21)) : Math.min(width * .22, 208);
+    drawHeading(ctx, centerX, headingY, headingSpan, frame.heading ?? 0, compact);
+    drawPitch(ctx, centerX, centerY, compact ? width * .83 : width, height, (frame.pitch ?? 0) * 180 / Math.PI, compact);
+    if (compact) {
+      drawCompactReadout(ctx, 49, headerBottom + 12, instruments[0].name, frame.agl, "m");
+      drawCompactReadout(ctx, width - 49, headerBottom + 12, instruments[1].name, frame.groundSpeed, "m/s");
+      return;
+    }
+    const tapeWidth = Math.min(width * .11, 92);
+    const tapeHeight = Math.min(height * .33, 264);
+    const tapeY = Math.min(centerY, (this.readoutsTop ?? height) - 16 - tapeHeight / 2);
+    drawTape(ctx, { ...instruments[0], x: 16, y: tapeY, width: tapeWidth, height: tapeHeight, right: false, compact });
+    drawTape(ctx, { ...instruments[1], x: width - 16 - tapeWidth, y: tapeY, width: tapeWidth, height: tapeHeight, right: true, compact });
   }
 }

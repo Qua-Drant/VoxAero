@@ -52,10 +52,12 @@ export function spatialCandidateForm(result, callbacks) {
   actions.className = "plan-actions";
   const cancel = document.createElement("button");
   cancel.type = "button";
+  cancel.className = "action-button";
   cancel.textContent = "返回修改";
   cancel.addEventListener("click", callbacks.cancel);
   const use = document.createElement("button");
   use.type = "submit";
+  use.className = "action-button primary";
   use.textContent = "采用候选";
   actions.append(cancel, use);
   form.append(header, fieldset, reason, airspace, rejected, actions);
@@ -78,7 +80,7 @@ export function spatialCandidateForm(result, callbacks) {
     const route = document.createElement("strong");
     route.textContent = `${option.start.name} → ${option.end.name}`;
     const measurements = document.createElement("small");
-    measurements.textContent = `${number.format(option.kpis.distance_m)} 米 · ${number.format(option.kpis.estimated_seconds)} 秒`;
+    measurements.textContent = `${number.format(option.kpis.distance_m)} m · ${number.format(option.kpis.estimated_seconds)} s`;
     content.append(route, measurements);
     label.append(radio, content);
     fieldset.append(label);

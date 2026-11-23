@@ -1,16 +1,20 @@
-import { CampusMap } from "./map3d.js?v=15";
+import { CampusMap } from "./map3d.js?v=16";
 import { DroneSim } from "./drone_sim.js?v=8";
-import { FlightReplay, flightClock } from "./flight_replay.js?v=11";
-import { FlightHUD } from "./ar_hud.js?v=14";
-import { AgentUI, plainDispatchText } from "./agent_ui.js?v=15";
+import { FlightReplay, flightClock } from "./flight_replay.js?v=12";
+import { FlightHUD } from "./ar_hud.js?v=15";
+import { batteryReading, paintBattery } from "./battery_display.js";
+import { AgentUI, plainDispatchText } from "./agent_ui.js?v=16";
 
-import { VerticalProfile } from "./flight_profile.js?v=13";
+import { VerticalProfile } from "./flight_profile.js?v=14";
 
 const element = (id) => document.getElementById(id);
 const layerToggles = [...document.querySelectorAll("[data-layer]")];
 const viewButtons = [...document.querySelectorAll("[data-view]")];
 const rateButtons = [...document.querySelectorAll("[data-rate]")];
 const playButton = element("play-flight");
+const fpvPanelButtons = [...document.querySelectorAll("button[data-fpv-panel]")];
+const batteryLabel = element("charge");
+const batteryMeter = element("battery-meter");
 const resetButton = element("reset-flight");
 const focusButton = element("focus-route");
 const windButton = element("wind");
@@ -84,11 +88,6 @@ function setupEmergencyMenu() {
   if (!("popover" in HTMLElement.prototype)) return () => { fallback.open = false; };
 
   const trigger = element("emergency-trigger");
-  if (!("command" in HTMLButtonElement.prototype)) {
-    trigger.removeAttribute("commandfor");
-    trigger.removeAttribute("command");
-    trigger.setAttribute("popovertarget", panel.id);
-  }
   panel.setAttribute("popover", "auto");
   fallback.replaceWith(panel);
   trigger.hidden = false;
@@ -145,10 +144,10 @@ function updateControls() {
   const cruising = planned && Boolean(frame) && frame.elapsed > 0 && !frame.complete
     && frame.leg.phase === "cruise" && frame.coordinates.alt >= 30;
   const canPlan = Boolean(sim) && !locked && !isInFlight();
-  ui.setAvailable(canPlan);
+  ui.setAvailable(canPlan, Boolean(draft || proposal));
   for (const button of pickButtons) button.disabled = !canPlan;
   element("clear-spatial").disabled = !canPlan;
-  playButton.disabled = !planned || locked || Boolean(draft || proposal) || frame?.complete || mission?.hold;
+  playButton.disabled = !replaying && (!planned || locked || Boolean(draft || proposal) || frame?.complete || mission?.hold);
   resetButton.disabled = !planned || locked || Boolean(draft || proposal);
   focusButton.disabled = !sim;
   windButton.disabled = !cruising || locked || mission.hazards.length >= 20;
@@ -163,9 +162,11 @@ function updateControls() {
     button.disabled = !sim || ((!planned || draft || proposal) && button.dataset.view !== "overview");
     button.setAttribute("aria-pressed", button.dataset.view === (review?.sim?.view ?? sim?.view ?? "overview"));
   }
-  text("play-label", frame?.complete ? "已完成" : frame?.playing ? "暂停"
-    : frame?.elapsed || mission?.rerouted ? "继续" : "开始");
-  element("play-icon").setAttribute("href", frame?.playing ? "#icon-pause" : "#icon-play");
+  const playing = replaying ? review.playing : frame?.playing;
+  text("play-label", replaying ? (playing ? "暂停回放" : "播放回放")
+    : frame?.complete ? "已完成" : playing ? "暂停"
+      : frame?.elapsed || mission?.rerouted ? "继续" : "开始");
+  element("play-icon").setAttribute("href", playing ? "#icon-pause" : "#icon-play");
   seek.hidden = !replaying;
   text("emergency-hint", replaying ? "回放中。退出回放后可操作当前任务。"
     : busy === "replan" ? "仿真已暂停，正在计算新航线。"
@@ -260,34 +261,35 @@ function paintTelemetry(next, currentSim) {
   const heading = Math.round((Cesium.Math.toDegrees(currentSim.heading ?? 0) + 360) % 360) % 360;
   const vertical = moving ? leg.dz / seconds : 0;
   next.agl = map.altitudeAGL(coordinates);
-  next.altitudeText = format.format(next.agl) + " 米";
+  next.altitudeText = format.format(next.agl) + " m";
+  next.groundSpeed = moving ? leg.horizontal / seconds : 0;
+  next.charge = batteryReading(battery);
   const lowClearance = !next.onGround && clearance !== null && clearance < 12;
   const flightActive = next.playing || review?.playing;
   const warning = lowClearance || (!review?.active && mission?.hold);
   next.instrumentTone = next.onGround ? "neutral" : warning ? "warn"
     : !flightActive ? "neutral" : leg.phase === "cruise" ? "normal" : "vector";
   element("altitude").closest(".flight-board").dataset.tone = next.instrumentTone;
-  measurement("altitude", next.agl, "米");
-  measurement("speed", moving ? leg.horizontal / seconds : 0, "米/秒");
-  text("charge", Math.round(battery) + " %");
-  measurement("clearance", next.onGround ? null : clearance, "米");
+  measurement("altitude", next.agl, "m");
+  measurement("speed", next.groundSpeed, "m/s");
+  paintBattery(batteryLabel, batteryMeter, next.charge);
+  measurement("clearance", next.onGround ? null : clearance, "m");
   element("clearance").dataset.tone = lowClearance ? "warn" : "neutral";
   text("clearance-status", next.onGround ? "地面停机" : clearance === null ? "等待净空数据"
     : lowClearance ? "净空偏低" : "距最近障碍物");
   element("clearance-status").dataset.tone = next.onGround || clearance === null ? "neutral" : next.instrumentTone;
-  element("charge").dataset.alert = !next.onGround && battery < 18;
-  element("battery-meter").dataset.alert = !next.onGround && battery < 18;
-  Array.from(element("battery-meter").children).forEach((bar, index) => bar.toggleAttribute("data-lit", index < Math.ceil(battery / 20)));
-  text("vertical-speed", vertical > .05 ? `↑ 爬升 +${format.format(vertical)} 米/秒`
-    : vertical < -.05 ? `↓ 下降 ${format.format(vertical)} 米/秒` : "垂直速度 0.0 米/秒");
+  text("vertical-speed", vertical > .05 ? `↑ 爬升 +${format.format(vertical)} m/s`
+    : vertical < -.05 ? `↓ 下降 ${format.format(vertical)} m/s` : "垂直速度 0.0 m/s");
   text("flight-heading", `航向 ${String(heading).padStart(3, "0")}° ${directions[Math.round(heading / 22.5) % 16]}`);
   const remaining = complete ? 0 : currentSim.track.legs.slice(next.legIndex).reduce((distance, step) => distance
     + Math.hypot(step.horizontal, step.dz) * (step.end - Math.max(step.start, next.elapsed)) / (step.end - step.start), 0);
-  text("distance", format.format(remaining) + " 米");
-  text("duration", format.format(next.duration - next.elapsed) + " 秒");
-  map.updateAircraftTag(next.altitudeText, next.instrumentTone);
+  text("distance", format.format(remaining) + " m");
+  text("duration", format.format(next.duration - next.elapsed) + " s");
+  map.updateAircraftTag(next.altitudeText, next.instrumentTone, next.agl);
   if (profile.track === currentSim.track) profile.paint(next);
-  hud.update(currentSim.view === "fpv", next, next.onGround ? null : clearance);
+  const emergencyPhase = !review?.active && !next.onGround && (busy === "replan" || mission?.hold || mission?.rerouted)
+    ? flightState() : null;
+  hud.update(currentSim.view === "fpv", next, next.onGround ? null : clearance, emergencyPhase);
 }
 
 const landingStart = (track) => track.legs.find((leg) => leg.phase === "landing")?.start ?? track.duration;
@@ -395,6 +397,7 @@ function paintReplay(next, record, segment) {
 }
 
 function setReplayMode(active) {
+  document.body.toggleAttribute("data-replay", active);
   lastTelemetry = -Infinity;
   if (active) {
     ui.setMissionState("历史回放");
@@ -436,7 +439,7 @@ function showDispatchNotice(result, query) {
   }
   const conflict = result.status === "constraint_conflict";
   if (result.mode) ui.setMode(result.mode);
-  const message = plainDispatchText(result.detail);
+  const message = result.status === "airspace_report" ? "空域核验已完成。" : plainDispatchText(result.detail);
   ui.status(message, conflict);
 }
 
@@ -792,8 +795,8 @@ async function launch() {
         map.setRouteTargets(review.record.startId, target);
         showRouteData(result, target);
       },
-      onMode: setReplayMode, onOverview: () => setView("overview"),
-    });
+      onMode: setReplayMode, onOverview: () => setView("overview"), onPlayback: updateControls,
+    }, seek);
     for (const toggle of layerToggles) {
       toggle.disabled = toggle.dataset.layer === "roads" && !data.roads;
       toggle.addEventListener("change", () => {
@@ -857,7 +860,7 @@ function bindOrientation() {
         const scale = 10 ** Math.floor(Math.log10(target));
         const nice = [5, 2, 1].find((value) => value * scale <= target) * scale;
         element("scale-rule").style.width = nice / metersPerPixel + "px";
-        text("scale-value", format.format(nice) + " 米");
+        text("scale-value", nice + " m");
       }
     } else {
       element("scale-rule").hidden = true;
@@ -877,10 +880,17 @@ function bindOrientation() {
   });
 }
 
+function setFpvPanel(panel) {
+  if (panel) document.body.dataset.fpvPanel = panel;
+  else delete document.body.dataset.fpvPanel;
+  for (const button of fpvPanelButtons) button.setAttribute("aria-expanded", String(button.dataset.fpvPanel === panel));
+}
+
 function setView(view) {
+  if (document.body.dataset.view !== view) setFpvPanel(null);
+  document.body.dataset.view = view;
   map?.viewer.camera.cancelFlight();
   (review?.sim ?? sim)?.setView(view);
-  document.body.dataset.view = view;
   updateControls();
 }
 
@@ -902,6 +912,12 @@ seek.addEventListener("input", () => {
   review.pause();
   review.seek(seek.valueAsNumber * review.record.duration);
 });
+for (const button of fpvPanelButtons) {
+  button.addEventListener("click", () => {
+    const panel = button.dataset.fpvPanel;
+    setFpvPanel(document.body.dataset.fpvPanel === panel ? null : panel);
+  });
+}
 for (const button of viewButtons) button.addEventListener("click", () => setView(button.dataset.view));
 for (const button of rateButtons) {
   button.addEventListener("click", () => {
@@ -912,6 +928,11 @@ for (const button of rateButtons) {
   });
 }
 playButton.addEventListener("click", () => {
+  if (review?.active) {
+    if (review.playing) review.pause();
+    else review.resume();
+    return;
+  }
   if (sim.playing) {
     sim.pause();
     ui.status("仿真已暂停。");

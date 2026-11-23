@@ -1,4 +1,4 @@
-import { renderAirspaceCheck, spatialCandidateForm } from "./spatial_ui.js";
+import { renderAirspaceCheck, spatialCandidateForm } from "./spatial_ui.js?v=2";
 
 const PRESETS = {
   spatial: "从信息学部附近找一个可起飞的地面点，去图书馆西侧巡检，绕开静谧区。",
@@ -12,13 +12,13 @@ const RESPONSE_LABELS = {
   needs_clarification: "请补充地点", clarification_closed: "请重新提交指令", constraint_conflict: "飞行要求有冲突",
 };
 const ACTION_STEPS = {
-  classify_dispatch: ["读指令", "先确认这条消息是在安排任务、补充地点，还是询问用法。"],
-  parse_dispatch_intent: ["懂需求", "根据指令确认是配送还是巡检，以及要从哪里飞到哪里。"],
-  clarify_dispatch: ["补地点", "用你刚提供的地点补全任务，保留之前的飞行要求。"],
-  replan_emergency: ["做应急", "根据突发情况，重新选择可以飞的路线。"],
+  classify_dispatch: ["请求分类", "识别任务、地点补充或空域查询。"],
+  parse_dispatch_intent: ["意图识别", "核对任务类型与起终点。"],
+  clarify_dispatch: ["地点补全", "更新起终点，沿用既定约束。"],
+  replan_emergency: ["应急评估", "按事件类型评估绕飞或备降。"],
 };
 const decimal = (value) => value.toFixed(1);
-const CORRIDORS = { delivery: "30–60 米", inspection: "60–90 米" };
+const CORRIDORS = { delivery: "30–60 m", inspection: "60–90 m" };
 const number = new Intl.NumberFormat("zh-CN", { minimumFractionDigits: 1, maximumFractionDigits: 1 });
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -27,7 +27,7 @@ export function plainDispatchText(content) {
     return "平台已返回回复，请查看任务状态。";
   }
   return content
-    .replace(/(\d+(?:\.\d+)?)\s+m\b/g, (_, meters) => Number(meters).toFixed(1) + " 米")
+    .replace(/(\d+(?:\.\d+)?)\s+m\b/g, (_, meters) => meters + " m")
     .replaceAll("起降坪", "起降点")
     .replaceAll("候选航线", "找到的路线")
     .replaceAll("合规航线", "符合飞行要求的路线")
@@ -43,23 +43,23 @@ export function plainDispatchText(content) {
 function readableStep({ role, content }) {
   if (role === "action") {
     const [action, detail] = content.split(" · ");
-    if (action === "校验空域") return ["查限制", `检查可用的巡航高度（${plainDispatchText(detail ?? "适用航层")}），确认哪些地方要绕开。`];
+    if (action === "校验空域") return ["空域检查", `核对巡航航层 ${plainDispatchText(detail ?? "适用航层")}。`];
     if (content.startsWith("模型提取地点") || content.startsWith("按本地规则识别")) return ["识别地点", content];
-    if (content.startsWith("用场景地形")) return ["筛选起降点", "检查地形、建筑、围栏和每组候选的起降航线。"];
+    if (content.startsWith("用场景地形")) return ["起降筛选", "核对地形、建筑、围栏和候选航线。"];
     if (action === "plan_3d_route") {
-      if (detail?.includes("备降") || detail?.includes("应急坪")) return ["找路线", "比较附近能到达的备降点，选一条符合飞行要求的路线。"];
-      if (detail?.startsWith("从当前")) return ["找路线", "从无人机现在的位置出发，找一条能绕开限制区域的路线。"];
-      return ["找路线", "寻找能避开建筑和禁飞区、也符合任务要求的路线。"];
+      if (detail?.includes("备降") || detail?.includes("应急坪")) return ["备降规划", "比较可达备降点与航程。"];
+      if (detail?.startsWith("从当前")) return ["绕飞规划", "从当前机位规划绕飞航线。"];
+      return ["航线规划", "搜索三维航线并复核障碍净空。"];
     }
-    return ACTION_STEPS[action] ?? ["核对", "继续核对这项任务的飞行要求。"];
+    return ACTION_STEPS[action] ?? ["任务复核", "检查既定飞行条件。"];
   }
   if (role === "thought") return content.startsWith("保持飞行当前位置")
-    ? ["看位置", "记录无人机现在的位置，作为改航的起点。"]
-    : ["看要求", "从指令中找出任务类型、地点和需要遵守的要求。"];
+    ? ["机位锁定", "记录当前位置作为改航起点。"]
+    : ["约束提取", "提取航层、时限与避让要求。"];
   const endpoints = content.match(/^\S+ (.+) → \S+ (.+)$/);
-  if (endpoints) return ["地点匹配", `计划从${endpoints[1]}出发，飞往${endpoints[2]}。`];
+  if (endpoints) return ["地点匹配", `${endpoints[1]} → ${endpoints[2]}`];
   const route = content.match(/^规划成功，\d+ 个航点，([\d.]+) m。$/);
-  if (route) return ["航线已生成", "航点已生成，路线符合飞行要求。"];
+  if (route) return ["航线复核", `已生成合规航线 · ${route[1]} m`];
   return [content.includes("空域") || content.includes("避让") ? "规则核验" : "处理反馈", plainDispatchText(content)];
 }
 
@@ -103,7 +103,7 @@ export class AgentUI {
     this.exchangeTemplate = document.getElementById("agent-exchange-template");
     this.planTemplate = document.getElementById("dispatch-plan-template");
     this.guide = document.getElementById("agent-welcome");
-    this.help = document.getElementById("agent-help");
+    this.panel = this.form.closest(".dispatch");
     this.feedback = document.getElementById("dispatch-status");
     this.submit = this.form.querySelector("#submit");
     this.clear = document.getElementById("clear-clarification");
@@ -137,21 +137,14 @@ export class AgentUI {
         if (!event.repeat && !this.submit.disabled) this.form.requestSubmit(this.submit);
       }
     });
-    this.help.addEventListener("click", () => this.showGuide(this.guide.hidden));
     for (const button of this.guide.querySelectorAll("[data-welcome-example]")) {
       button.addEventListener("click", () => {
         this.clear.click();
         this.setInput(PRESETS[button.dataset.welcomeExample]);
-        this.showGuide(false);
+        this.guide.hidden = true;
         this.input.focus();
       });
     }
-  }
-
-  showGuide(show) {
-    this.guide.hidden = !show;
-    this.form.closest(".dispatch").toggleAttribute("data-guide", show);
-    this.help.setAttribute("aria-expanded", String(show));
   }
 
   setInput(value) {
@@ -159,7 +152,7 @@ export class AgentUI {
   }
 
   beginExchange() {
-    this.showGuide(false);
+    this.guide.hidden = true;
     const element = this.exchangeTemplate.content.cloneNode(true).firstElementChild;
     const part = (name) => element.querySelector(`[data-exchange="${name}"]`);
     const exchange = { element, part, body: null, ok: false };
@@ -167,9 +160,14 @@ export class AgentUI {
       const open = part("trace").getAttribute("aria-expanded") !== "true";
       part("trace").setAttribute("aria-expanded", String(open));
       part("summary").hidden = open;
-      part("steps").hidden = !open;
+      part("details").hidden = !open;
+      this.updateTraceScroll(exchange);
       part("trace-title").textContent = open ? "返回摘要" : `展开 ${exchange.total} 步详情`;
     });
+    part("steps").addEventListener("scroll", () => this.updateTraceScroll(exchange), { passive: true });
+    this.traceResize?.disconnect();
+    this.traceResize = new ResizeObserver(() => this.updateTraceScroll(exchange));
+    this.traceResize.observe(part("steps"));
     element.dataset.pending = "";
     this.messages.replaceChildren(element);
     this.setTraceProgress(exchange, 8, 0);
@@ -181,6 +179,11 @@ export class AgentUI {
     };
     exchange.fail = () => { part("count").textContent = "连接失败"; };
     return exchange;
+  }
+
+  updateTraceScroll({ part }) {
+    const list = part("steps");
+    part("scroll-hint").hidden = list.scrollHeight - list.scrollTop <= list.clientHeight + 2;
   }
 
   setTraceProgress({ part }, total, complete) {
@@ -233,6 +236,7 @@ export class AgentUI {
       text.textContent = detail;
       row.append(number, title, text);
       list.append(row);
+      if (!part("details").hidden) this.updateTraceScroll(exchange);
       this.setTraceProgress(exchange, steps.length, index + 1);
       count.textContent = `${index + 1}/${steps.length}`;
       this.setTraceSummary(exchange, [[label, detail]]);
@@ -258,7 +262,7 @@ export class AgentUI {
           ? `确认${intent.mission_type === "inspection" ? "巡检" : "配送"}任务 · ${intent.start_id} → ${intent.end_id}`
           : `重新研判当前机位与目的地 ${body.target_id}`],
         ["约束核验", checked?.text ?? `航层 ${corridor} · 避开禁飞区`],
-        ["航线生成", `生成 ${decimal(kpis.distance_m)} 米 避障三维航迹`],
+        ["航线生成", `生成 ${decimal(kpis.distance_m)} m 避障三维航迹`],
       ]);
     } else if (body?.detail) {
       const readback = [[RESPONSE_LABELS[body.status] ?? "调度反馈", plainDispatchText(body.detail)]];
@@ -273,7 +277,13 @@ export class AgentUI {
     this.input.placeholder = active ? "例如：食堂" : "例如：从 VP01 巡检至 VP04";
   }
 
-  setAvailable(available) {
+  setAvailable(available, decisionPending) {
+    this.panel.toggleAttribute("data-decision", decisionPending);
+    if (this.clear.hidden) {
+      const label = decisionPending ? "重新规划" : "规划航线";
+      const submitLabel = document.getElementById("submit-label");
+      if (submitLabel.textContent !== label) submitLabel.textContent = label;
+    }
     this.submit.disabled = !available;
     this.clear.disabled = !available;
     for (const button of this.presets) button.disabled = !available;
@@ -333,12 +343,12 @@ export class AgentUI {
     part("corridor").textContent = CORRIDORS[result.corridor];
     part("compliance").textContent = kpis.compliant
       ? `${Math.round(kpis.compliance_percent)}% · 校验 ${zoneNames.size + (result.temporary_nofly_zone ? 1 : 0)} 区` : "未通过";
-    part("clearance").textContent = kpis.min_clearance_m == null ? "—" : `≥ ${(Math.floor(kpis.min_clearance_m * 10) / 10).toFixed(1)} 米`;
+    part("clearance").textContent = kpis.min_clearance_m == null ? "—" : `≥ ${(Math.floor(kpis.min_clearance_m * 10) / 10).toFixed(1)} m`;
     part("clearance").title = "规划航段距最近建筑或禁飞区包络的最小净空";
     part("source").textContent = !intent ? "本地应急规划" : result.model_fallback ? "本地规则兜底"
       : result.mode === "live_llm" ? "模型识别" : "本地规则";
     renderAirspaceCheck(part("airspace"), result.airspace_check);
-    part("kpis").textContent = `规划航程 ${decimal(kpis.distance_m)} 米 · 预计 ${decimal(kpis.estimated_seconds)} 秒`;
+    part("kpis").textContent = `规划航程 ${decimal(kpis.distance_m)} m · 预计 ${decimal(kpis.estimated_seconds)} s`;
   }
 
   setMissionState(label, tone = "neutral") {
