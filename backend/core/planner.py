@@ -36,24 +36,24 @@ class RoutePlanner:
 
     def plan_3d_route(
         self,
-        start: str | Position,
-        end_id: str,
+        start: str | Vertiport | Position,
+        end_id: str | Vertiport,
         mission_type: MissionType,
         extra_nofly_zones: tuple[DynamicHazard, ...] = (),
         *,
         avoid_zone_ids: tuple[str, ...] = (),
         cruise_limits: CruiseLimits | None = None,
     ) -> RoutePlan:
-        """Plan from a vertiport ID or an airborne WGS84 position to a vertiport."""
+        """Plan from a registered or validated task pad, or an airborne WGS84 position."""
         if mission_type not in MISSION_LAYERS:
             raise ValueError(f"Unknown mission type: {mission_type}")
-        if start == end_id:
-            raise ValueError("Origin and destination vertiports must be different")
         layer = MISSION_LAYERS[mission_type]
-        end_pad = self._pad(end_id)
-        origin_is_pad = isinstance(start, str)
+        end_pad = self._pad(end_id) if isinstance(end_id, str) else end_id
+        origin_is_pad = not isinstance(start, Position)
         if origin_is_pad:
-            start_pad = self._pad(start)
+            start_pad = self._pad(start) if isinstance(start, str) else start
+            if start_pad.properties.id == end_pad.properties.id or start_pad.position == end_pad.position:
+                raise NoRouteError("Origin and destination vertiports must be different")
             origin = start_pad.position
             origin_roof = start_pad.roof_obstacle
         else:

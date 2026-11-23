@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Annotated, Literal
 
 from pydantic import BaseModel, Field, FiniteFloat, StringConstraints, model_validator
@@ -17,6 +18,7 @@ EmergencyType = Literal["wind_gust", "temp_nofly", "low_battery"]
 LLMMode = Literal["live_llm", "fallback_mock"]
 DispatchNoticeType = Literal[
     "help", "out_of_scope", "needs_intent", "needs_clarification", "clarification_closed", "constraint_conflict",
+    "needs_spatial_location", "airspace_report",
 ]
 
 
@@ -65,10 +67,32 @@ class DynamicHazard(AltitudeRange):
     radius_m: Annotated[FiniteFloat, Field(gt=0)]
 
 
-class Position(BaseModel, frozen=True):
+class GroundPoint(BaseModel, frozen=True):
     lon: Longitude
     lat: Latitude
+
+
+class Position(GroundPoint):
     alt: NonnegativeMeters
+
+
+class TaskAvoidance(GroundPoint):
+    radius_m: Annotated[FiniteFloat, Field(ge=5, le=250)]
+
+
+class SpatialOptions(BaseModel, frozen=True):
+    start: GroundPoint | None = None
+    end: GroundPoint | None = None
+    avoid: Annotated[tuple[TaskAvoidance, ...], Field(max_length=3)] = ()
+
+
+class AirspaceCheck(BaseModel, frozen=True):
+    status: Literal["pending", "source_checked"] = "pending"
+    detail: str = "当前使用场景空域规则，外部空域数据待核验。"
+    source_name: str | None = None
+    source_url: str | None = None
+    source_version: str | None = None
+    valid_until: datetime | None = None
 
 
 class Waypoint(Position):
@@ -107,6 +131,7 @@ class DispatchRequest(BaseModel):
     query: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=500)]
     scene_version: str | None = None
     clarification_token: Annotated[str, StringConstraints(min_length=1, max_length=80)] | None = None
+    spatial: SpatialOptions | None = None
 
 
 class DispatchCandidate(BaseModel):
@@ -135,6 +160,7 @@ class ReplanRequest(BaseModel):
     scene_version: str | None = None
     cruise_limits: CruiseLimits | None = None
     remaining_deadline_seconds: FiniteFloat | None = None
+    mission_token: Annotated[str, StringConstraints(min_length=1, max_length=80)] | None = None
 
     @model_validator(mode="after")
     def check_hazard(self) -> ReplanRequest:
@@ -165,6 +191,7 @@ class AssessedRoute(RoutePlan):
 
 
 class MissionResult(BaseModel):
+    airspace_check: AirspaceCheck | None = None
     corridor: MissionType
     waypoints: list[Waypoint]
     kpis: RouteKPIs
@@ -180,6 +207,9 @@ class DispatchResult(MissionResult):
     intent: DispatchIntent
     start_name: str
     end_name: str
+    mission_token: str | None = None
+    task_sites: tuple[TaskSite, ...] = ()
+    task_zones: tuple[HazardFeature, ...] = ()
 
 
 class DispatchNotice(BaseModel):
@@ -190,6 +220,7 @@ class DispatchNotice(BaseModel):
     model_called: bool = False
     clarification_token: str | None = None
     scene_version: str | None = None
+    airspace_check: AirspaceCheck | None = None
 
 
 class HazardPolygon(BaseModel):
@@ -201,6 +232,44 @@ class HazardFeature(BaseModel):
     type: Literal["Feature"] = "Feature"
     properties: NoFlyProperties
     geometry: HazardPolygon
+
+
+class TaskSite(BaseModel, frozen=True):
+    id: str
+    name: str
+    position: Position
+    reference_name: str
+    offset_m: NonnegativeMeters
+
+
+class SpatialRouteOption(BaseModel):
+    id: str
+    start: TaskSite
+    end: TaskSite
+    corridor: MissionType
+    waypoints: list[Waypoint]
+    kpis: RouteKPIs
+    airspace_check: AirspaceCheck
+    recommendation: str
+
+
+class SpatialChoices(BaseModel):
+    status: Literal["choose_endpoints"] = "choose_endpoints"
+    detail: str
+    candidate_token: str
+    scene_version: str | None = None
+    mode: LLMMode
+    model_called: bool
+    thought_steps: list[ThoughtStep]
+    options: list[SpatialRouteOption]
+    rejected: dict[str, int]
+    task_zones: tuple[HazardFeature, ...] = ()
+
+
+class ConfirmSpatialRequest(BaseModel):
+    candidate_token: Annotated[str, StringConstraints(min_length=1, max_length=80)]
+    option_id: Annotated[str, StringConstraints(min_length=1, max_length=24)]
+    scene_version: str | None = None
 
 
 class ReplanResult(MissionResult):

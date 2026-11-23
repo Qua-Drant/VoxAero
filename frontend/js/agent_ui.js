@@ -1,9 +1,13 @@
+import { renderAirspaceCheck, spatialCandidateForm } from "./spatial_ui.js";
+
 const PRESETS = {
+  spatial: "从信息学部附近找一个可起飞的地面点，去图书馆西侧巡检，绕开静谧区。",
   delivery: "中午高峰配送：将餐食从信息学部食堂送至测国重楼顶，避开图书馆静谧区",
   inspection: "夜间高空安防巡检：从信息学部起飞，沿 60–90m 巡检层前往图书馆西侧巡检点",
   emergency: "应急航线演示：从 VP02 沿 60–90m 巡检层前往 VP03",
 };
 const RESPONSE_LABELS = {
+  choose_endpoints: "已生成候选", needs_spatial_location: "请补充地点", airspace_report: "空域核验",
   planned: "航线已规划", help: "使用指引", out_of_scope: "这条指令无法调度", needs_intent: "请说明任务",
   needs_clarification: "请补充地点", clarification_closed: "请重新提交指令", constraint_conflict: "飞行要求有冲突",
 };
@@ -40,6 +44,8 @@ function readableStep({ role, content }) {
   if (role === "action") {
     const [action, detail] = content.split(" · ");
     if (action === "校验空域") return ["查限制", `检查可用的巡航高度（${plainDispatchText(detail ?? "适用航层")}），确认哪些地方要绕开。`];
+    if (content.startsWith("模型提取地点") || content.startsWith("按本地规则识别")) return ["识别地点", content];
+    if (content.startsWith("用场景地形")) return ["筛选起降点", "检查地形、建筑、围栏和每组候选的起降航线。"];
     if (action === "plan_3d_route") {
       if (detail?.includes("备降") || detail?.includes("应急坪")) return ["找路线", "比较附近能到达的备降点，选一条符合飞行要求的路线。"];
       if (detail?.startsWith("从当前")) return ["找路线", "从无人机现在的位置出发，找一条能绕开限制区域的路线。"];
@@ -204,7 +210,8 @@ export class AgentUI {
     const { element, part, body, ok } = exchange;
     const list = part("steps");
     const count = part("count");
-    const planned = body?.kpis?.compliant && (body.status === "planned" || Boolean(body.emergency_type));
+    const choosing = body?.status === "choose_endpoints";
+    const planned = choosing || body?.kpis?.compliant && (body.status === "planned" || Boolean(body.emergency_type));
     const reduced = matchMedia("(prefers-reduced-motion: reduce)").matches;
     exchange.total = steps.length;
     part("trace-title").textContent = steps.length ? `展开 ${steps.length} 步详情` : "无步骤";
@@ -235,7 +242,13 @@ export class AgentUI {
       count.textContent = `${steps.length}/${steps.length} ${ok && planned ? "通过" : "已处理"}`;
       if (ok && planned) element.dataset.passed = "";
     }
-    if (planned && ok) {
+    if (choosing && ok) {
+      this.setTraceSummary(exchange, [
+        ["地点筛选", "在场景中匹配参考地点并检查地面候选。"],
+        ["航线复核", `已有 ${body.options.length} 组候选通过仿真路线检查。`],
+        ["候选确认", "选择候选后可核对航线并开始仿真。"],
+      ]);
+    } else if (planned && ok) {
       const { kpis, intent } = body;
       const corridor = CORRIDORS[body.corridor];
       const constraints = intent ? planRequirements(body, zoneNames) : [];
@@ -248,7 +261,9 @@ export class AgentUI {
         ["航线生成", `生成 ${decimal(kpis.distance_m)} 米 避障三维航迹`],
       ]);
     } else if (body?.detail) {
-      this.setTraceSummary(exchange, [[RESPONSE_LABELS[body.status] ?? "调度反馈", plainDispatchText(body.detail)]]);
+      const readback = [[RESPONSE_LABELS[body.status] ?? "调度反馈", plainDispatchText(body.detail)]];
+      if (body.airspace_check) readback.push(["来源核验", body.airspace_check.detail]);
+      this.setTraceSummary(exchange, readback);
     }
   }
 
@@ -273,6 +288,12 @@ export class AgentUI {
     this.feedback.textContent = plainDispatchText(message);
     this.feedback.dataset.error = error;
     this.feedback.toggleAttribute("data-active", !error && /已确认|飞行中|已接入|已开始/.test(message));
+  }
+
+  showChoices(result, callbacks) {
+    this.plan = null;
+    this.mission.replaceChildren(spatialCandidateForm(result, callbacks));
+    this.mission.querySelector("h3").focus({ preventScroll: true });
   }
 
   showPlan(result, zoneNames, { confirm, edit, locate }, running = false) {
@@ -316,6 +337,7 @@ export class AgentUI {
     part("clearance").title = "规划航段距最近建筑或禁飞区包络的最小净空";
     part("source").textContent = !intent ? "本地应急规划" : result.model_fallback ? "本地规则兜底"
       : result.mode === "live_llm" ? "模型识别" : "本地规则";
+    renderAirspaceCheck(part("airspace"), result.airspace_check);
     part("kpis").textContent = `规划航程 ${decimal(kpis.distance_m)} 米 · 预计 ${decimal(kpis.estimated_seconds)} 秒`;
   }
 

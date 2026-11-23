@@ -9,6 +9,7 @@ from typing import Iterator
 
 import numpy as np
 import shapely
+from shapely.errors import GEOSException
 from shapely.geometry import LineString, Point, Polygon, shape
 from shapely.strtree import STRtree
 
@@ -22,12 +23,15 @@ from backend.config import (
     VERTICAL_RESOLUTION_M,
 )
 from backend.schemas import (
+    AirspaceCheck,
     BuildingProperties,
     DynamicHazard,
+    GroundPoint,
     NoFlyProperties,
     Position,
     VertiportProperties,
 )
+from backend.core.rules import RuleSource, normalize_rules
 from backend.core.terrain import CONTACT_TOLERANCE_M, TerrainSurface
 
 LocalPoint = tuple[float, float, float]
@@ -287,6 +291,8 @@ class Airspace:
         self.vertiports = vertiports
         self.geojson = {} if geojson is None else geojson
         self.scene_version = scene_version
+        self.rule_source: RuleSource | None = None
+        self.rule_issue: str | None = None
         self.static_voxels = self.grid.rasterize(field.obstacles)
         if field.terrain is not None:
             self.static_voxels |= field.terrain.voxel_mask(self.grid)
@@ -312,6 +318,20 @@ class Airspace:
             version.update(key.encode() + b"\0" + payload)
             layers[key] = json.loads(payload)
         terrain = TerrainSurface(layers["terrain"], frame) if "terrain" in layers else None
+        rule_source = rule_issue = None
+        rules_path = directory / "airspace_rules.geojson"
+        if rules_path.is_file():
+            payload = rules_path.read_bytes()
+            version.update(b"external_airspace\0" + payload)
+            try:
+                source, rules = normalize_rules(json.loads(payload), layers.get("terrain"))
+                merged = {**layers["nofly_zones"], "features": layers["nofly_zones"]["features"] + rules}
+                for props, _ in _features(merged, "airspace_rules.geojson", "Polygon"):
+                    NoFlyProperties.model_validate(props)
+                layers["nofly_zones"] = merged
+                rule_source = source
+            except (ValueError, KeyError, TypeError, AttributeError, GEOSException):
+                rule_issue = "外部空域快照格式、坐标基准或高度范围有误，待核验。"
         buildings = []
         for data, geometry in _features(layers["buildings"], "whu_buildings.geojson", "Polygon"):
             properties = BuildingProperties.model_validate(data)
@@ -349,7 +369,16 @@ class Airspace:
                 raise ValueError(f"{properties.id} does not match its designated roof")
             vertiports[properties.id] = Vertiport(properties, position, roof)
 
-        return cls(frame, bounds, ObstacleField(tuple(obstacles), terrain), vertiports, layers, version.hexdigest())
+        scene = cls(frame, bounds, ObstacleField(tuple(obstacles), terrain), vertiports, layers, version.hexdigest())
+        scene.rule_source, scene.rule_issue = rule_source, rule_issue
+        return scene
+
+    def check_airspace(self, points: list[GroundPoint], seconds: float = 0) -> AirspaceCheck:
+        if self.rule_source:
+            return self.rule_source.check(points, seconds)
+        if self.rule_issue:
+            return AirspaceCheck(detail=self.rule_issue)
+        return AirspaceCheck()
 
     def with_hazards(
         self, hazards: tuple[DynamicHazard, ...], avoid_zone_ids: tuple[str, ...] = ()

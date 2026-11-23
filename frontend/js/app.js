@@ -1,8 +1,8 @@
-import { CampusMap } from "./map3d.js?v=14";
+import { CampusMap } from "./map3d.js?v=15";
 import { DroneSim } from "./drone_sim.js?v=8";
 import { FlightReplay, flightClock } from "./flight_replay.js?v=11";
 import { FlightHUD } from "./ar_hud.js?v=14";
-import { AgentUI, plainDispatchText } from "./agent_ui.js?v=13";
+import { AgentUI, plainDispatchText } from "./agent_ui.js?v=15";
 
 import { VerticalProfile } from "./flight_profile.js?v=13";
 
@@ -29,7 +29,12 @@ let review;
 let sceneVersion;
 let mission;
 let draft;
+let proposal;
+let pickRole;
+let spatialPicks = { avoid: [] };
 let busy;
+const pickButtons = [...document.querySelectorAll("[data-map-pick]")];
+const pickLabels = { start: "起点", end: "终点", avoid: "避让区" };
 let clarificationToken;
 let clarificationQuery;
 let frame;
@@ -111,20 +116,23 @@ function updateControls() {
   const locked = Boolean(busy) || replaying;
   const cruising = planned && Boolean(frame) && frame.elapsed > 0 && !frame.complete
     && frame.leg.phase === "cruise" && frame.coordinates.alt >= 30;
-  ui.setAvailable(Boolean(sim) && !locked && !isInFlight());
-  playButton.disabled = !planned || locked || Boolean(draft) || frame?.complete || mission?.hold;
-  resetButton.disabled = !planned || locked || Boolean(draft);
+  const canPlan = Boolean(sim) && !locked && !isInFlight();
+  ui.setAvailable(canPlan);
+  for (const button of pickButtons) button.disabled = !canPlan;
+  element("clear-spatial").disabled = !canPlan;
+  playButton.disabled = !planned || locked || Boolean(draft || proposal) || frame?.complete || mission?.hold;
+  resetButton.disabled = !planned || locked || Boolean(draft || proposal);
   focusButton.disabled = !sim;
   windButton.disabled = !cruising || locked || mission.hazards.length >= 20;
   batteryButton.disabled = !cruising || locked || mission.diverted;
   review?.setAvailable(review.record?.sceneVersion === sceneVersion
-    && !busy && !draft && (!isInFlight() || mission?.hold));
+    && !busy && !draft && !proposal && (!isInFlight() || mission?.hold));
   for (const button of rateButtons) {
     button.disabled = !planned || Boolean(busy);
     button.setAttribute("aria-pressed", Number(button.dataset.rate) === (replaying ? review.rate : sim?.rate));
   }
   for (const button of viewButtons) {
-    button.disabled = !sim || ((!planned || draft) && button.dataset.view !== "overview");
+    button.disabled = !sim || ((!planned || draft || proposal) && button.dataset.view !== "overview");
     button.setAttribute("aria-pressed", button.dataset.view === (review?.sim?.view ?? sim?.view ?? "overview"));
   }
   text("play-label", frame?.complete ? "已完成" : frame?.playing ? "暂停"
@@ -145,6 +153,7 @@ function flightState() {
   if (review?.active) return "历史回放";
   if (busy === "dispatch") return "调度中";
   if (busy === "replan") return "重规划中";
+  if (proposal) return "候选起降点 · 待选择";
   if (draft) return "候选航线 · 待确认";
   if (mission?.hold) return "应急悬停";
   if (!frame) return "待命";
@@ -164,7 +173,7 @@ function refreshFlightState() {
   const tone = busy === "replan" || mission?.hold || (moving && mission?.rerouted) ? "warn"
     : busy === "dispatch" ? "vector" : moving ? frame.instrumentTone : "neutral";
   element("flight-state").dataset.tone = tone;
-  if (!review?.active && mission && !draft && busy !== "dispatch") {
+  if (!review?.active && mission && !draft && !proposal && busy !== "dispatch") {
     const state = busy === "replan" ? "应急 · 改航中" : mission.hold ? "应急 · 悬停"
       : frame?.complete ? (mission.diverted ? "已备降" : "任务完成")
         : frame?.playing ? "已确认 · 执行中" : frame?.elapsed ? "任务已暂停" : "已确认 · 待起飞";
@@ -273,8 +282,13 @@ function setFlightProgress(elapsed, duration, phase) {
   }
 }
 
+function siteName(id) {
+  const sites = review?.active ? review.record.taskSites : mission?.original.task_sites;
+  return padNames.get(id) ?? sites?.find((site) => site.id === id)?.name ?? id;
+}
+
 function targetLabel(id) {
-  return id + " · " + (padNames.get(id) ?? id);
+  return id + " · " + siteName(id);
 }
 
 function showRouteData(result, target) {
@@ -284,8 +298,8 @@ function showRouteData(result, target) {
   element("saving").toggleAttribute("data-positive", saving > 0);
   const start = mission.original.intent.start_id;
   const short = (id) => {
-    const name = padNames.get(id);
-    return name ? id + " " + name.replace(/^信息学部/, "").replace(/(?:起降坪|停机坪|巡检点|应急备降坪)$/, "") : id;
+    const name = siteName(id);
+    return name !== id ? id + " " + name.replace(/^信息学部/, "").replace(/(?:起降坪|停机坪|巡检点|应急备降坪)$/, "") : id;
   };
   text("mission-target", short(start) + " → " + short(target));
   element("mission-target").title = targetLabel(start) + " → " + targetLabel(target);
@@ -306,7 +320,7 @@ function installRoute(result, target, battery = 100, rerouted = false) {
   map.setRouteTargets(mission.original.intent.start_id, target);
   map.drawRoute(result.waypoints, rerouted);
   showRouteData(result, target);
-  ui.updatePlan(result, target, padNames.get(target));
+  ui.updatePlan(result, target, siteName(target));
   sim.load(result.waypoints, result.corridor, { battery, target });
   profile.setTrack(sim.track, result.corridor, rerouted ? "改航点" : mission.original.intent.start_id, target);
   profile.paint(frame);
@@ -321,6 +335,7 @@ function saveReview(next, outcome, endEvent) {
   if (endEvent) events.push({ at: duration, name: endEvent, position: next.coordinates, segmentIndex });
   review.setRecord({
     sceneVersion, duration, events, avoid: mission.avoid, battery: next.battery, startId: mission.original.intent.start_id,
+    taskSites: mission.original.task_sites,
     climbEnds: mission.climbEnds, landingStarts: mission.elapsedBeforeSegment + landingStart(sim.track),
     outcome: `${mission.original.intent.start_id} → ${mission.target} · ${outcome}`,
     segments: [...mission.segments.slice(0, -1), { ...mission.segments[segmentIndex], flown: sim.flownWaypoints(next) }],
@@ -347,12 +362,14 @@ function setReplayMode(active) {
   lastTelemetry = -Infinity;
   if (active) {
     ui.setMissionState("历史回放");
+    map.setTaskSites(review.record.taskSites);
     setTimeline(review.record.climbEnds, review.record.landingStarts, review.record.duration);
     review.sim.view = sim.view;
     review.rate = sim.rate;
   } else {
     document.body.dataset.view = sim.view;
     if (sim.view === "overview") map.resetView();
+    map.setTaskSites(mission.original.task_sites);
     map.setHazards(mission.volumes);
     map.drawRoute(mission.current.waypoints, mission.rerouted);
     map.setRouteTargets(mission.original.intent.start_id, mission.target);
@@ -388,21 +405,26 @@ function showDispatchNotice(result, query) {
 }
 
 function discardDraft() {
-  if (!draft) return;
-  draft = null;
+  if (!draft && !proposal) return;
+  draft = proposal = null;
   ui.restoreMission();
   map.clearPadFocus();
+  map.setTaskSites(mission?.original.task_sites);
+  map.setHazards(mission?.volumes ?? []);
   map.setRouteTargets(mission?.original.intent.start_id, mission?.target);
   map.drawRoute(mission?.current.waypoints ?? [], mission?.rerouted);
+  renderSpatialPicks();
 }
 
 function startMission(result) {
+  clearSpatialPicks();
   mission = {
-    original: result, hazards: [], volumes: [],
+    original: result, hazards: [], volumes: [...(result.task_zones ?? [])],
     avoid: new Set(result.intent.avoid_zone_ids), diverted: false, hold: false, elapsedBeforeSegment: 0,
     segments: [], events: [],
   };
   map.clearPadFocus();
+  map.setTaskSites(result.task_sites);
   installRoute(result, result.intent.end_id);
   if (sim.view === "overview") focusTaskRoute();
   sim.play();
@@ -430,7 +452,11 @@ function editDraft() {
 
 async function dispatch(query, { autoPlay = false, newTask = false } = {}) {
   if (busy || !sim || review?.active || isInFlight()) return;
-  if (newTask) clearClarification();
+  stopMapPick();
+  if (newTask) {
+    clearClarification();
+    clearSpatialPicks();
+  }
   const originalQuery = clarificationQuery ?? query;
   discardDraft();
   busy = "dispatch";
@@ -438,43 +464,27 @@ async function dispatch(query, { autoPlay = false, newTask = false } = {}) {
   ui.status("已发送指令，正在等候回复…");
   const path = "/api/agent/dispatch";
   const payload = { query, scene_version: sceneVersion, clarification_token: clarificationToken };
+  if (spatialPicks.start || spatialPicks.end || spatialPicks.avoid.length) payload.spatial = spatialPicks;
   const exchange = ui.beginExchange();
   try {
     const result = await api(path, payload, exchange);
     ui.status("已收到回复，正在逐步说明处理过程…");
     await ui.revealSteps(exchange, result.thought_steps, zoneNames);
+    if (result.status === "choose_endpoints") {
+      presentChoices(result, query);
+      return;
+    }
     if (result.status !== "planned") {
       showDispatchNotice(result, query);
       return;
     }
-    clearClarification();
-    ui.setMode(result.mode);
-    if (result.scene_version !== sceneVersion || !result.kpis.compliant) {
-      const message = "该航线未通过当前场景校验，请刷新后重新规划。";
-      ui.status(message, true);
-      return;
-    }
-    const actions = { confirm: confirmDraft, edit: editDraft, locate: (id) => map.focusPad(id) };
-    if (autoPlay && !(result.model_fallback && mission)) {
-      ui.showPlan(result, zoneNames, actions, true);
-      startMission(result);
-      ui.setInput("");
-      ui.status("应急演示已开始，进入巡航后可注入事件。");
-      return;
-    }
-    const { start_id, end_id } = result.intent;
     let editQuery = query;
     if (originalQuery !== query && !result.model_called) {
+      const { start_id, end_id } = result.intent;
       const supplemented = `从 ${start_id} 到 ${end_id}。${originalQuery}`;
       editQuery = supplemented.length <= ui.input.maxLength ? supplemented : originalQuery;
     }
-    draft = { result, query: editQuery };
-    setView("overview");
-    map.drawRoute(result.waypoints, false, true);
-    map.setRouteTargets(start_id, end_id);
-    ui.showPlan(result, zoneNames, actions);
-    ui.setInput("");
-    ui.status("航线待确认。核对任务后可开始仿真。");
+    presentDraft(result, editQuery, autoPlay);
   } catch (error) {
     discardDraft();
     await ui.revealSteps(exchange, error.steps);
@@ -487,6 +497,157 @@ async function dispatch(query, { autoPlay = false, newTask = false } = {}) {
     busy = null;
     refreshFlightState();
   }
+}
+
+function presentDraft(result, query, autoPlay = false) {
+  if (result.scene_version !== sceneVersion || !result.kpis.compliant) {
+    ui.status("该航线未通过当前场景校验，请刷新后重新规划。", true);
+    return;
+  }
+  clearClarification();
+  ui.setMode(result.mode);
+  const actions = { confirm: confirmDraft, edit: editDraft, locate: (id) => map.focusPad(id) };
+  if (autoPlay && !(result.model_fallback && mission)) {
+    ui.showPlan(result, zoneNames, actions, true);
+    startMission(result);
+    ui.setInput("");
+    ui.status("应急演示已开始，进入巡航后可注入事件。");
+    return;
+  }
+  proposal = null;
+  draft = { result, query };
+  element("spatial-input").open = false;
+  setView("overview");
+  renderSpatialPicks();
+  map.setTaskSites(result.task_sites);
+  map.setHazards(result.task_zones ?? []);
+  map.setRouteTargets(result.intent.start_id, result.intent.end_id);
+  map.drawRoute(result.waypoints, false, true);
+  ui.showPlan(result, zoneNames, actions);
+  ui.setInput("");
+  ui.status("航线待确认。核对任务后可开始仿真。");
+}
+
+function presentChoices(result, query) {
+  if (result.scene_version !== sceneVersion || !result.options.length) {
+    ui.status("候选与当前场景不匹配，请刷新后重新规划。", true);
+    return;
+  }
+  clearClarification();
+  ui.setMode(result.mode);
+  proposal = { result, query };
+  element("spatial-input").open = false;
+  setView("overview");
+  renderSpatialPicks();
+  ui.showChoices(result, {
+    preview: (option) => {
+      proposal.option = option;
+      map.clearPadFocus();
+      map.setTaskSites([option.start, option.end]);
+      map.setHazards(result.task_zones ?? []);
+      map.setRouteTargets(option.start.id, option.end.id);
+      map.drawRoute(option.waypoints, false, true);
+      focusTaskRoute();
+    },
+    confirm: confirmCandidate,
+    cancel: () => {
+      if (busy) return;
+      discardDraft();
+      ui.input.focus({ preventScroll: true });
+      ui.status("调整地点或选点后可重新规划。");
+      refreshFlightState();
+    },
+  });
+  ui.status(result.detail);
+}
+
+async function confirmCandidate(optionId) {
+  if (busy || !proposal || isInFlight() || review?.active) return;
+  const { result: choices, query } = proposal;
+  busy = "dispatch";
+  refreshFlightState();
+  const exchange = ui.beginExchange();
+  ui.status("正在复核所选起降点…");
+  try {
+    const result = await api("/api/agent/confirm-candidate", {
+      candidate_token: choices.candidate_token, option_id: optionId, scene_version: sceneVersion,
+    }, exchange);
+    void ui.revealSteps(exchange, result.thought_steps, zoneNames);
+    if (result.status === "planned") presentDraft(result, query);
+    else showDispatchNotice(result, query);
+  } catch (error) {
+    await ui.revealSteps(exchange, error.steps, zoneNames);
+    ui.status(plainDispatchText(error.message), true);
+  } finally {
+    busy = null;
+    refreshFlightState();
+  }
+}
+
+function renderSpatialPicks() {
+  const markers = ["start", "end"].flatMap((role) => spatialPicks[role]
+    ? [{ ...spatialPicks[role], name: pickLabels[role] }] : []);
+  for (const [index, area] of spatialPicks.avoid.entries()) {
+    markers.push({ ...area, name: `避让区 ${index + 1}` });
+  }
+  const list = markers.map(({ lon, lat, name, radius_m }) => `${name} ${lon.toFixed(5)}, ${lat.toFixed(5)}`
+    + (radius_m ? ` · 半径 ${radius_m} 米` : ""));
+  text("spatial-count", markers.length ? `已选 ${markers.length} 处` : "");
+  text("spatial-picks", list.join("；") || "也可在指令中填写 [经度, 纬度]。");
+  element("clear-spatial").hidden = !markers.length;
+  map?.showPickMarkers(draft || proposal ? [] : markers);
+}
+
+function stopMapPick() {
+  pickRole = undefined;
+  map?.pickLocation(null);
+  for (const button of pickButtons) button.setAttribute("aria-pressed", "false");
+}
+
+function clearSpatialPicks() {
+  stopMapPick();
+  spatialPicks = { avoid: [] };
+  renderSpatialPicks();
+}
+
+function beginMapPick(role) {
+  if (!sim || busy || review?.active || isInFlight()) return;
+  if (pickRole === role) {
+    stopMapPick();
+    ui.status("已取消地图点选。");
+    return;
+  }
+  const radius = element("avoid-radius");
+  const radiusMeters = radius.valueAsNumber;
+  if (role === "avoid" && (!radius.reportValidity() || !Number.isFinite(radiusMeters))) {
+    ui.status("请填写 5 至 250 米的避让半径。", true);
+    return;
+  }
+  if (role === "avoid" && spatialPicks.avoid.length >= 3) {
+    ui.status("每个任务最多可添加三处避让区。", true);
+    return;
+  }
+  discardDraft();
+  clearClarification();
+  ui.showGuide(false);
+  setView("overview");
+  pickRole = role;
+  for (const button of pickButtons) button.setAttribute("aria-pressed", String(button.dataset.mapPick === role));
+  ui.status(`在三维地图上点击${pickLabels[role]}，按退出键取消。`);
+  map.pickLocation((point) => {
+    if (!pickRole) return;
+    const [west, south, east, north] = map.bounds;
+    if (point.lon < west || point.lon > east || point.lat < south || point.lat > north) {
+      ui.status("该位置在场景范围外，请在校园场景内点选。", true);
+      return;
+    }
+    if (role === "avoid") spatialPicks.avoid.push({ ...point, radius_m: radiusMeters });
+    else spatialPicks[role] = point;
+    stopMapPick();
+    renderSpatialPicks();
+    ui.status("已记录地图位置。输入任务并规划航线后校验。");
+    ui.input.focus({ preventScroll: true });
+  });
 }
 
 async function replan(type) {
@@ -515,6 +676,7 @@ async function replan(type) {
     current_pos: before.coordinates,
     scene_version: sceneVersion,
     target_id: mission.target,
+    mission_token: mission.original.mission_token,
     mission_type: mission.current.corridor,
     emergency_type: type,
     ...(hazard && { dynamic_hazard: hazard }),
@@ -678,7 +840,7 @@ function focusTaskRoute() {
   const currentSim = review?.sim ?? sim;
   const waypoints = review?.active
     ? review.record.segments.slice(0, review.segmentIndex + 1).flatMap(({ flown }) => flown)
-    : draft?.result.waypoints ?? mission?.current.waypoints;
+    : proposal?.option?.waypoints ?? draft?.result.waypoints ?? mission?.current.waypoints;
   if (currentSim.view !== "overview") setView("overview");
   if (waypoints?.length) map.focusRoute(waypoints, document.querySelector(".map-overlay").clientWidth);
   else map.resetView();
@@ -712,7 +874,7 @@ playButton.addEventListener("click", () => {
 resetButton.addEventListener("click", () => {
   if (isInFlight() && !mission.hold) saveReview(frame, "任务中止 · 已重置仿真", "重置飞行");
   mission.hazards = [];
-  mission.volumes = [];
+  mission.volumes = [...(mission.original.task_zones ?? [])];
   mission.diverted = false;
   mission.hold = false;
   mission.elapsedBeforeSegment = 0;
@@ -720,6 +882,19 @@ resetButton.addEventListener("click", () => {
   installRoute(mission.original, mission.original.intent.end_id);
   ui.status("已返回起点。");
   refreshFlightState();
+});
+for (const button of pickButtons) button.addEventListener("click", () => beginMapPick(button.dataset.mapPick));
+element("clear-spatial").addEventListener("click", () => {
+  discardDraft();
+  clearSpatialPicks();
+  refreshFlightState();
+  ui.status("已清除地图选点和任务避让区。");
+});
+document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape" && pickRole) {
+    stopMapPick();
+    ui.status("已取消地图点选。");
+  }
 });
 windButton.addEventListener("click", () => replan("wind_gust"));
 batteryButton.addEventListener("click", () => replan("low_battery"));

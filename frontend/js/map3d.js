@@ -172,6 +172,8 @@ export class CampusMap {
     this.staticVolumes = [];
     this.buildingRoofs = [];
     this.padLabels = new Map();
+    this.taskSiteIds = [];
+    this.pickMarkers = [];
     this.dynamicVolumes = [];
     this.padFocus = this.viewer.entities.add({
       show: false,
@@ -238,6 +240,15 @@ export class CampusMap {
       }
     }, Cesium.ScreenSpaceEventType.MOUSE_MOVE);
     this.viewer.canvas.addEventListener("pointerleave", () => { this.tooltip.hidden = true; });
+    this.viewer.screenSpaceEventHandler.setInputAction(({ position }) => {
+      if (!this.locationPicker) return;
+      const { camera, scene } = this.viewer;
+      const ray = camera.getPickRay(position);
+      const hit = ray && scene.globe.pick(ray, scene);
+      if (!hit) return;
+      const { longitude, latitude } = Cesium.Cartographic.fromCartesian(hit);
+      this.locationPicker({ lon: Cesium.Math.toDegrees(longitude), lat: Cesium.Math.toDegrees(latitude) });
+    }, Cesium.ScreenSpaceEventType.LEFT_CLICK);
   }
 
   async load(data) {
@@ -260,56 +271,89 @@ export class CampusMap {
     }
     this.roadFeatures = data.roads?.features ?? [];
     this.layers.get("roads").show = false;
-    const pads = this.layers.get("vertiports").entities;
     for (const feature of data.vertiports.features) {
-      const { id, name, altitude, type } = feature.properties;
-      const tint = color(type === "emergency" ? "#97aeaf" : "#86d7cc");
-      const anchor = degrees(feature.geometry.coordinates, altitude + 7);
-      pads.add({
-        id,
-        name,
-        position: degrees(feature.geometry.coordinates, altitude + 1),
-        ellipse: {
-          height: altitude + 0.65,
-          semiMajorAxis: 11,
-          semiMinorAxis: 11,
-          material: tint.withAlpha(0.36),
-          outline: true,
-          outlineColor: tint,
-        },
-        point: { pixelSize: 7, color: tint, outlineColor: color("#172838"), outlineWidth: 1.5, disableDepthTestDistance: Number.POSITIVE_INFINITY },
-      });
-      const leader = pads.add({
-        position: anchor,
-        polyline: { positions: [degrees(feature.geometry.coordinates, altitude + 1), anchor], width: 1, material: tint.withAlpha(.4), arcType: Cesium.ArcType.NONE },
-        label: {
-          text: id,
-          font: `600 11px ${readoutFont}`,
-          fillColor: tint.withAlpha(.76),
-          style: Cesium.LabelStyle.FILL_AND_OUTLINE,
-          outlineColor: color("#101724"),
-          outlineWidth: 3,
-          pixelOffset: new Cesium.Cartesian2(0, -12),
-          disableDepthTestDistance: Number.POSITIVE_INFINITY,
-          showBackground: true,
-          backgroundColor: color("#111a26", 0.8),
-          backgroundPadding: new Cesium.Cartesian2(5, 3),
-        },
-      });
-      this.padLabels.set(id, { leader, anchor, tint });
+      this.addPad(feature.properties, feature.geometry.coordinates);
     }
     const zones = this.layers.get("nofly_zones").entities;
     for (const feature of data.nofly_zones.features) {
-      const { min_alt, max_alt } = feature.properties;
+      const { min_alt, max_alt, name, source_kind } = feature.properties;
+      const external = source_kind === "external";
       volume(zones, feature, {
         bottom: min_alt, top: max_alt,
-        fill: color("#ef4444", 0.20), outline: color("#ef7777", 0.82),
+        fill: color(external ? "#d9466c" : "#ef4444", 0.20),
+        outline: color(external ? "#f19db1" : "#ef7777", 0.82),
+        hoverText: (external ? "外部空域快照" : "场景围栏") + " · " + name,
       });
       this.staticVolumes.push(this.asVolume(feature, min_alt, max_alt));
     }
     this.drawGrid(this.layers.get("airspace").entities, data.airspace_layers);
     await Promise.all(Array.from(this.layers.values(), (layer) => this.viewer.dataSources.add(layer)));
     this.resetView();
+  }
+
+  addPad({ id, name, altitude, type }, coordinates) {
+    const pads = this.layers.get("vertiports").entities;
+    const tint = color(type === "task" ? "#93c5fd" : type === "emergency" ? "#97aeaf" : "#86d7cc");
+    const position = degrees(coordinates, altitude + 1);
+    const anchor = degrees(coordinates, altitude + 7);
+    pads.add({
+      id, name, position,
+      ellipse: {
+        height: altitude + 0.65, semiMajorAxis: 11, semiMinorAxis: 11,
+        material: tint.withAlpha(.36), outline: true, outlineColor: tint,
+      },
+      point: { pixelSize: 7, color: tint, outlineColor: color("#172838"), outlineWidth: 1.5, disableDepthTestDistance: Number.POSITIVE_INFINITY },
+      properties: { hoverText: name },
+    });
+    const leader = pads.add({
+      position: anchor,
+      polyline: { positions: [position, anchor], width: 1, material: tint.withAlpha(.4), arcType: Cesium.ArcType.NONE },
+      label: {
+        text: id, font: `600 11px ${readoutFont}`, fillColor: tint.withAlpha(.76),
+        style: Cesium.LabelStyle.FILL_AND_OUTLINE, outlineColor: color("#101724"), outlineWidth: 3,
+        pixelOffset: new Cesium.Cartesian2(0, -12), disableDepthTestDistance: Number.POSITIVE_INFINITY,
+        showBackground: true, backgroundColor: color("#111a26", .8), backgroundPadding: new Cesium.Cartesian2(5, 3),
+      },
+    });
+    this.padLabels.set(id, { leader, anchor, tint });
+  }
+
+  setTaskSites(sites = []) {
+    const pads = this.layers.get("vertiports").entities;
+    for (const id of this.taskSiteIds) {
+      pads.removeById(id);
+      pads.remove(this.padLabels.get(id).leader);
+      this.padLabels.delete(id);
+    }
+    this.taskSiteIds = [];
+    for (const { id, name, position } of sites) {
+      if (!id.startsWith("TMP-")) continue;
+      this.addPad({ id, name, type: "task", altitude: position.alt }, [position.lon, position.lat]);
+      this.taskSiteIds.push(id);
+    }
+    this.viewer.scene.requestRender();
+  }
+
+  pickLocation(handler) {
+    this.locationPicker = handler;
+    this.viewer.canvas.classList.toggle("picking-site", Boolean(handler));
+  }
+
+  showPickMarkers(markers) {
+    for (const marker of this.pickMarkers) this.viewer.entities.remove(marker);
+    this.pickMarkers = markers.map(({ lon, lat, name }) => this.viewer.entities.add({
+      position: degrees([lon, lat], this.elevation(lon, lat) + 1),
+      point: {
+        color: color("#93c5fd"), pixelSize: 8, outlineColor: color("#111927"),
+        outlineWidth: 2, disableDepthTestDistance: Number.POSITIVE_INFINITY,
+      },
+      label: {
+        text: name, font: `600 11px ${labelFont}`, fillColor: color("#e7eef8"),
+        showBackground: true, backgroundColor: color("#111927", .9),
+        pixelOffset: new Cesium.Cartesian2(0, -14), disableDepthTestDistance: Number.POSITIVE_INFINITY,
+      },
+    }));
+    this.viewer.scene.requestRender();
   }
 
   drawGrid(entities, layers) {
@@ -621,10 +665,12 @@ export class CampusMap {
     const entities = this.layers.get("hazards").entities;
     entities.removeAll();
     this.dynamicVolumes = features.map((feature) => {
-      const { min_alt, max_alt } = feature.properties;
+      const { min_alt, max_alt, reason, name } = feature.properties;
+      const task = reason === "task_avoidance";
       volume(entities, feature, {
-        bottom: min_alt, top: max_alt, fill: color("#f59e0b", .22), outline: color("#fbbf24"),
-        hoverText: "临时禁飞区 · " + min_alt.toFixed(1) + "–" + max_alt.toFixed(1) + " 米",
+        bottom: min_alt, top: max_alt,
+        fill: color(task ? "#8b5cf6" : "#f59e0b", .22), outline: color(task ? "#c4b5fd" : "#fbbf24"),
+        hoverText: name + " · " + min_alt.toFixed(1) + "–" + max_alt.toFixed(1) + " 米",
       });
       return this.asVolume(feature, min_alt, max_alt);
     });

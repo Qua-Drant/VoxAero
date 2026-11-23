@@ -13,7 +13,9 @@ from openai import OpenAI
 from backend.config import AIRSPACE_LAYERS, DATA_DIR, FRONTEND_DIR, LLMSettings, STUDY_BOUNDS
 from backend.core.agent import AgentError, DispatchAgent
 from backend.core.airspace import Airspace
-from backend.schemas import DispatchNotice, DispatchRequest, DispatchResult, ReplanRequest, ReplanResult
+from backend.schemas import (
+    ConfirmSpatialRequest, DispatchNotice, DispatchRequest, DispatchResult, ReplanRequest, ReplanResult, SpatialChoices,
+)
 
 
 def create_app(
@@ -58,14 +60,20 @@ def create_app(
         return version
 
     @app.post("/api/agent/dispatch")
-    def dispatch(payload: DispatchRequest, request: Request) -> DispatchResult | DispatchNotice:
+    def dispatch(payload: DispatchRequest, request: Request) -> DispatchResult | DispatchNotice | SpatialChoices:
         version = current_version(request, payload.scene_version)
-        result = request.app.state.agent.dispatch(payload.query, payload.clarification_token)
+        result = request.app.state.agent.dispatch(payload.query, payload.clarification_token, payload.spatial)
         result = result.model_copy(update={"scene_version": version})
         if isinstance(result, DispatchNotice) and result.status in {"needs_clarification", "constraint_conflict"}:
             status = 422 if result.status == "needs_clarification" else 409
             return JSONResponse(status_code=status, content=result.model_dump(mode="json"))
         return result
+
+    @app.post("/api/agent/confirm-candidate")
+    def confirm_candidate(payload: ConfirmSpatialRequest, request: Request) -> DispatchResult | DispatchNotice:
+        version = current_version(request, payload.scene_version)
+        result = request.app.state.agent.spatial.confirm(payload)
+        return result.model_copy(update={"scene_version": version})
 
     @app.post("/api/agent/replan")
     def replan(payload: ReplanRequest, request: Request) -> ReplanResult:

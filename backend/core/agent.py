@@ -14,16 +14,17 @@ from openai import OpenAI, OpenAIError
 from shapely.geometry.polygon import orient
 
 from backend.config import LLMSettings, MISSION_LAYERS
-from backend.core.airspace import Airspace, Obstacle
+from backend.core.airspace import Airspace, Obstacle, Vertiport
 from backend.core.intent import (
     ALT_CONTEXT, CHAT, CLARIFY_INTENT_MESSAGE, DEADLINE, DISPATCH_WORDS, HELP, HELP_MESSAGE, LOW_FLIGHT, MEASUREMENT,
     ROUTE_WORDS, SCOPE_MESSAGE, UNSUPPORTED_WAYPOINT, intersect_limits, parse_constraints,
 )
 from backend.core.planner import NoRouteError, RoutePlanner
+from backend.core.spatial_dispatch import SpatialDispatch
 from backend.schemas import (
     AssessedRoute, CruiseLimits, DispatchCandidate, DispatchConstraints, DispatchIntent, DispatchNotice,
     DispatchNoticeType, DispatchResult, DynamicHazard, HazardFeature, HazardPolygon, LLMMode, MissionType,
-    NoFlyProperties, Position, ReplanRequest, ReplanResult, RouteKPIs, RoutePlan, ThoughtStep,
+    NoFlyProperties, Position, ReplanRequest, ReplanResult, RouteKPIs, RoutePlan, SpatialChoices, SpatialOptions, ThoughtStep,
 )
 
 PAD_ALIASES = {
@@ -115,6 +116,7 @@ class DispatchAgent:
         self.pad_pattern = re.compile("|".join(alternatives) or r"(?!)", re.IGNORECASE)
         self.pending: OrderedDict[str, PendingDispatch] = OrderedDict()
         self.pending_lock = Lock()
+        self.spatial = SpatialDispatch(self)
 
     def _locations(self, query: str) -> str:
         locations = AVOID_PATTERN.sub("", query)
@@ -186,11 +188,19 @@ class DispatchAgent:
             f"Vertiports: {self.pad_names}. No-fly zones: {self.zone_names}. "
             "Avoidance applies only to explicitly requested zones. Preserve the requested mission type."
         )
+        intent = ModelDispatchIntent.model_validate_json(self.request_model(query, function, prompt))
+        if any(pad is not None and pad not in self.pad_names for pad in (intent.start_id, intent.end_id)):
+            raise ValueError("Unknown vertiport from model")
+        if any(zone_id not in self.zone_names for zone_id in intent.avoid_zone_ids):
+            raise ValueError("Unknown avoid zone from model")
+        return intent
+
+    def request_model(self, query: str, function: dict, prompt: str) -> str:
         options = dict(
             model=self.settings.model,
             messages=[{"role": "system", "content": prompt}, {"role": "user", "content": query}],
             tools=[{"type": "function", "function": function}],
-            tool_choice={"type": "function", "function": {"name": TOOL_NAME}},
+            tool_choice={"type": "function", "function": {"name": function["name"]}},
         )
         if self.client is None:
             with OpenAI(
@@ -204,14 +214,9 @@ class DispatchAgent:
         if not calls or len(calls) != 1 or calls[0].type != "function":
             raise ValueError("Expected a dispatch intent tool call")
         function_call = calls[0].function
-        if function_call is None or function_call.name != TOOL_NAME:
+        if function_call is None or function_call.name != function["name"]:
             raise ValueError("Unexpected dispatch intent tool name")
-        intent = ModelDispatchIntent.model_validate_json(function_call.arguments)
-        if any(pad is not None and pad not in self.pad_names for pad in (intent.start_id, intent.end_id)):
-            raise ValueError("Unknown vertiport from model")
-        if any(zone not in self.zone_names for zone in intent.avoid_zone_ids):
-            raise ValueError("Unknown avoid zone from model")
-        return intent
+        return function_call.arguments
 
     def _ground_model(self, query: str, local: DispatchCandidate, model: ModelDispatchIntent) -> DispatchCandidate:
         locations = self._locations(query)
@@ -238,8 +243,8 @@ class DispatchAgent:
 
     def plan_3d_route(
         self,
-        start: str | Position,
-        end_id: str,
+        start: str | Vertiport | Position,
+        end_id: str | Vertiport,
         mission_type: MissionType,
         extra_nofly_zones: tuple[DynamicHazard, ...] = (),
         *,
@@ -252,7 +257,9 @@ class DispatchAgent:
         kpis, flight_seconds = self._metrics(route, mission_type, start, end_id, extra_nofly_zones, avoid_zone_ids)
         return AssessedRoute(waypoints=route.waypoints, distance_m=route.distance_m, kpis=kpis, flight_seconds=flight_seconds)
 
-    def dispatch(self, query: str, clarification_token: str | None = None) -> DispatchResult | DispatchNotice:
+    def dispatch(
+        self, query: str, clarification_token: str | None = None, spatial: SpatialOptions | None = None
+    ) -> DispatchResult | DispatchNotice | SpatialChoices:
         query = unicodedata.normalize("NFKC", query).strip()
         steps: list[ThoughtStep] = []
         _add(steps, "action", "classify_dispatch · 本地识别使用帮助、调度请求及补答")
@@ -261,10 +268,13 @@ class DispatchAgent:
         if CHAT.search(query):
             return self._notice(steps, "out_of_scope", SCOPE_MESSAGE)
 
+        if self.spatial.is_airspace_query(query):
+            return self.spatial.inspect_airspace(query, spatial, steps)
         locations = self._locations(query)
         mentioned = self._pad_mentions(locations)
         task_text = self.pad_pattern.sub("地点", locations)
-        is_request = bool(DISPATCH_WORDS.search(task_text) or mentioned and ROUTE_WORDS.search(task_text))
+        use_spatial = self.spatial.applies(query, spatial, mentioned)
+        is_request = bool(DISPATCH_WORDS.search(task_text) or (mentioned or use_spatial) and ROUTE_WORDS.search(task_text))
         if clarification_token and self._is_pad_reply(query, mentioned):
             pending = self._pending_for(clarification_token)
             if len(mentioned) == 1 or pending is None or not (pending.candidate.start_id or pending.candidate.end_id):
@@ -277,6 +287,8 @@ class DispatchAgent:
         _add(steps, "thought", "提取有输入依据的起降坪、任务类型与约束。")
         if UNSUPPORTED_WAYPOINT.search(locations):
             return self._notice(steps, "constraint_conflict", "当前支持单段配送或巡检，请直接指定起点和终点。")
+        if use_spatial:
+            return self.spatial.propose(query, spatial or SpatialOptions(), steps)
         try:
             local = self.parse_dispatch_intent(query)
         except ValueError as exc:
@@ -438,19 +450,32 @@ class DispatchAgent:
             intent=intent, mode=mode, model_called=model_called, model_fallback=model_fallback,
             corridor=corridor, start_name=self.pad_names[intent.start_id], end_name=self.pad_names[intent.end_id],
             waypoints=route.waypoints, kpis=route.kpis, thought_steps=steps,
+            airspace_check=self.airspace.check_airspace(route.waypoints, route.flight_seconds),
         )
 
     def replan_emergency(self, request: ReplanRequest) -> ReplanResult:
         steps: list[ThoughtStep] = []
         _add(steps, "thought", "保持飞行当前位置，优先选择合规的应急航线。")
         _add(steps, "action", f"replan_emergency · {request.emergency_type}")
-        if request.target_id not in self.pad_names:
+        task = self.spatial.active_task(request.mission_token) if request.mission_token else None
+        if request.mission_token and task is None:
+            raise _error(steps, "本任务的临时起降点会话已失效，请重新规划。", 409)
+        pads = self.airspace.vertiports | (task.pads if task else {})
+        if task:
+            request = request.model_copy(update={
+                "avoid_zone_ids": tuple(dict.fromkeys((*task.intent.avoid_zone_ids, *request.avoid_zone_ids))),
+                "cruise_limits": intersect_limits(task.intent.constraints.cruise, request.cruise_limits),
+            })
+        if request.target_id not in pads:
             raise _error(steps, "原目的地不在起降坪清单内。", 422)
         if any(zone_id not in self.zone_names for zone_id in request.avoid_zone_ids):
             raise _error(steps, "指定的禁飞区编号不在空域清单内。", 422)
 
-        corridor = request.mission_type or ("inspection" if request.current_pos.alt >= 60 else "delivery")
-        hazards = request.active_hazards
+        if task and request.target_id == task.intent.end_id:
+            corridor = "inspection" if task.intent.prefer_high_altitude else task.intent.mission_type
+        else:
+            corridor = request.mission_type or ("inspection" if request.current_pos.alt >= 60 else "delivery")
+        hazards = (task.hazards if task else ()) + request.active_hazards
         feature = None
         if request.dynamic_hazard is not None:
             hazards += (request.dynamic_hazard,)
@@ -469,12 +494,12 @@ class DispatchAgent:
         try:
             if request.emergency_type == "low_battery":
                 _add(steps, "action", "plan_3d_route · 比较可达应急坪的合规航线")
-                route, target, corridor = self._divert(request, corridor, hazards)
-                _add(steps, "observation", f"选定最短可达备降航线 · {target} {self.pad_names[target]}。")
+                route, target, corridor = self._divert(request, corridor, hazards, pads)
+                _add(steps, "observation", f"选定最短可达备降航线 · {target} {pads[target].properties.name}。")
             else:
                 _add(steps, "action", f"plan_3d_route · 从当前坐标绕飞至 {target}")
                 route = self.plan_3d_route(
-                    request.current_pos, target, corridor, hazards, avoid_zone_ids=request.avoid_zone_ids,
+                    request.current_pos, pads[target], corridor, hazards, avoid_zone_ids=request.avoid_zone_ids,
                     cruise_limits=request.cruise_limits,
                 )
         except NoRouteError as exc:
@@ -493,27 +518,28 @@ class DispatchAgent:
             emergency_type=request.emergency_type, original_target_id=request.target_id, target_id=target,
             corridor=corridor, waypoints=route.waypoints, kpis=route.kpis, thought_steps=steps,
             temporary_nofly_zone=feature,
+            airspace_check=self.airspace.check_airspace(route.waypoints, route.flight_seconds),
         )
 
     def _divert(
-        self, request: ReplanRequest, corridor: MissionType, hazards: tuple[DynamicHazard, ...]
+        self, request: ReplanRequest, corridor: MissionType, hazards: tuple[DynamicHazard, ...], pads: dict[str, Vertiport]
     ) -> tuple[AssessedRoute, str, MissionType]:
         emergency, other = [], []
-        for pad_id, pad in self.airspace.vertiports.items():
-            (emergency if pad.properties.type == "emergency" else other).append(pad_id)
+        for pad in pads.values():
+            (emergency if pad.properties.type == "emergency" else other).append(pad)
         corridors = (corridor, "inspection" if corridor == "delivery" else "delivery")
-        for pads in (emergency, other):
+        for group in (emergency, other):
             candidates = []
-            for pad_id in pads:
+            for pad in group:
                 for candidate_layer in corridors:
                     try:
                         route = self.plan_3d_route(
-                            request.current_pos, pad_id, candidate_layer, hazards,
+                            request.current_pos, pad, candidate_layer, hazards,
                             avoid_zone_ids=request.avoid_zone_ids, cruise_limits=request.cruise_limits,
                         )
                     except NoRouteError:
                         continue
-                    candidates.append((route, pad_id, candidate_layer))
+                    candidates.append((route, pad.properties.id, candidate_layer))
             if candidates:
                 return min(candidates, key=lambda candidate: candidate[0].distance_m)
         raise NoRouteError("No reachable diversion pad")
@@ -522,13 +548,15 @@ class DispatchAgent:
         self,
         route: RoutePlan,
         corridor: MissionType,
-        start: str | Position,
-        end_id: str,
+        start: str | Vertiport | Position,
+        end_id: str | Vertiport,
         hazards: tuple[DynamicHazard, ...],
         avoid_zone_ids: tuple[str, ...],
     ) -> tuple[RouteKPIs, float]:
-        start_roof = self.airspace.vertiports[start].roof_obstacle if isinstance(start, str) else None
-        end_roof = self.airspace.vertiports[end_id].roof_obstacle
+        start_pad = self.airspace.vertiports[start] if isinstance(start, str) else start
+        start_roof = start_pad.roof_obstacle if isinstance(start_pad, Vertiport) else None
+        end_pad = self.airspace.vertiports[end_id] if isinstance(end_id, str) else end_id
+        end_roof = end_pad.roof_obstacle
         positions = [self.airspace.frame.to_local(point) for point in route.waypoints]
         field, _ = self.airspace.with_hazards(hazards, avoid_zone_ids)
         elapsed = 0.0
