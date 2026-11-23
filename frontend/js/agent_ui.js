@@ -14,7 +14,7 @@ const ACTION_STEPS = {
   replan_emergency: ["做应急", "根据突发情况，重新选择可以飞的路线。"],
 };
 const decimal = (value) => value.toFixed(1);
-const CORRIDORS = { delivery: "30–60 m", inspection: "60–90 m" };
+const CORRIDORS = { delivery: "30–60 米", inspection: "60–90 米" };
 const number = new Intl.NumberFormat("zh-CN", { minimumFractionDigits: 1, maximumFractionDigits: 1 });
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -23,7 +23,7 @@ export function plainDispatchText(content) {
     return "平台已返回回复，请查看任务状态。";
   }
   return content
-    .replace(/(\d+(?:\.\d+)?)\s+m\b/g, (_, meters) => Number(meters).toFixed(1) + " m")
+    .replace(/(\d+(?:\.\d+)?)\s+m\b/g, (_, meters) => Number(meters).toFixed(1) + " 米")
     .replaceAll("起降坪", "起降点")
     .replaceAll("候选航线", "找到的路线")
     .replaceAll("合规航线", "符合飞行要求的路线")
@@ -59,8 +59,8 @@ function readableStep({ role, content }) {
 
 function altitudeText(limits) {
   const parts = [];
-  if (limits.min_alt !== null) parts.push(`${limits.min_exclusive ? ">" : "≥"} ${number.format(limits.min_alt)} m`);
-  if (limits.max_alt !== null) parts.push(`${limits.max_exclusive ? "<" : "≤"} ${number.format(limits.max_alt)} m`);
+  if (limits.min_alt !== null) parts.push(`${limits.min_exclusive ? ">" : "≥"} ${number.format(limits.min_alt)} 米`);
+  if (limits.max_alt !== null) parts.push(`${limits.max_exclusive ? "<" : "≤"} ${number.format(limits.max_alt)} 米`);
   return parts.join(" 且 ");
 }
 
@@ -82,7 +82,7 @@ function planRequirements({ intent, waypoints, kpis }, zoneNames) {
   }
   if (preferred_deadline_seconds !== null) {
     const missed = kpis.estimated_seconds > preferred_deadline_seconds;
-    rows.push({ text: `到达时限偏好 ${number.format(preferred_deadline_seconds)} s${missed ? " · 预计超时" : ""}`, warning: missed });
+    rows.push({ text: `到达时限偏好 ${number.format(preferred_deadline_seconds)} 秒${missed ? " · 预计超时" : ""}`, warning: missed });
   }
   return rows.length ? rows : [{ text: "采用默认空域与建筑避障规则" }];
 }
@@ -245,7 +245,7 @@ export class AgentUI {
           ? `确认${intent.mission_type === "inspection" ? "巡检" : "配送"}任务 · ${intent.start_id} → ${intent.end_id}`
           : `重新研判当前机位与目的地 ${body.target_id}`],
         ["约束核验", checked?.text ?? `航层 ${corridor} · 避开禁飞区`],
-        ["航线生成", `生成 ${decimal(kpis.distance_m)} m 避障三维航迹`],
+        ["航线生成", `生成 ${decimal(kpis.distance_m)} 米 避障三维航迹`],
       ]);
     } else if (body?.detail) {
       this.setTraceSummary(exchange, [[RESPONSE_LABELS[body.status] ?? "调度反馈", plainDispatchText(body.detail)]]);
@@ -312,11 +312,11 @@ export class AgentUI {
     part("corridor").textContent = CORRIDORS[result.corridor];
     part("compliance").textContent = kpis.compliant
       ? `${Math.round(kpis.compliance_percent)}% · 校验 ${zoneNames.size + (result.temporary_nofly_zone ? 1 : 0)} 区` : "未通过";
-    part("clearance").textContent = kpis.min_clearance_m == null ? "—" : `≥ ${(Math.floor(kpis.min_clearance_m * 10) / 10).toFixed(1)} m`;
+    part("clearance").textContent = kpis.min_clearance_m == null ? "—" : `≥ ${(Math.floor(kpis.min_clearance_m * 10) / 10).toFixed(1)} 米`;
     part("clearance").title = "规划航段距最近建筑或禁飞区包络的最小净空";
     part("source").textContent = !intent ? "本地应急规划" : result.model_fallback ? "本地规则兜底"
-      : result.mode === "live_llm" ? "LLM 语义校验" : "本地规则";
-    part("kpis").textContent = `规划航程 ${decimal(kpis.distance_m)} m · 预计 ${decimal(kpis.estimated_seconds)} s`;
+      : result.mode === "live_llm" ? "模型识别" : "本地规则";
+    part("kpis").textContent = `规划航程 ${decimal(kpis.distance_m)} 米 · 预计 ${decimal(kpis.estimated_seconds)} 秒`;
   }
 
   setMissionState(label, tone = "neutral") {

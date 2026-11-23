@@ -1,8 +1,6 @@
 const CYAN = "#38bdf8";
 const TEXT = "#f8fafc";
 const MUTED = "#9baabd";
-const SAFE = "#34d399";
-const DANGER = "#ff858e";
 const typography = getComputedStyle(document.documentElement);
 const READOUT_FONT = typography.getPropertyValue("--font-mono").trim() || "monospace";
 const LABEL_FONT = typography.getPropertyValue("--font-sans").trim() || "system-ui, sans-serif";
@@ -19,11 +17,12 @@ function line(ctx, points) {
   ctx.stroke();
 }
 
-function text(ctx, value, x, y, { color = TEXT, size = 13, weight = 650, align = "left", font = READOUT_FONT } = {}) {
+function text(ctx, value, x, y, { color = TEXT, size = 13, weight = 650, align = "left", font = READOUT_FONT, maxWidth } = {}) {
   ctx.font = `${weight} ${size}px ${font}`;
   ctx.textAlign = align;
   ctx.fillStyle = color;
-  ctx.fillText(value, x, y);
+  if (maxWidth === undefined) ctx.fillText(value, x, y);
+  else ctx.fillText(value, x, y, maxWidth);
 }
 
 function plate(ctx, x, y, width, height, tint = "#79b5dea6") {
@@ -44,21 +43,16 @@ function drawTape(ctx, { x, y, width, height, right, name, value, unit, step, ra
   const bottom = y + height / 2;
   const rail = right ? x + width - 13 : x + 13;
   const inward = right ? -1 : 1;
-  const readoutHeight = compact ? 40 : 36;
-  const gap = 8;
-  plate(ctx, x, top - readoutHeight - gap, width, readoutHeight);
-  if (compact) {
-    text(ctx, name, x + width / 2, top - gap - 28, { color: MUTED, size: 10, align: "center", font: LABEL_FONT });
-    text(ctx, value.toFixed(1) + unit, x + width / 2, top - gap - 12,
-      { color: CYAN, size: 12, weight: 740, align: "center" });
-  } else {
-    const baseline = top - gap - readoutHeight / 2;
-    const rightEdge = x + width - 9;
-    text(ctx, name, x + 9, baseline, { color: MUTED, size: 11, font: LABEL_FONT });
-    text(ctx, unit, rightEdge, baseline + 2, { color: MUTED, size: 11, align: "right", font: LABEL_FONT });
-    text(ctx, value.toFixed(1), rightEdge - ctx.measureText(unit).width - 4, baseline,
-      { color: CYAN, size: 17, weight: 740, align: "right" });
-  }
+  const readoutHeight = compact ? 36 : 43;
+  const readoutY = top - readoutHeight - 8;
+  const center = x + width / 2;
+  plate(ctx, x, readoutY, width, readoutHeight);
+  text(ctx, name, center, readoutY + 10, {
+    color: MUTED, size: compact ? 10 : 11, align: "center", font: LABEL_FONT, maxWidth: width - 8,
+  });
+  text(ctx, value.toFixed(1) + " " + unit, center, readoutY + readoutHeight * .69, {
+    color: CYAN, size: compact ? 11 : 15, weight: 700, align: "center", maxWidth: width - 8,
+  });
   plate(ctx, x, top, width, height, "#6a9ecb91");
   const inset = 13;
   const halfScale = height / 2 - inset;
@@ -162,54 +156,59 @@ function drawPitch(ctx, x, y, width, height, pitch) {
   ctx.restore();
 }
 
-function drawTelemetry(ctx, x, y, battery, clearance, low, alarm, compact) {
-  const width = compact ? 248 : 306;
-  const height = compact ? 33 : 42;
-  plate(ctx, x, y, width, height, "#65bbd4c0");
-  const middle = y + height / 2;
-  const batteryWidth = compact ? 28 : 35;
-  const start = x + 9;
-  ctx.strokeStyle = low ? DANGER : CYAN;
-  ctx.lineWidth = 1;
-  ctx.strokeRect(start, middle - 6, batteryWidth, 12);
-  line(ctx, [[start + batteryWidth + 2, middle - 3], [start + batteryWidth + 2, middle + 3]]);
-  const segmentWidth = (batteryWidth - 8) / 4;
-  for (let i = 0; i < 4; i++) {
-    ctx.fillStyle = low ? DANGER : CYAN;
-    ctx.globalAlpha = battery > i * 25 ? 1 : .19;
-    ctx.fillRect(start + 2 + i * (segmentWidth + 1), middle - 4, segmentWidth, 8);
-  }
-  ctx.globalAlpha = 1;
-  const textX = start + batteryWidth + 10;
-  text(ctx, "BAT", textX, middle, { color: MUTED, size: compact ? 10 : 11, font: LABEL_FONT });
-  text(ctx, Math.round(battery) + "%", textX + 25, middle,
-    { color: low ? DANGER : CYAN, size: compact ? 13 : 16, weight: 750 });
-  const divider = x + (compact ? 110 : 132);
-  ctx.strokeStyle = "#9fc7e482";
-  line(ctx, [[divider, y + 7], [divider, y + height - 7]]);
-  text(ctx, "CLEARANCE", divider + 10, middle, { color: MUTED, size: compact ? 10 : 11, font: LABEL_FONT });
-  text(ctx, clearance === null ? "—" : clearance.toFixed(1) + " m", x + width - 10, middle,
-    { color: alarm ? DANGER : CYAN, size: compact ? 12 : 16, weight: 750, align: "right" });
+function setText(node, value) {
+  if (node.textContent !== value) node.textContent = value;
 }
 
 export class FlightHUD {
   constructor(canvas) {
     this.canvas = canvas;
     this.context = canvas.getContext("2d");
-    this.reducedMotion = matchMedia("(prefers-reduced-motion: reduce)");
-    new ResizeObserver(() => this.draw()).observe(canvas);
+    this.overlay = canvas.parentElement;
+    this.header = this.overlay.querySelector(".hud-header");
+    this.phase = document.getElementById("hud-phase");
+    this.alert = document.getElementById("hud-alert");
+    this.readouts = document.getElementById("hud-readouts");
+    this.battery = document.getElementById("hud-battery");
+    this.meter = document.getElementById("hud-meter");
+    this.clearance = document.getElementById("hud-clearance");
+
+    const layout = new ResizeObserver(() => {
+      this.headerBottom = this.header.offsetTop + this.header.offsetHeight;
+      const rail = this.readouts.getBoundingClientRect();
+      this.readoutsTop = rail.height ? rail.top - this.canvas.getBoundingClientRect().top : null;
+      this.draw();
+    });
+    layout.observe(canvas);
+    layout.observe(this.header);
+    layout.observe(this.readouts.parentElement);
   }
 
   update(active, frame, clearance) {
-    this.canvas.hidden = !active;
+    this.overlay.hidden = !active;
+    this.readouts.hidden = !active;
     this.frame = frame;
-    this.clearance = clearance;
-    if (active) this.draw();
+    if (!active) return;
+
+    const alarm = !frame.onGround && clearance !== null && clearance < 12;
+    const low = !frame.onGround && frame.battery < 18;
+    const phase = frame.complete ? "已停机" : frame.onGround ? "地面待命" : PHASE_LABELS[frame.leg?.phase] ?? "飞行";
+    const warnings = [alarm && "净空过近", low && "低电量"].filter(Boolean);
+    setText(this.phase, phase);
+    setText(this.alert, warnings.join(" · ") || (frame.onGround ? "地面状态" : clearance === null ? "等待净空数据" : "净空正常"));
+    this.alert.dataset.tone = warnings.length ? "warn" : frame.onGround || clearance === null ? "neutral" : "normal";
+    this.alert.toggleAttribute("data-live-warning", Boolean(frame.playing && warnings.length));
+    setText(this.battery, Math.round(frame.battery) + "%");
+    setText(this.clearance, clearance === null ? "—" : clearance.toFixed(1) + " 米");
+    this.meter.value = frame.battery;
+    this.readouts.toggleAttribute("data-low", low);
+    this.readouts.toggleAttribute("data-clearance-alert", alarm);
+    this.draw();
   }
 
   draw() {
-    if (this.canvas.hidden || !this.frame) return;
-    const { canvas, context: ctx, frame, clearance } = this;
+    if (this.overlay.hidden || !this.frame) return;
+    const { canvas, context: ctx, frame } = this;
     const width = canvas.clientWidth;
     const height = canvas.clientHeight;
     if (!width || !height) return;
@@ -227,39 +226,18 @@ export class FlightHUD {
     ctx.lineCap = "round";
 
     const compact = width < 630;
-    const margin = compact ? 9 : 21;
+    const margin = compact ? 10 : 20;
     const centerX = width / 2;
-    const centerY = height * .50;
-    const tapeWidth = compact ? 60 : 114;
-    const tapeHeight = Math.min(height * .47, 365);
-    const alarm = !frame.onGround && clearance !== null && clearance < 12;
-    const low = frame.battery < 18;
+    const tapeWidth = compact ? 65 : 112;
+    const tapeHeight = Math.min(height * .42, 365);
+    const centerY = Math.min(height * .48, (this.readoutsTop ?? height) - 10 - tapeHeight / 2);
+    const headingY = Math.max((this.headerBottom || 53) + 16, height * .13);
 
-    const phase = frame.complete ? "已抵达" : frame.onGround ? "地面待命" : PHASE_LABELS[frame.leg?.phase] ?? "飞行";
-    const call = compact ? "VOXAERO-01  ·  FPV" : "CALLSIGN  VOXAERO-01    /    FPV AR-HUD    /    " + phase;
-    plate(ctx, margin, 13, compact ? 164 : 399, 31);
-    text(ctx, call, margin + 10, 28, { size: compact ? 11 : 13 });
-    const status = [alarm && "净空过近", low && "低电量"].filter(Boolean).join(" / ")
-      || (frame.onGround ? phase : clearance === null ? "净空待测" : "净空正常");
-    const tint = alarm || low ? DANGER : frame.onGround || clearance === null ? MUTED : SAFE;
-    const liveBlink = frame.playing && !this.reducedMotion.matches && Math.floor(performance.now() / 450) % 2 !== 0;
-    ctx.globalAlpha = (alarm || low) && liveBlink ? .68 : 1;
-    const statusWidth = compact ? 103 : 140;
-    const statusX = width - margin - statusWidth;
-    plate(ctx, statusX, 45, statusWidth, 28, tint);
-    text(ctx, status, statusX + statusWidth / 2, 59,
-      { color: tint, size: compact ? 11 : 13, align: "center", font: LABEL_FONT });
-    ctx.globalAlpha = 1;
-
-    drawHeading(ctx, centerX, Math.max(77, height * .133), Math.min(width * .255, 220), frame.heading ?? 0, compact);
-    drawPitch(ctx, centerX, centerY, compact ? width * .72 : width, height, (frame.pitch ?? 0) * 180 / Math.PI);
+    drawHeading(ctx, centerX, headingY, Math.min(width * .255, 220), frame.heading ?? 0, compact);
+    drawPitch(ctx, centerX, centerY, compact ? width * .66 : width, height, (frame.pitch ?? 0) * 180 / Math.PI);
     drawTape(ctx, { x: margin, y: centerY, width: tapeWidth, height: tapeHeight, right: false,
-      name: "AGL", value: frame.agl, unit: "m", step: 5, range: 35, compact });
+      name: "离地高度", value: frame.agl, unit: "米", step: 5, range: 35, compact });
     drawTape(ctx, { x: width - margin - tapeWidth, y: centerY, width: tapeWidth, height: tapeHeight, right: true,
-      name: "SPD", value: frame.speed, unit: "m/s", step: 1, range: 7, compact });
-
-    // Leave the bottom band clear for the flight controls.
-    const telemetryY = height - (compact ? 135 : 110);
-    drawTelemetry(ctx, margin, telemetryY, frame.battery, clearance, low, alarm, compact);
+      name: "飞行速度", value: frame.speed, unit: "米/秒", step: 1, range: 7, compact });
   }
 }

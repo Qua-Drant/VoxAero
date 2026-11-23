@@ -8,10 +8,10 @@
   <link rel="stylesheet" href="https://cesium.com/downloads/cesiumjs/releases/1.119/Build/Cesium/Widgets/widgets.css">
   <link rel="preload" href="/assets/fonts/Inter-Latin.woff2" as="font" type="font/woff2" crossorigin>
   <link rel="stylesheet" href="/css/tokens.css?v=12">
-  <link rel="stylesheet" href="/css/style.css?v=12">
+  <link rel="stylesheet" href="/css/style.css?v=14">
   <script src="https://cdn.tailwindcss.com/3.4.17" defer></script>
   <script src="https://cesium.com/downloads/cesiumjs/releases/1.119/Build/Cesium/Cesium.js" defer></script>
-  <script src="/js/app.js?v=12" type="module"></script>
+  <script src="/js/app.js?v=14" type="module"></script>
 </head>
 <body>
   <svg class="icon-definitions" aria-hidden="true" focusable="false" width="0" height="0">
@@ -48,10 +48,10 @@
     <div class="view-switch segmented" role="group" aria-label="飞行视角">
       <button type="button" data-view="overview" aria-pressed="true" disabled>全局总览</button>
       <button type="button" data-view="follow" aria-pressed="false" disabled>第三人称跟随</button>
-      <button type="button" data-view="fpv" aria-pressed="false" disabled>FPV AR-HUD</button>
+      <button type="button" data-view="fpv" aria-pressed="false" disabled>第一人称</button>
     </div>
     <div class="header-end">
-      <div id="system-status" class="system-status mono"><span class="status-dot"></span><span id="sim-live">SIM INIT</span><time id="sim-clock">--:--:--</time></div>
+      <div id="system-status" class="system-status"><span class="status-dot"></span><span id="sim-live">仿真加载中</span><time id="sim-clock" class="mono">--:--:--</time></div>
       <button id="emergency-trigger" class="emergency-trigger" type="button" popovertarget="emergency-actions" hidden><svg class="icon" aria-hidden="true"><use href="#icon-warning"/></svg>突发应急</button>
       <details id="emergency-menu" class="emergency">
         <summary class="emergency-trigger"><svg class="icon" aria-hidden="true"><use href="#icon-warning"/></svg>突发应急</summary>
@@ -67,7 +67,15 @@
     <section class="scene" aria-label="武汉大学信息学部三维空域地图">
       <div id="map"></div>
       <div class="scene-vignette" aria-hidden="true"></div>
-      <canvas id="hud" aria-hidden="true" hidden></canvas>
+      <div id="hud-overlay" class="hud-overlay" hidden>
+        <canvas id="hud" aria-hidden="true"></canvas>
+        <div class="hud-header cockpit-panel">
+          <span class="hud-view">第一人称</span>
+          <strong class="mono">VOXAERO-01</strong>
+          <span id="hud-phase" class="hud-phase"></span>
+          <span id="hud-alert" class="status-label" role="status"></span>
+        </div>
+      </div>
       <div id="aircraft-tag" class="aircraft-tag" aria-hidden="true" hidden>
         <span class="status-dot"></span><strong class="mono">VOXAERO-01</strong><span class="aircraft-tag-value mono"></span>
       </div>
@@ -75,15 +83,15 @@
     </section>
     <aside class="left-rail cockpit-panel" aria-label="飞行遥测与空域图层">
       <section class="flight-board" aria-label="实时飞行遥测">
-        <div class="panel-heading"><h2 class="micro">FLIGHT TELEMETRY</h2><span id="flight-state" class="status-label" role="status">待命</span></div>
+        <div class="panel-heading"><h2>飞行遥测</h2><span id="flight-state" class="status-label" role="status">待命</span></div>
         <div class="aircraft mono"><svg class="icon" aria-hidden="true"><use href="#icon-aircraft"/></svg><strong>VOXAERO-01</strong></div>
         <p id="mission-target" class="mission-target">等待任务分配</p>
         <dl class="telemetry telemetry-major">
-          <div><dt title="相对机位下方地形的高度">离地高度 <b>AGL</b></dt><dd id="altitude">—</dd><dd class="readout-detail" id="vertical-speed">—</dd></div>
-          <div><dt>地速 <b>GS</b></dt><dd id="speed">—</dd><dd class="readout-detail" id="flight-heading">—</dd></div>
+          <div><dt title="相对机位下方地形的高度">离地高度</dt><dd id="altitude">—</dd><dd class="readout-detail" id="vertical-speed">—</dd></div>
+          <div><dt>地速</dt><dd id="speed">—</dd><dd class="readout-detail" id="flight-heading">—</dd></div>
         </dl>
         <figure class="vertical-profile">
-          <figcaption><span>垂直剖面 <small class="micro">AGL</small></span><span id="profile-band" class="tabular">—</span></figcaption>
+          <figcaption><span>离地剖面</span><span id="profile-band" class="tabular">—</span></figcaption>
           <div class="profile-chart" title="离地高度以机位下方地形为基准。灰色轮廓为航迹下方的建筑顶面。">
             <div class="profile-annotation"><output id="profile-altitude" class="mono" aria-hidden="true" hidden></output></div>
             <div class="profile-ticks mono" aria-hidden="true"><span></span><span></span><span></span></div>
@@ -103,8 +111,8 @@
           <div class="profile-axis"><span id="profile-start">出发 —</span><span id="profile-end">到达 —</span></div>
         </figure>
         <dl class="telemetry telemetry-secondary">
-          <div><dt>当前净空 <b>CLR</b></dt><dd id="clearance">—</dd><dd id="clearance-status" class="readout-detail">等待飞行</dd></div>
-          <div><dt>电池电量 <b>BAT</b></dt><dd id="charge">—</dd><dd id="battery-meter" class="battery-meter" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i></dd></div>
+          <div><dt>当前净空</dt><dd id="clearance">—</dd><dd id="clearance-status" class="readout-detail">等待飞行</dd></div>
+          <div><dt>电池电量</dt><dd id="charge">—</dd><dd id="battery-meter" class="battery-meter" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i></dd></div>
         </dl>
         <dl class="metrics">
           <div><dt>剩余航程</dt><dd id="distance">—</dd></div>
@@ -113,13 +121,13 @@
         </dl>
       </section>
       <details class="layers" open>
-        <summary class="panel-heading"><span class="layer-title">空域图层 <small class="micro">LAYERS</small></span><span class="layer-summary"><span id="layer-count" class="mono">6 / 7</span><svg class="icon chevron" aria-hidden="true"><use href="#icon-chevron"/></svg></span></summary>
+        <summary class="panel-heading"><span class="layer-title">空域图层</span><span class="layer-summary"><span id="layer-count" class="mono">6 / 7</span><svg class="icon chevron" aria-hidden="true"><use href="#icon-chevron"/></svg></span></summary>
         <div class="layer-list">
           <label><svg class="icon building-key" aria-hidden="true"><use href="#icon-buildings"/></svg><span>建筑白模</span><input type="checkbox" role="switch" data-layer="buildings" checked disabled></label>
           <label><svg class="icon pad-key" aria-hidden="true"><use href="#icon-pad"/></svg><span id="pads-label">起降坪</span><input type="checkbox" role="switch" data-layer="vertiports" checked disabled></label>
-          <label><svg class="icon roads-key" aria-hidden="true"><use href="#icon-route"/></svg><span>OSM 路网</span><input type="checkbox" role="switch" data-layer="roads" disabled></label>
+          <label><svg class="icon roads-key" aria-hidden="true"><use href="#icon-route"/></svg><span title="道路数据来自 OpenStreetMap">道路图层</span><input type="checkbox" role="switch" data-layer="roads" disabled></label>
           <label><svg class="icon zone-key" aria-hidden="true"><use href="#icon-zone"/></svg><span>静态禁飞区</span><input type="checkbox" role="switch" data-layer="nofly_zones" checked disabled></label>
-          <label><svg class="icon grid-key" aria-hidden="true"><use href="#icon-grid"/></svg><span>30 / 60 m 空域网格</span><input type="checkbox" role="switch" data-layer="airspace" checked disabled></label>
+          <label><svg class="icon grid-key" aria-hidden="true"><use href="#icon-grid"/></svg><span>30 / 60 米空域网格</span><input type="checkbox" role="switch" data-layer="airspace" checked disabled></label>
           <label><svg class="icon route-key" aria-hidden="true"><use href="#icon-route"/></svg><span>规划航线</span><input type="checkbox" role="switch" data-layer="route" checked disabled></label>
           <label><svg class="icon hazard-key" aria-hidden="true"><use href="#icon-warning"/></svg><span>临时禁飞区</span><input type="checkbox" role="switch" data-layer="hazards" checked disabled></label>
         </div>
@@ -151,6 +159,16 @@
           <button id="reset-view" type="button" title="重置视角" aria-label="重置视角" disabled><svg class="icon" aria-hidden="true"><use href="#icon-frame"/></svg><span>重置视角</span></button>
         </div>
       </div>
+      <dl id="hud-readouts" class="hud-readouts cockpit-panel" aria-label="飞行仪表读数" hidden>
+        <div class="hud-battery">
+          <dt>电池电量</dt>
+          <dd><span id="hud-battery" class="mono">—</span><meter id="hud-meter" min="0" max="100" value="0" aria-hidden="true"></meter></dd>
+        </div>
+        <div class="hud-clearance">
+          <dt>当前净空</dt>
+          <dd id="hud-clearance" class="tabular">—</dd>
+        </div>
+      </dl>
         <details id="flight-review" class="flight-review cockpit-panel" hidden>
           <summary>最近任务记录</summary>
           <div class="review-content">
@@ -173,26 +191,34 @@
         </details>
     </div>
     <footer class="geo-readout cockpit-panel" aria-label="地理坐标与地图署名">
-      <div class="geo-position"><span>WGS 84</span><span id="geo-coordinate" class="mono">—</span></div>
+      <div class="geo-position"><span>地理坐标</span><span id="geo-coordinate" class="tabular">—</span></div>
       <div id="map-credits"></div>
     </footer>
     <section class="orientation cockpit-panel" aria-label="地图定向">
       <button id="north" type="button" title="回正正北" aria-label="回正正北" disabled>
-        <svg viewBox="0 0 32 32" aria-hidden="true"><circle cx="16" cy="16" r="14"/><g id="north-needle"><path d="M16 5 20 17 16 15 12 17Z"/><path d="M16 27 12 15 16 17 20 15Z"/></g><text x="16" y="4">N</text></svg>
+        <svg viewBox="0 0 32 32" aria-hidden="true"><circle cx="16" cy="16" r="14"/><g id="north-needle"><path d="M16 5 20 17 16 15 12 17Z"/><path d="M16 27 12 15 16 17 20 15Z"/></g><text x="16" y="4">北</text></svg>
       </button>
-      <div class="orientation-readout mono"><div id="camera-angle">HDG — · PITCH —</div><div class="scale"><i id="scale-rule"></i><span id="scale-value">—</span></div></div>
+      <div class="orientation-readout tabular"><div id="camera-angle">航向 — · 俯仰 —</div><div class="scale"><i id="scale-rule"></i><span id="scale-value">—</span></div></div>
     </section>
-    <aside class="dispatch cockpit-panel" aria-labelledby="dispatch-heading">
+    <aside class="dispatch cockpit-panel" aria-labelledby="dispatch-heading" data-guide>
       <div class="panel-heading">
-        <h2 id="dispatch-heading"><svg class="icon" aria-hidden="true"><use href="#icon-agent"/></svg>任务调度 <small class="micro">DISPATCH</small></h2>
+        <h2 id="dispatch-heading"><svg class="icon" aria-hidden="true"><use href="#icon-agent"/></svg>任务调度</h2>
         <div class="dispatch-tools"><span id="mode" class="status-label">连接中</span><button id="agent-help" type="button" class="icon-button" aria-label="使用帮助" title="使用帮助" aria-controls="agent-welcome" aria-expanded="true">?</button></div>
       </div>
       <div id="active-mission" class="active-mission"></div>
       <section id="agent-welcome" class="welcome" aria-labelledby="welcome-heading">
-        <h3 id="welcome-heading">欢迎使用 VoxAero</h3>
-        <p>在武汉大学信息学部规划无人机配送或巡检。输入起点、终点和任务，也可指定限高、到达时限或需要绕开的区域。</p>
-        <p>核对航线后开始仿真。进入巡航可模拟临时禁飞或低电备降，任务结束后可在底部回放。</p>
-        <div class="welcome-actions"><button type="button" data-welcome-example="delivery">配送示例</button><button type="button" data-welcome-example="inspection">巡检示例</button></div>
+        <h3 id="welcome-heading"><span class="welcome-emoji" aria-hidden="true">🧭</span> 使用帮助</h3>
+        <p>在武大信息学部规划配送、巡检和应急仿真。</p>
+        <ol class="welcome-steps">
+          <li><strong>描述任务</strong><span>说明要做什么、从哪里飞到哪里。你也可以补充限高、到达时限或避让区域。</span></li>
+          <li><strong>核对航线</strong><span>地点不清楚时，调度台会请你补充。确认起终点和航线后，再开始仿真。</span></li>
+          <li><strong>体验应急</strong><span>巡航中可模拟临时禁飞或低电量备降，结束后可回放任务。</span></li>
+        </ol>
+        <p class="welcome-note">当前起终点可使用地图上的已登记起降点。</p>
+        <div class="welcome-actions">
+          <button type="button" data-welcome-example="delivery"><span class="welcome-emoji" aria-hidden="true">📦</span> 配送示例</button>
+          <button type="button" data-welcome-example="inspection"><span class="welcome-emoji" aria-hidden="true">🔎</span> 巡检示例</button>
+        </div>
       </section>
       <div id="agent-messages"></div>
       <template id="agent-exchange-template">
@@ -210,7 +236,7 @@
       </template>
       <template id="dispatch-plan-template">
         <section class="dispatch-plan" aria-label="当前任务简报">
-          <header class="plan-kicker"><span class="micro">ACTIVE MISSION</span><span class="status-label" data-plan="state">航线待确认</span></header>
+          <header class="plan-kicker"><span class="micro">当前任务</span><span class="status-label" data-plan="state">航线待确认</span></header>
           <div class="plan-heading"><h3 data-plan="type"></h3><span class="mission-id mono" data-plan="id"></span></div>
           <div class="plan-route">
             <button type="button" class="plan-location" data-plan="start"></button>
@@ -227,14 +253,14 @@
         </section>
       </template>
       <div class="composer">
-        <h3 class="micro">QUICK SCENARIOS</h3>
+        <h3 class="micro">快捷演示</h3>
         <div class="presets" role="group" aria-label="一键演示">
           <button type="button" data-preset="delivery" disabled><svg class="icon" aria-hidden="true"><use href="#icon-package"/></svg>中午配送</button>
           <button type="button" data-preset="inspection" disabled><svg class="icon" aria-hidden="true"><use href="#icon-aircraft"/></svg>夜间巡检</button>
           <button type="button" data-preset="emergency" disabled><svg class="icon" aria-hidden="true"><use href="#icon-warning"/></svg>应急演示</button>
         </div>
         <form id="dispatch-form">
-          <div class="dispatch-prompt"><label for="query">调度指令</label><span id="dispatch-shortcuts">Enter 发送 · Ctrl+Enter 换行</span></div>
+          <div class="dispatch-prompt"><label for="query">调度指令</label><span id="dispatch-shortcuts">回车发送 · Ctrl + 回车换行</span></div>
           <textarea id="query" rows="3" maxlength="500" required aria-describedby="dispatch-shortcuts" enterkeyhint="send" placeholder="例如：从 VP01 巡检至 VP04"></textarea>
           <div class="dispatch-actions"><p id="dispatch-status" class="feedback" role="status">等待调度指令</p><button id="clear-clarification" type="button" hidden>另起任务</button><button id="submit" type="submit" class="primary" disabled><span id="submit-label">规划航线</span><svg class="icon" aria-hidden="true"><use href="#icon-arrow-right"/></svg></button></div>
         </form>

@@ -252,7 +252,7 @@ export class CampusMap {
       volume(buildings, feature, {
         bottom: base_alt, top,
         fill: color("#bdcee0", 0.82), outline: color("#e8f4ff", 0.87),
-        hoverText: feature.properties.name + " · " + height.toFixed(1) + " m" + (provenance ? " · " + provenance : ""),
+        hoverText: feature.properties.name + " · " + height.toFixed(1) + " 米" + (provenance ? " · " + provenance : ""),
       });
       const bounds = this.asVolume(feature, base_alt, collision_top_alt ?? top);
       this.staticVolumes.push(bounds);
@@ -350,7 +350,7 @@ export class CampusMap {
           width: 1.2, material: color(tint, .8), arcType: Cesium.ArcType.NONE,
         },
         label: {
-          text: alt.toFixed(1) + (alt === ticks.at(-1) ? " m AGL" : " m"),
+          text: (alt === ticks.at(-1) ? "离地 " : "") + alt.toFixed(1) + " 米",
           font: `600 10px ${readoutFont}`, fillColor: color("#b9c0fa"),
           style: Cesium.LabelStyle.FILL_AND_OUTLINE, outlineColor: color("#080a0f"), outlineWidth: 2,
           pixelOffset: new Cesium.Cartesian2(4, 0), horizontalOrigin: Cesium.HorizontalOrigin.LEFT,
@@ -594,7 +594,7 @@ export class CampusMap {
       const { label } = entities.add({
         position,
         label: {
-          text: altitude.toFixed(1) + " m AGL", font: `620 11px ${readoutFont}`, fillColor: color("#e2e8f0"),
+          text: "离地 " + altitude.toFixed(1) + " 米", font: `620 11px ${readoutFont}`, fillColor: color("#e2e8f0"),
           showBackground: true, backgroundColor: color("#101821", .98),
           backgroundPadding: new Cesium.Cartesian2(7, 4),
           pixelOffset: new Cesium.Cartesian2(0, -17), disableDepthTestDistance: Number.POSITIVE_INFINITY,
@@ -624,7 +624,7 @@ export class CampusMap {
       const { min_alt, max_alt } = feature.properties;
       volume(entities, feature, {
         bottom: min_alt, top: max_alt, fill: color("#f59e0b", .22), outline: color("#fbbf24"),
-        hoverText: "临时禁飞区 · " + min_alt.toFixed(1) + "–" + max_alt.toFixed(1) + " m",
+        hoverText: "临时禁飞区 · " + min_alt.toFixed(1) + "–" + max_alt.toFixed(1) + " 米",
       });
       return this.asVolume(feature, min_alt, max_alt);
     });

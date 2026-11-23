@@ -1,10 +1,10 @@
-import { CampusMap } from "./map3d.js?v=11";
+import { CampusMap } from "./map3d.js?v=14";
 import { DroneSim } from "./drone_sim.js?v=8";
 import { FlightReplay, flightClock } from "./flight_replay.js?v=11";
-import { FlightHUD } from "./ar_hud.js?v=11";
-import { AgentUI, plainDispatchText } from "./agent_ui.js?v=11";
+import { FlightHUD } from "./ar_hud.js?v=14";
+import { AgentUI, plainDispatchText } from "./agent_ui.js?v=13";
 
-import { VerticalProfile } from "./flight_profile.js?v=11";
+import { VerticalProfile } from "./flight_profile.js?v=13";
 
 const element = (id) => document.getElementById(id);
 const layerToggles = [...document.querySelectorAll("[data-layer]")];
@@ -17,7 +17,7 @@ const windButton = element("wind");
 const batteryButton = element("battery");
 const closeEmergency = setupEmergencyMenu();
 const phaseNames = { takeoff: "垂直起飞", cruise: "巡航", landing: "降落", transition: "调整高度" };
-const directions = ["N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE", "S", "SSW", "SW", "WSW", "W", "WNW", "NW", "NNW"];
+const directions = ["北", "北偏东", "东北", "东偏北", "东", "东偏南", "东南", "南偏东", "南", "南偏西", "西南", "西偏南", "西", "西偏北", "西北", "北偏西"];
 const eventNames = { wind_gust: "突发阵风 / 临时禁飞区", low_battery: "低电量强制备降" };
 const format = new Intl.NumberFormat("zh-CN", { minimumFractionDigits: 1, maximumFractionDigits: 1 });
 const ui = new AgentUI(dispatch, clearClarification);
@@ -218,17 +218,17 @@ function paintTelemetry(next, currentSim) {
   const heading = Math.round((Cesium.Math.toDegrees(currentSim.heading ?? 0) + 360) % 360) % 360;
   const vertical = moving ? leg.dz / seconds : 0;
   next.agl = map.altitudeAGL(coordinates);
-  next.altitudeText = format.format(next.agl) + " m";
+  next.altitudeText = format.format(next.agl) + " 米";
   const lowClearance = !next.onGround && clearance !== null && clearance < 12;
   const flightActive = next.playing || review?.playing;
   const warning = lowClearance || (!review?.active && mission?.hold);
   next.instrumentTone = next.onGround ? "neutral" : warning ? "warn"
     : !flightActive ? "neutral" : leg.phase === "cruise" ? "normal" : "vector";
   element("altitude").closest(".flight-board").dataset.tone = next.instrumentTone;
-  measurement("altitude", next.agl, "m");
-  measurement("speed", moving ? leg.horizontal / seconds : 0, "m/s");
+  measurement("altitude", next.agl, "米");
+  measurement("speed", moving ? leg.horizontal / seconds : 0, "米/秒");
   text("charge", Math.round(battery) + " %");
-  measurement("clearance", next.onGround ? null : clearance, "m");
+  measurement("clearance", next.onGround ? null : clearance, "米");
   element("clearance").dataset.tone = lowClearance ? "warn" : "neutral";
   text("clearance-status", next.onGround ? "地面停机" : clearance === null ? "等待净空数据"
     : lowClearance ? "净空偏低" : "距最近障碍物");
@@ -236,13 +236,13 @@ function paintTelemetry(next, currentSim) {
   element("charge").dataset.alert = !next.onGround && battery < 18;
   element("battery-meter").dataset.alert = !next.onGround && battery < 18;
   Array.from(element("battery-meter").children).forEach((bar, index) => bar.toggleAttribute("data-lit", index < Math.ceil(battery / 20)));
-  text("vertical-speed", vertical > .05 ? `↑ 爬升 +${format.format(vertical)} m/s`
-    : vertical < -.05 ? `↓ 下降 ${format.format(vertical)} m/s` : "垂直速度 0.0 m/s");
+  text("vertical-speed", vertical > .05 ? `↑ 爬升 +${format.format(vertical)} 米/秒`
+    : vertical < -.05 ? `↓ 下降 ${format.format(vertical)} 米/秒` : "垂直速度 0.0 米/秒");
   text("flight-heading", `航向 ${String(heading).padStart(3, "0")}° ${directions[Math.round(heading / 22.5) % 16]}`);
   const remaining = complete ? 0 : currentSim.track.legs.slice(next.legIndex).reduce((distance, step) => distance
     + Math.hypot(step.horizontal, step.dz) * (step.end - Math.max(step.start, next.elapsed)) / (step.end - step.start), 0);
-  text("distance", format.format(remaining) + " m");
-  text("duration", format.format(next.duration - next.elapsed) + " s");
+  text("distance", format.format(remaining) + " 米");
+  text("duration", format.format(next.duration - next.elapsed) + " 秒");
   map.updateAircraftTag(next.altitudeText, next.instrumentTone);
   if (profile.track === currentSim.track) profile.paint(next);
   hud.update(currentSim.view === "fpv", next, next.onGround ? null : clearance);
@@ -537,7 +537,7 @@ async function replan(type) {
     mission.segments[segmentIndex].flown = sim.flownWaypoints(before);
     installRoute(result, result.target_id, sim.battery, true);
     const action = type === "low_battery" ? "备降" : "绕飞";
-    const detail = hazard ? `临时禁飞区半径 ${format.format(hazard.radius_m)} m`
+    const detail = hazard ? `临时禁飞区半径 ${format.format(hazard.radius_m)} 米`
       : `改降 ${targetLabel(result.target_id)}`;
     mission.events.push({
       ...event, segmentIndex: segmentIndex + 1, name: `${eventNames[type]} · ${action}获准`, compare: true,
@@ -593,7 +593,7 @@ async function launch() {
     const heightDatum = data.terrain ? " · 地形高程" : "";
     text("scene-status", data.buildings.features.length + " 建筑 · " + padNames.size + " 起降坪" + heightDatum);
     text("pads-label", "起降坪 ×" + padNames.size);
-    text("sim-live", "SIM LIVE");
+    text("sim-live", "仿真在线");
     element("system-status").dataset.ready = "";
     element("north").disabled = false;
     updateLayerCount();
@@ -602,7 +602,7 @@ async function launch() {
     refreshFlightState();
   } catch (error) {
     text("scene-status", "地图初始化失败 · " + error.message);
-    text("sim-live", "SIM OFFLINE");
+    text("sim-live", "仿真离线");
     element("system-status").dataset.tone = "error";
     console.error("VoxAero scene initialization failed", error);
     element("scene-status").dataset.error = "true";
@@ -624,7 +624,7 @@ function bindOrientation() {
     const heading = C.Math.toDegrees(camera.heading);
     const pitch = Math.round(C.Math.toDegrees(camera.pitch));
     element("north-needle").style.rotate = -heading + "deg";
-    text("camera-angle", `HDG ${String(Math.round(heading) % 360).padStart(3, "0")}° · PITCH ${pitch}°`);
+    text("camera-angle", `航向 ${String(Math.round(heading) % 360).padStart(3, "0")}° · 俯仰 ${pitch}°`);
     const { clientWidth: width, clientHeight: height } = canvas;
     const pick = (x) => {
       const ray = camera.getPickRay(new C.Cartesian2(x, height * .54));
@@ -636,7 +636,7 @@ function bindOrientation() {
     if (place) {
       const lat = C.Math.toDegrees(place.latitude);
       const lon = C.Math.toDegrees(place.longitude);
-      text("geo-coordinate", `${Math.abs(lat).toFixed(4)}°${lat < 0 ? "S" : "N"} ${Math.abs(lon).toFixed(4)}°${lon < 0 ? "W" : "E"}`);
+      text("geo-coordinate", `${lat < 0 ? "南纬" : "北纬"} ${Math.abs(lat).toFixed(4)}° · ${lon < 0 ? "西经" : "东经"} ${Math.abs(lon).toFixed(4)}°`);
     }
     if (middle && right) {
       element("scale-rule").hidden = false;
@@ -646,7 +646,7 @@ function bindOrientation() {
         const scale = 10 ** Math.floor(Math.log10(target));
         const nice = [5, 2, 1].find((value) => value * scale <= target) * scale;
         element("scale-rule").style.width = nice / metersPerPixel + "px";
-        text("scale-value", format.format(nice) + " m");
+        text("scale-value", format.format(nice) + " 米");
       }
     } else {
       element("scale-rule").hidden = true;
