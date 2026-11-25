@@ -49,7 +49,6 @@ TARGET_SUFFIX = re.compile(r"\s*(?:作为|设为|是|为)\s*(?:终点|目的地)
 INSPECTION_PATTERN = re.compile(r"巡检|巡逻|安防|\b(?:inspection|inspect|patrol)\b", re.IGNORECASE)
 DELIVERY_PATTERN = re.compile(r"配送|送(?:到|往|至|餐|件|货)|投送|\bdeliver\w*\b", re.IGNORECASE)
 HIGH_PATTERN = re.compile(r"优先高空|高空|60\s*[-–—~至]\s*90|high.altitude", re.IGNORECASE)
-URGENT_PATTERN = re.compile(r"加急|紧急|\burgent\b", re.IGNORECASE)
 GENERIC_AVOIDANCE = re.compile(r"(?:所有|全部|已知|静态|周边|附近)*(?:建筑物?|障碍物?|禁飞区|no-fly zones?)")
 TOOL_NAME = "parse_dispatch_intent"
 FLIGHT_SPEED_MPS = {"delivery": 12.0, "inspection": 15.0}
@@ -155,7 +154,6 @@ class DispatchAgent:
             end_id=end,
             mission_type="inspection" if INSPECTION_PATTERN.search(task_text) else "delivery",
             avoid_zone_ids=self._avoidance(LOW_FLIGHT.sub("", query)),
-            priority="urgent" if URGENT_PATTERN.search(query) else "normal",
             prefer_high_altitude=bool(HIGH_PATTERN.search(LOW_FLIGHT.sub("", query))),
         )
 
@@ -233,7 +231,6 @@ class DispatchAgent:
             start_id=start, end_id=end, avoid_zone_ids=zones,
             mission_type=local.mission_type if INSPECTION_PATTERN.search(task_text) or DELIVERY_PATTERN.search(task_text)
             else model.mission_type,
-            priority="urgent" if local.priority == "urgent" else model.priority,
             prefer_high_altitude=local.prefer_high_altitude or (model.prefer_high_altitude and not LOW_FLIGHT.search(query)),
         )
 

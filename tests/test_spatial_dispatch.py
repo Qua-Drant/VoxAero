@@ -336,7 +336,6 @@ def test_ordered_osm_flyovers_and_checked_alternatives_survive_replan(client):
     planned = confirm(client, offered, choice["id"])
     assert planned["status"] == "planned" and planned["waypoints"] == choice["waypoints"]
     assert [ref["name"] for ref in planned["intent"]["via"]] == ["星湖", "星湖南路"]
-    assert planned["intent"]["constraints"]["deadline_seconds"] is None
     current = planned["waypoints"][planned["route_visits"][0]["waypoint_index"]]
     event = DynamicHazard(center_lon=114.3615, center_lat=30.5245, radius_m=14, min_alt=0, max_alt=100)
     payload = {

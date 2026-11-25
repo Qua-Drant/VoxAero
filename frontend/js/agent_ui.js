@@ -1,4 +1,4 @@
-import { renderAirspaceCheck, spatialCandidateForm } from "./spatial_ui.js?v=4";
+import { renderAirspaceCheck, spatialCandidateForm } from "./spatial_ui.js";
 
 const PRESETS = {
   spatial: "从信息学部附近找一个可起飞的地面点，去图书馆西侧巡检，绕开静谧区。",
@@ -24,14 +24,9 @@ const number = new Intl.NumberFormat("zh-CN", { minimumFractionDigits: 1, maximu
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 export function plainDispatchText(content) {
-  if (typeof content !== "string" || /(?:^|\s)[{\[]\s*["{\[]|["\w]+"\s*:\s*["{\[]/.test(content)) {
-    return "平台已返回回复，请查看任务状态。";
-  }
+  if (typeof content !== "string") return "";
   return content
     .replace(/(\d+(?:\.\d+)?)\s+m\b/g, (_, meters) => meters + " m")
-    .replaceAll("起降坪", "起降点")
-    .replaceAll("候选航线", "找到的路线")
-    .replaceAll("合规航线", "符合飞行要求的路线")
     .replaceAll("硬约束", "必须满足的要求")
     .replaceAll("全高度绕开", "从任何高度都绕开")
     .replace("并应用其余空域限制", "并遵守其他飞行限制")
@@ -45,7 +40,9 @@ function readableStep({ role, content }) {
     const [action, detail] = content.split(" · ");
     if (action === "校验空域") return ["空域检查", `核对巡航航层 ${plainDispatchText(detail ?? "适用航层")}。`];
     if (content.startsWith("模型提取地点") || content.startsWith("按本地规则识别")) return ["识别地点", content];
-    if (content.startsWith("用场景地形")) return ["起降筛选", "核对地形、建筑、围栏和候选航线。"];
+    if (content.startsWith("继续确认")) return ["地点确认", content];
+    if (content.startsWith("正在核对起降通道")) return ["起降筛选", "核对起降通道、巡航层接入和完整航线。"];
+    if (content.startsWith("加密搜索原地标") || content.startsWith("继续查找距离原地标")) return ["扩大选址", content];
     if (action === "plan_3d_route") {
       if (detail?.includes("备降") || detail?.includes("应急坪")) return ["备降规划", "比较可达备降点与航程。"];
       if (detail?.startsWith("从当前")) return ["绕飞规划", "从当前机位规划绕飞航线。"];

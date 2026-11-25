@@ -128,8 +128,7 @@ def test_real_dispatch_enforces_cruise_and_ignores_time_requirements(scene, clie
         result = client.post("/api/agent/dispatch", json={"query": base + "，" + suffix})
         assert result.status_code == 200, result.text
         body = result.json()
-        limits = body["intent"]["constraints"]
-        assert limits["deadline_seconds"] is None and limits["preferred_deadline_seconds"] is None
+        assert body["intent"]["constraints"] == {"cruise": None, "preferred_cruise": None}
         assert body["kpis"]["estimated_seconds"] > 10
         assert any("预计耗时仅供参考" in step["content"] for step in body["thought_steps"])
 
@@ -159,7 +158,7 @@ def test_real_temporary_restriction_and_diversion(scene, client, real_detour, em
     _verify_api_route(detour, scene, current, "VP05", changed)
     limited = client.post("/api/agent/replan", json={
         **request, "emergency_type": emergency_type, "dynamic_hazard": hazard.model_dump(),
-        "cruise_limits": {"min_alt": 65, "max_alt": 85}, "remaining_deadline_seconds": 0,
+        "cruise_limits": {"min_alt": 65, "max_alt": 85},
     })
     assert limited.status_code == 200, limited.text
     limited_route = ReplanResult.model_validate(limited.json())

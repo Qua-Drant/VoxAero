@@ -25,8 +25,8 @@ class Case:
 def route(name, query, start, end, corridor="delivery", *, reply=None, **expected):
     return Case(name, query, "planned", {
         "start": start, "end": end, "corridor": corridor, "compliant": True,
-        "mission_type": corridor, "avoid": [], "cruise": None, "deadline": None,
-        "preferred_cruise": None, "preferred_deadline": None, **expected,
+        "mission_type": corridor, "avoid": [], "cruise": None,
+        "preferred_cruise": None, **expected,
     }, reply)
 
 
@@ -82,8 +82,7 @@ def summarize(body):
         "model_fallback": body.get("model_fallback", False) or (attempted and body.get("mode") == "fallback_mock"),
         "start": intent.get("start_id"), "end": intent.get("end_id"),
         "mission_type": intent.get("mission_type"), "corridor": body.get("corridor"), "avoid": intent.get("avoid_zone_ids"),
-        "cruise": bounds("cruise"), "deadline": constraints.get("deadline_seconds"),
-        "preferred_cruise": bounds("preferred_cruise"), "preferred_deadline": constraints.get("preferred_deadline_seconds"),
+        "cruise": bounds("cruise"), "preferred_cruise": bounds("preferred_cruise"),
         "compliant": body.get("kpis", {}).get("compliant"), "detail": body.get("detail"),
     }
 

@@ -34,6 +34,13 @@ def create_app(
 
     app = FastAPI(title="VoxAero API", version="1.0.0", lifespan=lifespan)
 
+    @app.middleware("http")
+    async def revalidate_frontend(request: Request, call_next):
+        response = await call_next(request)
+        if request.url.path == "/" or request.url.path.startswith(("/js/", "/css/")):
+            response.headers["Cache-Control"] = "no-cache"
+        return response
+
     @app.exception_handler(AgentError)
     async def handle_agent_error(request: Request, exc: AgentError) -> JSONResponse:
         return JSONResponse(

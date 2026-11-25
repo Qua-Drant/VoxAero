@@ -1,4 +1,4 @@
-import { DroneSim } from "./drone_sim.js?v=9";
+import { DroneSim } from "./drone_sim.js";
 
 export function flightClock(seconds) {
   const whole = Math.floor(seconds);

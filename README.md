@@ -87,7 +87,7 @@ if (!(Test-Path -LiteralPath .env)) { Copy-Item -LiteralPath .env.example -Desti
 
 ## 技术栈
 
-- **浏览器界面**采用 HTML、原生 ES Modules、CSS 和 Tailwind CSS CDN。`app.js` 维护地图、调度表单和任务状态，`agent_ui.js` 渲染消歧选项、候选航线及校验记录。 [界面入口](frontend/index.html) · [调度界面](frontend/js/agent_ui.js)
+- **浏览器界面**采用 HTML5、原生 ES Modules 和基于 Design Tokens 的现代原生 CSS。`app.js` 维护地图、调度表单和任务状态，`agent_ui.js` 渲染消歧选项、候选航线及校验记录。 [界面入口](frontend/index.html) · [调度界面](frontend/js/agent_ui.js)
 - **三维场景与仿真**使用 CesiumJS 1.119 和 OpenStreetMap 底图。场景渲染建筑白模、起降坪、禁飞区和三维航迹。飞行器通过 `SampledPositionProperty` 沿航点插值运行，第一人称姿态与遥测由 Canvas HUD 叠加，任务回放沿用同一套飞行数据。 [地图](frontend/js/map3d.js) · [飞行仿真](frontend/js/drone_sim.js) · [HUD](frontend/js/ar_hud.js)
 - **服务端**使用 Python 3.11、FastAPI、Uvicorn 和 Pydantic。启动时加载场景，集中提供 REST API、OpenAPI 文档和前端静态文件。Pydantic 校验经纬度、高度、调度参数及响应结构。 [服务入口](backend/main.py) · [数据模型](backend/schemas.py)
 - **地理处理与规划**使用 NumPy 和 Shapely。建筑、起降坪和围栏来自本地 GeoJSON，场景的地形与 OSM 地标也从本地文件读取。后端将 WGS84 坐标投影到以米为单位的局部 ENU 坐标系，维护体素占用图和碰撞检测索引，再使用三维 A* 搜索航线。 [空域建模](backend/core/airspace.py) · [路径规划](backend/core/planner.py)

@@ -1,11 +1,10 @@
-import { CampusMap } from "./map3d.js?v=17";
-import { DroneSim } from "./drone_sim.js?v=9";
-import { FlightReplay, flightClock } from "./flight_replay.js?v=14";
-import { FlightHUD } from "./ar_hud.js?v=15";
+import { CampusMap } from "./map3d.js";
+import { DroneSim } from "./drone_sim.js";
+import { FlightReplay, flightClock } from "./flight_replay.js";
+import { FlightHUD } from "./ar_hud.js";
 import { batteryReading, paintBattery } from "./battery_display.js";
-import { AgentUI, plainDispatchText } from "./agent_ui.js?v=19";
-
-import { VerticalProfile } from "./flight_profile.js?v=14";
+import { AgentUI, plainDispatchText } from "./agent_ui.js";
+import { VerticalProfile } from "./flight_profile.js";
 
 const element = (id) => document.getElementById(id);
 const layerToggles = [...document.querySelectorAll("[data-layer]")];

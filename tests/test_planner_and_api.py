@@ -3,6 +3,7 @@
 import json
 from itertools import combinations, pairwise, permutations
 from math import dist, hypot
+from pathlib import Path
 from statistics import mean
 from time import perf_counter
 
@@ -14,7 +15,7 @@ from openai import OpenAI
 from shapely.geometry import LineString, Point, box, shape
 from shapely.ops import substring
 
-from backend.config import DATA_DIR, LLMSettings, MISSION_LAYERS, ORIGIN_LON_LAT, STUDY_BOUNDS
+from backend.config import LLMSettings, MISSION_LAYERS, ORIGIN_LON_LAT, STUDY_BOUNDS
 from backend.core.airspace import Airspace, LocalENU, Obstacle, ObstacleField
 from backend.core.planner import NoRouteError, RoutePlanner
 from backend.main import create_app
@@ -25,7 +26,7 @@ from backend.schemas import (
 
 DELIVERY_QUERY = "中午高峰配送：将餐食从信息学部食堂送至测国重楼顶，避开图书馆静谧区"
 INSPECTION_QUERY = "夜间高空安防巡检：从信息学部起飞，沿 60–90m 巡检层前往图书馆西侧巡检点"
-MOCK_DATA = DATA_DIR / "mock_backup"
+MOCK_DATA = Path(__file__).resolve().parent / "fixtures" / "mock_scene"
 
 
 @pytest.fixture(scope="module")
@@ -295,20 +296,20 @@ def test_service_metadata_geojson_and_preview_assets(client):
     assert model.status_code == 200 and model.content.startswith(b"glTF\x02\x00\x00\x00")
 
 
-@pytest.mark.parametrize(("query", "target", "mission", "corridor", "zones", "priority"), [
-    (DELIVERY_QUERY, "VP03", "delivery", "delivery", ("NFZ01",), "normal"),
-    (INSPECTION_QUERY, "VP04", "inspection", "inspection", (), "normal"),
-    ("从 VP01 加急配送到图书馆西侧巡检点，优先高空", "VP04", "delivery", "inspection", (), "urgent"),
-    ("配送至 VP03，由 VP01 起飞", "VP03", "delivery", "delivery", (), "normal"),
+@pytest.mark.parametrize(("query", "target", "mission", "corridor", "zones"), [
+    (DELIVERY_QUERY, "VP03", "delivery", "delivery", ("NFZ01",)),
+    (INSPECTION_QUERY, "VP04", "inspection", "inspection", ()),
+    ("从 VP01 加急配送到图书馆西侧巡检点，优先高空", "VP04", "delivery", "inspection", ()),
+    ("配送至 VP03，由 VP01 起飞", "VP03", "delivery", "delivery", ()),
 ])
-def test_dispatch_fallback_contract(airspace, client, query, target, mission, corridor, zones, priority):
+def test_dispatch_fallback_contract(airspace, client, query, target, mission, corridor, zones):
     response = client.post("/api/agent/dispatch", json={"query": query})
     assert response.status_code == 200, response.text
     result = DispatchResult.model_validate(response.json())
     assert result.mode == "fallback_mock" and result.corridor == corridor
     assert result.intent.start_id == "VP01" and result.intent.end_id == target
     assert result.intent.mission_type == mission
-    assert result.intent.avoid_zone_ids == zones and result.intent.priority == priority
+    assert result.intent.avoid_zone_ids == zones
     assert result.kpis.time_saving_percent > 0
     _verify_api_route(result, airspace, "VP01", target, airspace.with_hazards((), zones)[0])
 
@@ -458,7 +459,6 @@ def test_openai_compatible_intent_and_fallback(scenario):
     if not successful:
         assert any("切换至本地规则" in event.content for event in result.thought_steps)
     if scenario == "deadline_in_cruise_field":
-        assert result.intent.constraints.preferred_deadline_seconds is None
         assert any("预计耗时仅供参考" in event.content for event in result.thought_steps)
         assert result.intent.constraints.cruise is None
 
@@ -498,6 +498,7 @@ def test_dispatch_classification_and_grounded_one_turn_tool_workflow():
             notice = response.json()
             assert response.status_code == 422 and notice["status"] == "needs_clarification"
             assert "起点" in notice["detail"] and "waypoints" not in notice
+            assert any("预计耗时仅供参考" in step["content"] for step in notice["thought_steps"])
             assert notice["mode"] == "live_llm" and notice["model_called"]
             token = notice["clarification_token"]
 
@@ -510,5 +511,5 @@ def test_dispatch_classification_and_grounded_one_turn_tool_workflow():
             assert result.mode == "live_llm" and not result.model_called and len(calls) == 2
             assert result.intent.start_id == "VP01" and result.intent.end_id == "VP03"
             assert result.intent.avoid_zone_ids == ("NFZ01",)
-            assert result.intent.constraints.deadline_seconds is None
+            assert result.intent.constraints.cruise is None
             assert api.post("/api/agent/dispatch", json=reply).json()["status"] == "clarification_closed"

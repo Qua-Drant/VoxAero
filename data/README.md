@@ -39,7 +39,7 @@ conda run -n VoxAero python -m scripts.build_whu_scene --osm third_party/whu_sou
 从项目根目录启动另一端口，访问 `http://127.0.0.1:8001`。主预览读取 `data/` 的默认实景。
 
 ```powershell
-$env:VOXAERO_SCENE_DIR = 'data/mock_backup'
+$env:VOXAERO_SCENE_DIR = 'tests/fixtures/mock_scene'
 conda run -n VoxAero uvicorn backend.main:app --port 8001
 ```
 

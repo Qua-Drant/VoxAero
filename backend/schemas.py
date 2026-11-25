@@ -131,11 +131,8 @@ class CruiseLimits(BaseModel, frozen=True):
 
 
 class DispatchConstraints(BaseModel, frozen=True):
-    # Legacy deadline fields remain null in newly planned missions.
     cruise: CruiseLimits | None = None
-    deadline_seconds: NonnegativeMeters | None = None
     preferred_cruise: CruiseLimits | None = None
-    preferred_deadline_seconds: NonnegativeMeters | None = None
 
 
 class DispatchRequest(BaseModel):
@@ -150,7 +147,6 @@ class DispatchCandidate(BaseModel):
     start_id: NonemptyString | None = None
     end_id: NonemptyString | None = None
     avoid_zone_ids: tuple[str, ...] = ()
-    priority: Literal["normal", "urgent"] = "normal"
     prefer_high_altitude: bool = False
 
 
@@ -176,7 +172,6 @@ class ReplanRequest(BaseModel):
     avoid_zone_ids: Annotated[tuple[str, ...], Field(max_length=20)] = ()
     scene_version: str | None = None
     cruise_limits: CruiseLimits | None = None
-    remaining_deadline_seconds: FiniteFloat | None = None  # Accepted for older clients.
     battery_percent: Annotated[FiniteFloat, Field(ge=0, le=100)] | None = None
     completed_visits: Annotated[int, Field(ge=0, le=3)] = 0
     mission_token: Annotated[str, StringConstraints(min_length=1, max_length=80)] | None = None

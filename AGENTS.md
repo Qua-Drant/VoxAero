@@ -29,14 +29,14 @@
    - 若因权限或网络受限无法创建 Conda 环境，请立即停止并提示用户手动执行创建命令，不要静默回退到系统 Python。
 
 1. **后端**：Python 3.10+、`FastAPI`、`uvicorn`、`pydantic`、`numpy`、`shapely`、`openai`（用于兼容 OpenAI / DeepSeek / Qwen 等标准 Function Calling 接口）。
-2. **前端**：采用**零构建（No-Build）原生模块化架构**（HTML5 + ES6 Modules + Tailwind CSS CDN + CesiumJS 1.119 官方 CDN），由 FastAPI 直接通过 `StaticFiles` 托管于 `/` 根路径。
+2. **前端**：采用**零构建（No-Build）原生模块化架构**（HTML5 + ES6 Modules + 原生 CSS Design Tokens + CesiumJS 1.119 官方 CDN），由 FastAPI 直接通过 `StaticFiles` 托管于 `/` 根路径。
    - **禁止**引入 Webpack、Vite、React/Vue 脚手架或 `vite-plugin-cesium`。
-   - **零 Token 地图底图约束**：禁止强依赖 Cesium Ion Token。初始化 `Cesium.Viewer` 时，必须默认使用免费的深色科技风瓦片底图（如 CartoDB Dark Matter `https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png` 或 OSM 暗色滤镜）与 `Cesium.EllipsoidTerrainProvider()`，确保在无外网 Token 环境下 100% 正常渲染三维白模。
+   - **零 Token 地图底图约束**：禁止强依赖 Cesium Ion Token。初始化 `Cesium.Viewer` 时，必须默认使用免费的深色底图（如 OSM 暗色滤镜）与本地高程/椭球地形，确保在无外网 Token 环境下 100% 正常渲染三维白模。
 3. **LLM 双模式兜底约束**：
    - 支持通过环境变量 `LLM_API_KEY`、`LLM_BASE_URL`、`LLM_MODEL` 调用真实大模型执行 Function Calling。
    - **必须内置 Deterministic Fallback（确定性规则兜底引擎）**：当未配置 `LLM_API_KEY` 或网络请求超时失败时，自动降级到本地关键词+正则意图解析器，完整输出与真实 Agent 相同格式的推理步骤（`thought_steps`）和工具调用结果，确保演示永不崩溃。
 4. **Git 版本管理规范**：
-   - 使用本地 Git 管理代码（默认分支 `main`），遵循 Conventional Commits 风格（如 `feat:`、`fix:`、`docs:`、`chore:`）。
+   - 使用本地 Git 管理代码（当前主开发分支 `codex/tactical-obsidian`），遵循 Conventional Commits 风格（如 `feat:`、`fix:`、`docs:`、`chore:`）。
    - 每轮修改完成并验证通过后，自动在当前分支执行本地 `git commit`，附上清晰的改动说明，方便查看和回滚。
    - **严禁**提交 `.env`、个人 API Key、缓存文件（`__pycache__/`、`.pytest_cache/`）或未授权执行 `git push`、`git reset --hard`。
 
@@ -64,34 +64,56 @@
     VoxAero/
     ├── AGENTS.md                     # 本开发规范文档
     ├── README.md                     # VoxAero 启动说明、环境变量配置与数据替换指南
+    ├── Test.md                       # 自动化回归与浏览器交互验收清单
     ├── requirements.txt              # Python 依赖清单
     ├── .env.example                  # LLM_API_KEY / LLM_BASE_URL / LLM_MODEL 示例
-    ├── data/                         # 空间数据目录（支持外部队友直接替换同名文件）
-    │   ├── whu_buildings.geojson     # 校园建筑白模轮廓与高度
-    │   ├── vertiports.geojson        # 起降坪与备降点 POI
-    │   └── nofly_zones.geojson       # 静态禁飞/限高电子围栏
+    ├── data/                         # 武大信息学部实景空间数据目录（支持独立目录替换）
+    │   ├── README.md                 # 数据来源、高程基准与外部空域快照规范
+    │   ├── whu_buildings.geojson     # OSM 建筑轮廓与高度/包络属性
+    │   ├── vertiports.geojson        # 起降坪与应急备降点 POI
+    │   ├── nofly_zones.geojson       # 静态禁飞/限高电子围栏
+    │   ├── whu_roads.geojson         # OSM 道路矢量
+    │   ├── whu_places.geojson        # OSM 校门、广场、运动场、道路与水体地标
+    │   └── whu_terrain.json          # SRTM 局部高程网格
     ├── backend/
     │   ├── __init__.py
-    │   ├── main.py                   # FastAPI 入口、静态文件挂载与 REST API 路由
-    │   ├── config.py                 # 配置加载与空域高度层常量定义
+    │   ├── main.py                   # FastAPI 入口、静态文件托管与 REST API 路由
+    │   ├── config.py                 # 配置加载与空域高度层/能耗常量定义
     │   ├── schemas.py                # Pydantic 请求与响应数据模型
     │   └── core/
     │       ├── __init__.py
     │       ├── airspace.py           # GeoJSON 加载、ENU 坐标投影、空域体素化与碰撞检测
+    │       ├── terrain.py            # 双线性地形插值与连续航段地形净空检查
     │       ├── planner.py            # 3D 体素网格 A* 算法与三维航迹平滑器
-    │       └── agent.py              # LLM Function Calling Agent + 确定性降级引擎
+    │       ├── intent.py             # 本地分类器与巡航高度硬/软约束解析
+    │       ├── rules.py              # 外部空域快照高程基准换算与时效核验
+    │       ├── agent.py              # LLM Function Calling Agent + 确定性降级与应急改航
+    │       └── spatial_dispatch.py   # OSM 地标消歧、动态地面选址、有序途经与任务会话
     ├── frontend/
-    │   ├── index.html                # VoxAero 主页面布局（Tailwind CDN + CesiumJS CDN）
+    │   ├── index.html                # VoxAero 战术黑曜石航电主页面（原生 ES Modules + CesiumJS CDN）
+    │   ├── assets/                   # 本地 WOFF2 界面字体与 VOXAERO-01 四旋翼 GLB 模型
     │   ├── css/
-    │   │   └── style.css             # 深色玻璃拟态看板与 AR-HUD 样式
+    │   │   ├── tokens.css            # 全局色彩、字体与尺寸语义变量
+    │   │   └── style.css             # 航电座舱面板、响应式布局与 FPV 叠层样式
     │   └── js/
-    │       ├── app.js                # 应用主入口与状态管理
-    │       ├── map3d.js              # Cesium 场景、白模、空域网格、禁飞区与航迹渲染
-    │       ├── drone_sim.js          # 无人机运动插值、多视角控制与动态应急中断
-    │       ├── ar_hud.js             # FPV 第一人称 AR-HUD Canvas 叠层（引导框/净空预警）
-    │       └── agent_ui.js           # 右侧 Agent 对话框、思维链折叠展示与预设指令快捷按钮
+    │       ├── app.js                # 应用主入口、状态机与应急联动
+    │       ├── map3d.js              # Cesium 场景、白模、空域网格、防重叠标签与航迹渲染
+    │       ├── drone_sim.js          # 无人机运动插值、能耗模拟、多视角控制与动态应急
+    │       ├── ar_hud.js             # FPV 第一人称 AR-HUD Canvas 姿态与遥测叠层
+    │       ├── flight_profile.js     # 2D 离地高度（AGL）垂直飞行剖面 SVG 组件
+    │       ├── flight_replay.js      # 累计仿真时间轴与应急事件回放引擎
+    │       ├── battery_display.js    # 电量数值与分段进度条语义状态共享组件
+    │       ├── agent_ui.js           # 右侧任务调度台、校验链摘要/详情与预设指令
+    │       └── spatial_ui.js         # 动态候选起降点/航线对比与空域核验回读表单
+    ├── scripts/
+    │   ├── build_whu_scene.py        # OSM + Skadi HGT 实景数据离线构建脚本
+    │   ├── build_drone_model.py      # VOXAERO-01 glTF 2.0 模型生成脚本
+    │   └── evaluate_dispatch.py      # 真实模型与本地规则 30 用例对照评测脚本
     └── tests/
-        └── test_planner_and_api.py   # 算法避障、禁飞区绕行与核心 API 自动化测试
+        ├── fixtures/mock_scene/      # Phase 1 受控几何测试夹具
+        ├── test_planner_and_api.py   # 算法避障、禁飞区绕行与核心 API 契约测试
+        ├── test_real_scene.py        # 武大实景几何同源、起降坪贴地/屋顶与性能测试
+        └── test_spatial_dispatch.py  # 多轮消歧、动态选址、有序飞越与应急预算测试
 
 ---
 
