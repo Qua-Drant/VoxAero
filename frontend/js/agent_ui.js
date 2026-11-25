@@ -401,7 +401,7 @@ export class AgentUI {
     part("compliance").textContent = kpis.compliant
       ? `${Math.round(kpis.compliance_percent)}% · 校验 ${zoneNames.size + (result.temporary_nofly_zone ? 1 : 0)} 区` : "未通过";
     part("clearance").textContent = kpis.min_clearance_m == null ? "—" : `≥ ${(Math.floor(kpis.min_clearance_m * 10) / 10).toFixed(1)} m`;
-    part("clearance").title = "规划航段距最近建筑或禁飞区包络的最小净空";
+    part("clearance").title = "规划航段距最近建筑或电子围栏的最小物理净空";
     part("source").textContent = !intent ? "本地应急规划" : result.model_fallback ? "本地规则兜底"
       : result.mode === "live_llm" ? "模型识别" : "本地规则";
     renderAirspaceCheck(part("airspace"), result.airspace_check);

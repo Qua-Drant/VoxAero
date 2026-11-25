@@ -9,8 +9,10 @@ import pytest
 from fastapi.testclient import TestClient
 
 from backend.config import DATA_DIR, LLMSettings
+from backend.core import session as session_module
 from backend.core.airspace import Airspace
 from backend.core.planner import NoRouteError
+from backend.core.session import SessionStore
 from backend.main import create_app
 from backend.schemas import DynamicHazard, Position
 
@@ -202,8 +204,17 @@ def confirm(client, proposed, option=None):
 
 def assert_clear(scene, route, hazards=(), avoid=()):
     field, _ = scene.with_hazards(hazards, tuple(avoid))
-    coordinates = [scene.frame.to_local(Position.model_validate(point)) for point in route["waypoints"]]
-    assert all(field.segment_clear(first, last) for first, last in pairwise(coordinates))
+    waypoints = route["waypoints"]
+    coordinates = [scene.frame.to_local(Position.model_validate(point)) for point in waypoints]
+    start_id = (route.get("intent") or {}).get("start_id") or (route.get("start") or {}).get("id")
+    end_id = (route.get("intent") or {}).get("end_id") or route.get("target_id") or (route.get("end") or {}).get("id")
+    start_roof = scene.vertiports[start_id].roof_obstacle if start_id in scene.vertiports else None
+    end_roof = scene.vertiports[end_id].roof_obstacle if end_id in scene.vertiports else None
+    for index, ((first, last), end_wp) in enumerate(zip(pairwise(coordinates), waypoints[1:], strict=True)):
+        roof = start_roof if index == 0 and end_wp["phase"] == "takeoff" else (
+            end_roof if index == len(waypoints) - 2 and end_wp["phase"] == "landing" else None
+        )
+        assert field.segment_clear(first, last, roof_access=roof)
 
 
 def test_ground_options_require_selection_and_preserve_scene_catalog(client):
@@ -447,3 +458,62 @@ def test_external_snapshots_normalize_heights_and_check_validity(tmp_path):
     invalid = Airspace.from_directory(tmp_path)
     assert invalid.rule_issue and not invalid.rule_source
     assert all(item.id != "EXT-rule" for item in invalid.field.obstacles)
+
+
+def test_pad_clarification_bridges_to_spatial_landmark_and_retains_constraints(client):
+    initial = client.post("/api/agent/dispatch", json={"query": "把午餐送到测国重楼顶，避开图书馆禁飞区"})
+    assert initial.status_code == 422, initial.text
+    notice = initial.json()
+    assert notice["status"] == "needs_clarification"
+    assert not notice["clarification_token"].startswith("geo-")
+    assert notice["clarification"]["slot"] == "start"
+    assert notice["clarification"]["slots"][1]["resolved_name"] == "测国重楼顶停机坪"
+
+    bridged = answer(client, notice, "珞瑜门")
+    assert bridged["status"] == "needs_spatial_location", bridged
+    assert bridged["clarification_token"].startswith("geo-")
+    assert bridged["clarification"]["slots"][1]["resolved_name"] == "测国重楼顶停机坪"
+    assert [option["label"] for option in bridged["clarification"]["options"]] == ["珞喻门 · 西侧", "珞喻门 · 东侧"]
+    assert answer(client, notice, "珞瑜门")["status"] == "clarification_closed"
+
+    offered = answer(client, bridged, "西边那个")
+    assert offered["status"] == "choose_endpoints", offered
+    assert offered["options"][0]["start"]["reference_name"] == "珞喻门 · 西侧"
+    assert offered["options"][0]["end"]["id"] == "VP03"
+    planned = confirm(client, offered)
+    assert planned["status"] == "planned"
+    assert planned["intent"]["end_id"] == "VP03"
+    assert planned["intent"]["avoid_zone_ids"] == ["NFZ01"]
+    assert_clear(client.app.state.agent.airspace, planned, avoid=("NFZ01",))
+
+
+def test_both_missing_pad_clarification_accepts_landmark_pair(client):
+    initial = client.post("/api/agent/dispatch", json={"query": "安排一次巡检，避开图书馆禁飞区"})
+    assert initial.status_code == 422, initial.text
+    notice = initial.json()
+    assert notice["status"] == "needs_clarification"
+
+    offered = answer(client, notice, "从星空广场到信息学部操场")
+    assert offered["status"] == "choose_endpoints", offered
+    planned = confirm(client, offered)
+    assert planned["status"] == "planned"
+    assert planned["intent"]["mission_type"] == "inspection"
+    assert planned["intent"]["avoid_zone_ids"] == ["NFZ01"]
+    assert_clear(client.app.state.agent.airspace, planned, avoid=("NFZ01",))
+
+
+def test_session_store_prefix_expiry_and_lru_capacity(monkeypatch):
+    clock = [100.0]
+    monkeypatch.setattr(session_module, "monotonic", lambda: clock[0])
+    store = SessionStore(ttl_seconds=30.0, capacity=2, prefix="geo-")
+    t1 = store.issue({"n": 1})
+    t2 = store.issue({"n": 2})
+    assert t1.startswith("geo-") and store.get(t1[4:]) is None
+    assert store.update(t1, lambda value: {"n": value["n"] + 10}) == {"n": 11}
+    t3 = store.issue({"n": 3})
+    assert store.get(t1) is None
+    assert store.get(t2) == {"n": 2} and store.get(t3) == {"n": 3}
+    clock[0] = 131.0
+    assert store.get(t2) is None
+    assert store.update(t3, lambda value: value) is None
+

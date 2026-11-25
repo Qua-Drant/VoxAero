@@ -87,6 +87,7 @@
     │       ├── planner.py            # 3D 体素网格 A* 算法与三维航迹平滑器
     │       ├── intent.py             # 本地分类器与巡航高度硬/软约束解析
     │       ├── rules.py              # 外部空域快照高程基准换算与时效核验
+    │       ├── session.py            # 有界 LRU+TTL 会话缓存与共享推理步骤/回执构造器
     │       ├── agent.py              # LLM Function Calling Agent + 确定性降级与应急改航
     │       └── spatial_dispatch.py   # OSM 地标消歧、动态地面选址、有序途经与任务会话
     ├── frontend/

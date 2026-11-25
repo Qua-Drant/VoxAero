@@ -11,6 +11,7 @@ import numpy as np
 import shapely
 from shapely.errors import GEOSException
 from shapely.geometry import LineString, Point, Polygon, shape
+from shapely.geometry.polygon import orient
 from shapely.strtree import STRtree
 
 from backend.config import (
@@ -27,6 +28,8 @@ from backend.schemas import (
     BuildingProperties,
     DynamicHazard,
     GroundPoint,
+    HazardFeature,
+    HazardPolygon,
     NoFlyProperties,
     Position,
     VertiportProperties,
@@ -95,6 +98,9 @@ class Obstacle:
     footprint: Polygon
     min_alt: float
     max_alt: float
+    surface_footprint: Polygon | None = None
+    surface_min_alt: float | None = None
+    surface_max_alt: float | None = None
 
     @classmethod
     def from_hazard(cls, hazard: DynamicHazard, frame: LocalENU, index: int) -> "Obstacle":
@@ -107,6 +113,19 @@ class Obstacle:
             Point(center[:2]).buffer(radius, quad_segs=quad_segs),
             hazard.min_alt,
             hazard.max_alt,
+        )
+
+    def to_feature(self, frame: LocalENU, *, feature_id: str | None = None, name: str, reason: str) -> HazardFeature:
+        ring = [frame.to_position((x, y, 0)) for x, y in orient(self.footprint).exterior.coords]
+        return HazardFeature(
+            properties=NoFlyProperties(
+                id=feature_id or self.id,
+                name=name,
+                reason=reason,
+                min_alt=self.min_alt,
+                max_alt=self.max_alt,
+            ),
+            geometry=HazardPolygon(coordinates=[[(point.lon, point.lat) for point in ring]]),
         )
 
 
@@ -153,7 +172,7 @@ class ObstacleField:
     def segment_clearance(
         self, start: LocalPoint, end: LocalPoint, *, roof_access: Obstacle | None = None
     ) -> float:
-        """Return a lower bound on distance to the buffered obstacle volumes, in meters."""
+        """Return a lower bound on distance to physical building and fence volumes, in meters."""
         vertical = start[:2] == end[:2]
         trace = Point(start[:2]) if vertical else LineString([start[:2], end[:2]])
         low, high = sorted((start[2], end[2]))
@@ -170,14 +189,17 @@ class ObstacleField:
         for obstacle in self.obstacles:
             if vertical and obstacle is roof_access:
                 continue
-            horizontal = trace.distance(obstacle.footprint)
-            vertical_gap = max(obstacle.min_alt - high, low - obstacle.max_alt, 0)
+            surface = obstacle.surface_footprint if obstacle.surface_footprint is not None else obstacle.footprint
+            min_alt = obstacle.surface_min_alt if obstacle.surface_min_alt is not None else obstacle.min_alt
+            max_alt = obstacle.surface_max_alt if obstacle.surface_max_alt is not None else obstacle.max_alt
+            horizontal = trace.distance(surface)
+            vertical_gap = max(min_alt - high, low - max_alt, 0)
             lower_bound = hypot(horizontal, vertical_gap)
             if lower_bound >= best:
                 continue
             if spacing:
-                xy = shapely.distance(samples, obstacle.footprint)
-                z = np.maximum(np.maximum(obstacle.min_alt - heights, heights - obstacle.max_alt), 0)
+                xy = shapely.distance(samples, surface)
+                z = np.maximum(np.maximum(min_alt - heights, heights - max_alt), 0)
                 # Distance to a volume is 1-Lipschitz along the segment.
                 lower_bound = max(lower_bound, float(np.hypot(xy, z).min()) - spacing / 2)
             best = min(best, lower_bound)
@@ -337,8 +359,17 @@ class Airspace:
             properties = BuildingProperties.model_validate(data)
             footprint = shapely.transform(geometry, frame.project_xy)
             roof = properties.base_alt + properties.height
+            surface_top = max(roof, properties.collision_top_alt or 0)
             top = max(roof + BUILDING_BUFFER_M, properties.collision_top_alt or 0)
-            obstacle = Obstacle(properties.id, footprint.buffer(BUILDING_BUFFER_M), 0, top)
+            obstacle = Obstacle(
+                properties.id,
+                footprint.buffer(BUILDING_BUFFER_M),
+                0,
+                top,
+                surface_footprint=footprint,
+                surface_min_alt=properties.base_alt,
+                surface_max_alt=surface_top,
+            )
             buildings.append((roof, footprint, obstacle))
 
         obstacles = [obstacle for _, _, obstacle in buildings]

@@ -113,13 +113,13 @@ function footprintDistance(rings, x, y) {
 }
 
 export class CampusMap {
-  constructor(container, bounds, terrain) {
+  constructor(container, bounds, terrain, origin) {
     if (!Cesium) throw new Error("Cesium 资源加载失败，请检查 CDN 连接。");
     this.bounds = bounds;
     this.terrain = terrain;
     this.elevation = terrainSampler(terrain);
     const [west, south, east, north] = bounds;
-    const localOrigin = degrees([(west + east) / 2, (south + north) / 2]);
+    const localOrigin = degrees(origin ?? [(west + east) / 2, (south + north) / 2]);
     this.worldToLocal = Cesium.Matrix4.inverseTransformation(
       Cesium.Transforms.eastNorthUpToFixedFrame(localOrigin), new Cesium.Matrix4(),
     );

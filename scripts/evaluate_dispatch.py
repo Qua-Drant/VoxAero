@@ -47,7 +47,7 @@ CASES = (
           "VP01", "VP03", reply="食堂", cruise=[None, 50, False, False], avoid=["NFZ01"]),
     route("补终点并忽略时限", "从食堂起飞配送，必须在 120 秒内送达", "VP01", "VP02", reply="菜鸟"),
     Case("起终点都缺失", "请安排一个配送任务", "needs_clarification"),
-    Case("未知终点", "从食堂配送到青松楼楼顶", "needs_clarification"),
+    Case("未知终点", "从食堂配送到青松楼楼顶", "needs_spatial_location"),
     Case("地点缺少任务", "菜鸟驿站", "needs_intent", {"model_called": False}),
     route("中文限高数字", "从食堂配送到测国重楼顶，巡航高度不要超过五十米", "VP01", "VP03", cruise=[None, 50, False, False]),
     route("严格上限", "从食堂配送到测国重楼顶，巡航高度低于五十米", "VP01", "VP03", cruise=[None, 50, False, True]),

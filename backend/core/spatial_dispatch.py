@@ -3,15 +3,12 @@
 from __future__ import annotations
 
 import re
-from collections import Counter, OrderedDict
+from collections import Counter
 from dataclasses import dataclass, replace
 from difflib import SequenceMatcher
 from datetime import datetime, timezone
 from itertools import product
 from math import cos, hypot, pi, sin
-from secrets import token_urlsafe
-from threading import Lock
-from time import monotonic
 from typing import TYPE_CHECKING, Callable
 
 from openai import OpenAIError
@@ -25,16 +22,17 @@ from backend.config import CEILING_M, MISSION_LAYERS, STUDY_BOUNDS
 from backend.core.airspace import Obstacle, ObstacleField, Vertiport
 from backend.core.intent import ALT_CONTEXT, ALT_RANGE, LOW_FLIGHT, MEASUREMENT, UNSUPPORTED_STOP, intersect_limits, parse_constraints
 from backend.core.planner import NoRouteError
+from backend.core.session import SessionStore, add_step as event, build_notice
 from backend.schemas import (
     AssessedRoute, ConfirmSpatialRequest, CruiseLimits, DispatchCandidate, DispatchConstraints, DispatchIntent,
     DispatchNotice, DispatchNoticeType, DispatchResult,
-    DynamicHazard, GroundPoint, HazardFeature, HazardPolygon, LLMMode, LocationClarification, LocationOption,
-    LocationSlot, MissionType, NoFlyProperties, Position, RouteReference, RouteVisit,
+    DynamicHazard, GroundPoint, HazardFeature, LLMMode, LocationClarification, LocationOption,
+    LocationSlot, MissionType, Position, RouteReference, RouteVisit,
     SpatialChoices, SpatialOptions, SpatialRouteOption, TaskSite, ThoughtStep, VertiportProperties,
 )
 
 if TYPE_CHECKING:
-    from backend.core.agent import DispatchAgent
+    from backend.core.agent import DispatchAgent, PendingDispatch
 
 COORDINATES = re.compile(r"[\[(]\s*(-?\d+(?:\.\d+)?)\s*[,，]\s*(-?\d+(?:\.\d+)?)\s*[\])]")
 VIA_WORD = r"中途(?:经过|经由)|(?<!不)(?<!别)(?<!不要)(?:依次|先|再)?(?:经过|途经|途径|经由|飞越|飞过)|(?:先|再)经"
@@ -54,7 +52,6 @@ AIRSPACE_QUERY = re.compile(r"(?:查(?:询|看)?|核验|确认).{0,36}(?:空域|
 AVOID_CLAUSE = re.compile(r"(?:绕开|避开|绕过)[^，,。；;]*")
 TASK_AVOID_REFERENCE = re.compile(r"(?:绕开|避开|绕过)(?:我)?(?:标记|选定|画出)的?(?:区域|范围|避让区)")
 DIRECTION = {"东": (1, 0), "西": (-1, 0), "北": (0, 1), "南": (0, -1)}
-CONTEXT_LIMIT = 128
 CANDIDATE_TTL = 600
 TASK_TTL = 4 * 60 * 60
 SLOT_EDIT = re.compile(r"^(?:把|将)?(起点|终点|第\s*([一二三123])\s*个?途经点)\s*(?:换成|改成|改为|设为|是|在|[:：])\s*(.+)$")
@@ -158,10 +155,6 @@ class AmbiguousPlace(ValueError):
         names = "、".join(dict.fromkeys(place.name for place in places[:4]))
         super().__init__(f"地点有多个匹配（{names}），请选择具体位置。")
         self.places = places
-
-
-def event(steps: list[ThoughtStep], role, content: str) -> None:
-    steps.append(ThoughtStep(step=len(steps) + 1, role=role, content=content))
 
 
 def bounded(point: GroundPoint) -> bool:
@@ -277,10 +270,60 @@ class SpatialDispatch:
             self.places.setdefault("信息学部", [Place("信息学部", pad.position)])
         self.catalog = tuple(dict.fromkeys(place for group in self.places.values() for place in group))
         self.match_keys = sorted(self.places, key=len, reverse=True)
-        self.dialogs: OrderedDict[str, tuple[float, LocationTurn]] = OrderedDict()
-        self.pending: OrderedDict[str, tuple[float, CandidateSet]] = OrderedDict()
-        self.active: OrderedDict[str, tuple[float, ActiveTask]] = OrderedDict()
-        self.lock = Lock()
+        self.dialogs: SessionStore[LocationTurn] = SessionStore(CANDIDATE_TTL, prefix="geo-")
+        self.pending: SessionStore[CandidateSet] = SessionStore(CANDIDATE_TTL)
+        self.active: SessionStore[ActiveTask] = SessionStore(TASK_TTL)
+
+    def pad_clarification(self, candidate: DispatchCandidate) -> LocationClarification:
+        slot = "start" if not candidate.start_id else "end"
+        slots = [
+            LocationSlot(
+                key=key,
+                label=SLOT_LABELS[key],
+                phrase="",
+                resolved_name=self.agent.pad_names[pad_id] if pad_id else None,
+            )
+            for key, pad_id in (("start", candidate.start_id), ("end", candidate.end_id))
+        ]
+        return LocationClarification(slot=slot, label=SLOT_LABELS[slot], slots=slots, options=[], map_pick=True)
+
+    def resume_pending(
+        self, pending: PendingDispatch, query: str, options: SpatialOptions, steps: list[ThoughtStep]
+    ) -> SpatialChoices | DispatchNotice:
+        try:
+            hazards = self.task_hazards(options)
+        except ValueError as exc:
+            return self.notice("constraint_conflict", str(exc), steps)
+        candidate = pending.candidate
+        missing = "start" if not candidate.start_id else "end"
+        event(steps, "action", f"继续确认{SLOT_LABELS[missing]}，沿用已识别的地点、航层和避让要求。")
+        roles, _ = route_texts(AVOID_CLAUSE.sub("", query))
+        selected = {
+            slot: Reference(Place(self.airspace.vertiports[pad_id].properties.name,
+                                  self.airspace.vertiports[pad_id].position, pad_id), exact=True)
+            for slot, pad_id in (("start", candidate.start_id), ("end", candidate.end_id))
+            if pad_id
+        }
+        for slot, point in (("start", options.start), ("end", options.end)):
+            if point:
+                selected[slot] = Reference(Place("地图点选位置", point), exact=True)
+        slots = {
+            "start": candidate.start_id or roles.get("start", query if missing == "start" and not roles else ""),
+            "end": candidate.end_id or roles.get("end", query if missing == "end" and not roles else ""),
+        }
+        draft = SpatialDraft(
+            slots=slots,
+            selected=selected,
+            parsed=candidate,
+            constraints=pending.constraints,
+            hazards=hazards,
+            mission_type=candidate.mission_type,
+            compare=bool(COMPARE.search(query)),
+            mode=pending.mode,
+            model_called=False,
+            allow_layer_fallback=pending.allow_layer_fallback,
+        )
+        return self.advance(draft, steps)
 
     def applies(self, query: str, options: SpatialOptions | None, mentioned: list[str]) -> bool:
         if (options and (options.start or options.end or options.avoid)) or COORDINATES.search(query) or SEARCH.search(query):
@@ -525,19 +568,20 @@ class SpatialDispatch:
         status: DispatchNoticeType = "needs_spatial_location",
     ) -> DispatchNotice:
         draft, issue = turn.draft, turn.issue
-        token = self.store(self.dialogs, turn, CANDIDATE_TTL)
+        token = self.dialogs.issue(turn)
         slots = [LocationSlot(key=key, label=SLOT_LABELS[key], phrase=location_phrase(phrase),
                               resolved_name=turn.resolved[key].place.name if key in turn.resolved else None)
                  for key, phrase in draft.slots.items()]
         options = [LocationOption(label=self.option_label(ref.place, issue.options),
                                   reply=f"选项{i}", point=ref.place.point)
                    for i, ref in enumerate(issue.options, 1)]
-        detail = issue.reason
-        event(steps, "observation", detail)
-        return DispatchNotice(status=status, detail=detail, thought_steps=steps, mode=draft.mode, model_called=model_called,
-                              clarification_token=f"geo-{token}", clarification=LocationClarification(
-                                  slot=turn.slot, label=SLOT_LABELS[turn.slot], slots=slots, options=options,
-                                  map_pick=issue.map_pick, expand_search=issue.expand_search))
+        return build_notice(
+            steps, status, issue.reason, mode=draft.mode, model_called=model_called, token=token,
+            clarification=LocationClarification(
+                slot=turn.slot, label=SLOT_LABELS[turn.slot], slots=slots, options=options,
+                map_pick=issue.map_pick, expand_search=issue.expand_search,
+            ),
+        )
 
     def advance(
         self, draft: SpatialDraft, steps: list[ThoughtStep], *, model_called: bool = False,
@@ -567,7 +611,7 @@ class SpatialDispatch:
         return self.plan_draft(draft, resolved, steps)
 
     def reply(self, query: str, token: str, steps: list[ThoughtStep]) -> SpatialChoices | DispatchNotice:
-        turn = self.get(self.dialogs, token)
+        turn = self.dialogs.get(token)
         if not turn:
             return self.notice("clarification_closed", "这次地点确认已过期，请重新发送原始调度指令。", steps)
         event(steps, "action", f"继续确认{SLOT_LABELS[turn.slot]}，沿用已识别的地点、航层和避让要求。")
@@ -747,7 +791,7 @@ class SpatialDispatch:
             event(steps, "observation", "依序飞越：" + " → ".join(place.name for place in via) + "。")
         event(steps, "observation", f"完成起降及避障复核，共 {len(plans)} 条可行航线。")
         task_zones = self.task_zones(hazards)
-        token = self.store(self.pending, CandidateSet(plans, task_zones, tuple(steps), draft.mode, draft.model_called), CANDIDATE_TTL)
+        token = self.pending.issue(CandidateSet(plans, task_zones, tuple(steps), draft.mode, draft.model_called))
         return SpatialChoices(
             candidate_token=token, detail="请选择可行航线，核对起降和途经位置后确认。", mode=draft.mode,
             choice_type="routes" if compare else "sites",
@@ -907,7 +951,7 @@ class SpatialDispatch:
         raise NoRouteError("No compliant candidate route")
 
     def confirm(self, payload: ConfirmSpatialRequest) -> DispatchResult | DispatchNotice:
-        selection = self.get(self.pending, payload.candidate_token)
+        selection = self.pending.get(payload.candidate_token)
         if selection is None or payload.option_id not in selection.plans:
             return self.notice("constraint_conflict", "候选已失效或选择不存在，请重新规划。", [])
         plan = selection.plans[payload.option_id]
@@ -937,58 +981,33 @@ class SpatialDispatch:
                                    min_alt=0, max_alt=CEILING_M) for point in options.avoid)
 
     def task_zones(self, hazards: tuple[DynamicHazard, ...]) -> tuple[HazardFeature, ...]:
-        features = []
-        for index, hazard in enumerate(hazards, start=1):
-            obstacle = Obstacle.from_hazard(hazard, self.airspace.frame, index)
-            ring = [self.airspace.frame.to_position((x, y, 0)) for x, y in obstacle.footprint.exterior.coords]
-            features.append(HazardFeature(
-                properties=NoFlyProperties(id=f"task-avoid-{index}", name=f"任务避让区 {index}", reason="task_avoidance",
-                                           min_alt=hazard.min_alt, max_alt=hazard.max_alt),
-                geometry=HazardPolygon(coordinates=[[(point.lon, point.lat) for point in ring]]),
-            ))
-        return tuple(features)
-
-    def store(self, cache, value, ttl: int) -> str:
-        token = token_urlsafe(24)
-        with self.lock:
-            cache[token] = (monotonic() + ttl, value)
-            if len(cache) > CONTEXT_LIMIT:
-                cache.popitem(last=False)
-        return token
-
-    def get(self, cache, token: str):
-        with self.lock:
-            entry = cache.get(token)
-            if entry and entry[0] > monotonic():
-                return entry[1]
-            cache.pop(token, None)
-        return None
+        return tuple(
+            Obstacle.from_hazard(hazard, self.airspace.frame, index).to_feature(
+                self.airspace.frame, feature_id=f"task-avoid-{index}", name=f"任务避让区 {index}", reason="task_avoidance",
+            )
+            for index, hazard in enumerate(hazards, start=1)
+        )
 
     def activate(self, task: ActiveTask) -> str:
-        return self.store(self.active, task, TASK_TTL)
+        return self.active.issue(task)
 
     def restart(self, token: str) -> str | None:
         task = self.active_task(token)
         return self.activate(replace(task, active_hazards=())) if task else None
 
     def remember_hazard(self, token: str, hazard: DynamicHazard) -> ActiveTask | None:
-        with self.lock:
-            entry = self.active.get(token)
-            if entry is None or entry[0] <= monotonic():
-                self.active.pop(token, None)
-                return None
-            expires, task = entry
-            if hazard not in task.active_hazards:
-                if len(task.active_hazards) >= 20:
-                    raise ValueError("本任务已达到临时围栏上限。")
-                task = replace(task, active_hazards=(*task.active_hazards, hazard))
-                self.active[token] = (expires, task)
-            return task
+        def append_hazard(task: ActiveTask) -> ActiveTask:
+            if hazard in task.active_hazards:
+                return task
+            if len(task.active_hazards) >= 20:
+                raise ValueError("本任务已达到临时围栏上限。")
+            return replace(task, active_hazards=(*task.active_hazards, hazard))
+
+        return self.active.update(token, append_hazard)
 
     def active_task(self, token: str) -> ActiveTask | None:
-        return self.get(self.active, token)
+        return self.active.get(token)
 
     @staticmethod
-    def notice(status, detail: str, steps: list[ThoughtStep]) -> DispatchNotice:
-        event(steps, "observation", detail)
-        return DispatchNotice(status=status, detail=detail, thought_steps=steps)
+    def notice(status: DispatchNoticeType, detail: str, steps: list[ThoughtStep]) -> DispatchNotice:
+        return build_notice(steps, status, detail)

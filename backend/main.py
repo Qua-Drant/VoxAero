@@ -12,7 +12,7 @@ from openai import OpenAI
 
 from backend.config import (
     AIRSPACE_LAYERS, BATTERY_PERCENT_PER_CLIMB_M, BATTERY_PERCENT_PER_SECOND, DATA_DIR, FRONTEND_DIR,
-    LLMSettings, STUDY_BOUNDS,
+    LLMSettings, ORIGIN_LON_LAT, STUDY_BOUNDS,
 )
 from backend.core.agent import AgentError, DispatchAgent
 from backend.core.airspace import Airspace
@@ -62,6 +62,7 @@ def create_app(
             **request.app.state.agent.airspace.geojson,
             "airspace_layers": [asdict(layer) for layer in AIRSPACE_LAYERS],
             "bounds": STUDY_BOUNDS,
+            "origin": ORIGIN_LON_LAT,
             "battery_model": {
                 "per_second": BATTERY_PERCENT_PER_SECOND,
                 "per_climb_m": BATTERY_PERCENT_PER_CLIMB_M,

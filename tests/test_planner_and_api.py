@@ -162,6 +162,14 @@ def test_building_buffers_are_applied_on_both_axes(airspace):
     ring = np.array(feature["geometry"]["coordinates"][0])
     footprint = shape({"type": "Polygon", "coordinates": [airspace.frame.project_xy(ring)]})
     assert obstacle.footprint.equals(footprint.buffer(5))
+    isolated = ObstacleField((obstacle,))
+    vx, vy = max(footprint.exterior.coords, key=lambda coord: coord[0])
+    inside_buffer = (vx + 3.0, vy, 30.0)
+    outside_buffer = (vx + 7.0, vy, 30.0)
+    assert not isolated.segment_clear(inside_buffer, inside_buffer)
+    assert isolated.segment_clear(outside_buffer, outside_buffer)
+    assert isolated.segment_clearance(inside_buffer, inside_buffer) == pytest.approx(3.0, abs=1e-6)
+    assert isolated.segment_clearance(outside_buffer, outside_buffer) == pytest.approx(7.0, abs=1e-6)
 
 
 def test_astar_changes_altitude_between_stacked_restrictions(airspace):
@@ -281,6 +289,7 @@ def test_service_metadata_geojson_and_preview_assets(client):
     assert response.status_code == 200
     data = response.json()
     assert data["bounds"] == list(STUDY_BOUNDS)
+    assert data["origin"] == list(ORIGIN_LON_LAT)
     for key, count in [("buildings", 30), ("vertiports", 6), ("nofly_zones", 3)]:
         assert data[key]["type"] == "FeatureCollection"
         assert len(data[key]["features"]) == count

@@ -843,7 +843,7 @@ async function launch() {
       document.fonts.load('600 12px "Vox CJK"', "降落靶标").catch(() => []),
     ]);
     sceneVersion = data.scene_version;
-    map = new CampusMap("map", data.bounds, data.terrain);
+    map = new CampusMap("map", data.bounds, data.terrain, data.origin);
     await map.load(data);
     padNames = new Map(data.vertiports.features.map(({ properties }) => [properties.id, properties.name]));
     zoneNames = new Map(data.nofly_zones.features.map(({ properties }) => [properties.id, properties.name]));
