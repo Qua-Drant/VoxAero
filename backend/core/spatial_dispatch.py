@@ -139,6 +139,7 @@ class CandidatePlan:
     option: SpatialRouteOption
     task: ActiveTask
     fixed_altitude: float | None = None
+    clearance_weight: float | None = None
 
 
 @dataclass(frozen=True)
@@ -728,7 +729,7 @@ class SpatialDispatch:
                     except NoRouteError:
                         rejected["候选组合无法连成完整航线"] += 1
                         continue
-                    accepted.append((origin.site, target.site, task, route, corridor, preferred, None))
+                    accepted.append((origin.site, target.site, task, route, corridor, preferred, None, None))
                     if len(accepted) == 3:
                         break
                 if accepted or (start.exact and end.exact):
@@ -765,9 +766,14 @@ class SpatialDispatch:
         if compare:
             best = min(accepted, key=self.rank)
             accepted.extend(self.alternatives(best))
-        ranked = sorted(accepted, key=self.rank)
+        top = sorted(accepted, key=self.rank)[:3]
+        fastest_sec = min(item[3].kpis.estimated_seconds for item in top)
+        safest_clr = max((item[3].kpis.min_clearance_m or -1.0) for item in top)
+        min_clr = min((item[3].kpis.min_clearance_m or 0.0) for item in top)
+        lowest_bat = min(item[3].kpis.estimated_battery_percent for item in top)
+        max_bat = max(item[3].kpis.estimated_battery_percent for item in top)
         plans = {}
-        for number, (origin, target, task, route, corridor, _, fixed) in enumerate(ranked[:3], start=1):
+        for number, (origin, target, task, route, corridor, _, fixed, weight) in enumerate(top, start=1):
             clearance = route.kpis.min_clearance_m
             notes = []
             if corridor != primary:
@@ -775,18 +781,32 @@ class SpatialDispatch:
                 notes.append(f"改用 {layer.min_alt:g}–{layer.max_alt:g} 米航层")
             if max(origin.offset_m, target.offset_m) > NEAR_RADIUS_M:
                 notes.append("采用扩展范围内的起降点")
-            label = f"{fixed:g} m 巡航" if fixed is not None else "可行航线"
-            label = ("推荐" if number == 1 else f"方案 {number}") + " · " + label
+            highlights: list[str] = []
+            if len(top) >= 2:
+                if route.kpis.estimated_seconds <= fastest_sec + 0.05:
+                    highlights.append("最短耗时")
+                if clearance is not None and clearance >= safest_clr - 0.05 and safest_clr - min_clr >= 0.4:
+                    highlights.append("最大净空")
+                if route.kpis.estimated_battery_percent <= lowest_bat + 0.01 and max_bat - lowest_bat >= 0.1:
+                    highlights.append("低能耗")
+            variant = (
+                f"{fixed:g} m 巡航" if fixed is not None
+                else "宽净空绕行" if weight and weight > 1
+                else "紧凑直达" if weight is not None
+                else "可行航线"
+            )
+            label = ("推荐" if number == 1 else f"方案 {number}") + " · " + variant
             option = SpatialRouteOption(
                 id=f"choice-{number}", start=origin, end=target, corridor=corridor,
                 waypoints=route.waypoints, kpis=route.kpis, route_label=label,
                 route_visits=route_visits(via, route), planning_note=" · ".join(notes) or None,
+                highlights=tuple(highlights),
                 airspace_check=self.airspace.check_airspace(route.waypoints, route.flight_seconds),
                 recommendation=f"已校验 {len(via) + 2} 个任务位置 · 航程 {route.kpis.distance_m:.1f} m"
                 + (f" · 最小净空 {clearance:.1f} m" if clearance is not None else "")
                 + "。",
             )
-            plans[option.id] = CandidatePlan(option, task, fixed)
+            plans[option.id] = CandidatePlan(option, task, fixed, weight)
         if via:
             event(steps, "observation", "依序飞越：" + " → ".join(place.name for place in via) + "。")
         event(steps, "observation", f"完成起降及避障复核，共 {len(plans)} 条可行航线。")
@@ -811,17 +831,26 @@ class SpatialDispatch:
 
     @staticmethod
     def rank(item):
-        origin, target, _, route, _, preferred, _ = item
+        origin, target, _, route, _, preferred, _, _ = item
         clearance = route.kpis.min_clearance_m
         return (not preferred, origin.offset_m + target.offset_m,
                 -(clearance if clearance is not None else -1), route.distance_m)
 
     def alternatives(self, candidate):
-        origin, target, task, original, corridor, _, _ = candidate
+        origin, target, task, original, corridor, _, _, _ = candidate
         levels = self.agent.planner.cruise_levels(MISSION_LAYERS[corridor], task.intent.constraints.cruise)
         signature = lambda route: tuple((p.lon, p.lat, p.alt) for p in route.waypoints)
         seen = {signature(original)}
         alternatives = []
+        for weight in (1.35, 0.08):
+            try:
+                route, _, preferred = self.route(task, clearance_weight=weight)
+            except NoRouteError:
+                continue
+            path = signature(route)
+            if path not in seen:
+                seen.add(path)
+                alternatives.append((origin, target, task, route, corridor, preferred, None, weight))
         for level in levels:
             altitude = self.airspace.grid.center((0, 0, level))[2]
             try:
@@ -832,7 +861,7 @@ class SpatialDispatch:
             if path in seen:
                 continue
             seen.add(path)
-            alternatives.append((origin, target, task, route, corridor, preferred, altitude))
+            alternatives.append((origin, target, task, route, corridor, preferred, altitude, None))
         return alternatives
 
     def sites(
@@ -926,7 +955,9 @@ class SpatialDispatch:
         rejected[reason] += 1
         return None
 
-    def route(self, task: ActiveTask, fixed_altitude: float | None = None) -> tuple[AssessedRoute, MissionType, bool]:
+    def route(
+        self, task: ActiveTask, fixed_altitude: float | None = None, clearance_weight: float | None = None
+    ) -> tuple[AssessedRoute, MissionType, bool]:
         intent = task.intent
         corridor = task.corridor
         constraints = intent.constraints
@@ -941,10 +972,12 @@ class SpatialDispatch:
             variants = [(softer, True), (strict, False)] if softer != strict else [(strict, True)]
         for limits, preferred in variants:
             try:
-                route = self.agent.plan_3d_route(task.pads.get(intent.start_id, intent.start_id),
-                                                 task.pads.get(intent.end_id, intent.end_id),
-                                                 corridor, task.hazards, avoid_zone_ids=intent.avoid_zone_ids,
-                                                 cruise_limits=limits, via=intent.via)
+                route = self.agent.plan_3d_route(
+                    task.pads.get(intent.start_id, intent.start_id),
+                    task.pads.get(intent.end_id, intent.end_id),
+                    corridor, task.hazards, avoid_zone_ids=intent.avoid_zone_ids,
+                    cruise_limits=limits, via=intent.via, clearance_weight=clearance_weight,
+                )
             except NoRouteError:
                 continue
             return route, corridor, preferred
@@ -957,7 +990,7 @@ class SpatialDispatch:
         plan = selection.plans[payload.option_id]
         steps = list(selection.steps)
         try:
-            route, corridor, preferred = self.route(plan.task, plan.fixed_altitude)
+            route, corridor, preferred = self.route(plan.task, plan.fixed_altitude, plan.clearance_weight)
         except NoRouteError:
             return self.notice("constraint_conflict", "复核时发现所选路线不可用，请重新规划。", steps)
         event(steps, "observation", "所选起降点及航线已复核。" if preferred else "航线满足必须条件，部分偏好未满足。")

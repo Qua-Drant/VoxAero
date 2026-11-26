@@ -1,6 +1,9 @@
 import { paintBattery } from "./battery_display.js";
 
 const CYAN = "#38bdf8";
+const TEAL = "#2dd4bf";
+const AMBER = "#fbbf24";
+const CORAL = "#fb7185";
 const TEXT = "#f8fafc";
 const MUTED = "#9baabd";
 const typography = getComputedStyle(document.documentElement);
@@ -91,7 +94,11 @@ function drawCompactReadout(ctx, x, y, name, value, unit) {
   text(ctx, value.toFixed(1) + " " + unit, x, y + 24, { color: CYAN, size: 12, align: "center" });
 }
 
-function drawHeading(ctx, x, y, span, heading, compact) {
+function angleDelta(from, to) {
+  return ((to - from + 540) % 360) - 180;
+}
+
+function drawHeading(ctx, x, y, span, heading, compact, targetBearing, threat) {
   const rise = compact ? 12 : 25;
   const degrees = (Math.round(heading) % 360 + 360) % 360;
   const arcY = (offset) => y + rise * offset * offset;
@@ -116,6 +123,37 @@ function drawHeading(ctx, x, y, span, heading, compact) {
     ctx.lineWidth = 1;
     line(ctx, [[tx, ty], [tx - offset * 3, ty + 7]]);
   }
+
+  if (Number.isFinite(targetBearing)) {
+    const delta = angleDelta(heading, targetBearing);
+    const clamped = clamp(delta / 40, -.96, .96);
+    const tx = x + clamped * span;
+    const ty = arcY(clamped) - 5;
+    ctx.fillStyle = TEAL;
+    ctx.beginPath();
+    ctx.moveTo(tx, ty - 4.5);
+    ctx.lineTo(tx + 4.2, ty);
+    ctx.lineTo(tx, ty + 4.5);
+    ctx.lineTo(tx - 4.2, ty);
+    ctx.closePath();
+    ctx.fill();
+  }
+
+  if (threat && (threat.isDynamic && threat.distance < 95 || threat.distance < 15)) {
+    const delta = angleDelta(heading, threat.bearingDeg);
+    const clamped = clamp(delta / 40, -.96, .96);
+    const tx = x + clamped * span;
+    const ty = arcY(clamped) - 5;
+    const tint = threat.distance < 10 ? CORAL : AMBER;
+    ctx.fillStyle = tint;
+    ctx.beginPath();
+    ctx.moveTo(tx, ty - 5);
+    ctx.lineTo(tx + 4.6, ty + 4);
+    ctx.lineTo(tx - 4.6, ty + 4);
+    ctx.closePath();
+    ctx.fill();
+  }
+
   ctx.fillStyle = CYAN;
   ctx.shadowColor = CYAN;
   ctx.shadowBlur = 7;
@@ -129,12 +167,30 @@ function drawHeading(ctx, x, y, span, heading, compact) {
     { color: CYAN, size: compact ? 13 : 15, weight: 720, align: "center" });
 }
 
-function drawPitch(ctx, x, y, width, height, pitch, compact) {
+function drawThreatCue(ctx, width, y, heading, threat, compact) {
+  if (!threat || !(threat.isDynamic && threat.distance < 95 || threat.distance < 14)) return;
+  const delta = angleDelta(heading, threat.bearingDeg);
+  const rightSide = delta >= 0;
+  const tint = threat.distance < 10 ? CORAL : AMBER;
+  const label = `${threat.isDynamic ? "禁飞区" : "近距障碍"} ${Math.round(threat.distance)}m`;
+  const textLabel = rightSide ? `${label} ▸` : `◂ ${label}`;
+  const boxWidth = compact ? 96 : 114;
+  const boxX = rightSide ? width - boxWidth - 18 : 18;
+  const boxY = y - 13;
+  plate(ctx, boxX, boxY, boxWidth, 26, tint);
+  text(ctx, textLabel, boxX + boxWidth / 2, y, {
+    color: tint, size: compact ? 10 : 11, weight: 680, align: "center", font: LABEL_FONT, maxWidth: boxWidth - 10,
+  });
+}
+
+function drawPitch(ctx, x, y, width, height, pitch, roll, compact) {
   const radius = clamp(width * .105, 34, 104);
   const gap = clamp(radius * .38, 17, 44);
   const scale = clamp(height / 112, 3.8, 8);
   const clip = Math.min(height * (compact ? .17 : .21), 138);
   ctx.save();
+  ctx.translate(x, y);
+  ctx.rotate(-(roll || 0));
   ctx.strokeStyle = CYAN;
   ctx.lineWidth = 1.2;
   ctx.shadowColor = "#06141f";
@@ -142,21 +198,26 @@ function drawPitch(ctx, x, y, width, height, pitch, compact) {
   for (let angle = -40; angle <= 40; angle += compact ? 10 : 5) {
     const offset = (pitch - angle) * scale;
     if (Math.abs(offset) > clip || Math.abs(offset) < 13) continue;
-    const ty = y + offset;
+    const ty = offset;
     const major = angle % 10 === 0;
     const arm = major ? radius : radius * .72;
     ctx.globalAlpha = (major ? .78 : .38) * (1 - .5 * Math.abs(offset) / clip);
     ctx.setLineDash(angle < 0 ? [5, 4] : []);
-    line(ctx, [[x - arm, ty], [x - gap, ty]]);
-    line(ctx, [[x + gap, ty], [x + arm, ty]]);
+    line(ctx, [[-arm, ty], [-gap, ty]]);
+    line(ctx, [[gap, ty], [arm, ty]]);
     ctx.setLineDash([]);
     if (major && !compact) {
       const label = (angle > 0 ? "+" : "") + angle;
       const size = width < 630 ? 11 : 12;
-      text(ctx, label, x - arm - 8, ty, { color: CYAN, align: "right", size });
-      text(ctx, label, x + arm + 8, ty, { color: CYAN, size });
+      text(ctx, label, -arm - 8, ty, { color: CYAN, align: "right", size });
+      text(ctx, label, arm + 8, ty, { color: CYAN, size });
     }
   }
+  ctx.restore();
+  ctx.save();
+  ctx.strokeStyle = CYAN;
+  ctx.shadowColor = "#06141f";
+  ctx.shadowBlur = 4;
   ctx.globalAlpha = 1;
   ctx.lineWidth = 1.65;
   line(ctx, [[x - 36, y], [x - 14, y], [x - 8, y + 5]]);
@@ -193,10 +254,11 @@ export class FlightHUD {
     layout.observe(this.readouts.parentElement);
   }
 
-  update(active, frame, clearance, emergencyPhase) {
+  update(active, frame, clearance, emergencyPhase, threat = null) {
     this.overlay.hidden = !active;
     this.readouts.hidden = !active;
     this.frame = frame;
+    this.threat = frame?.onGround ? null : threat;
     if (!active) return;
 
     const alarm = !frame.onGround && clearance !== null && clearance < 12;
@@ -244,8 +306,9 @@ export class FlightHUD {
     ];
 
     const headingSpan = compact ? Math.max(25, Math.min(width / 2 - 91, width * .21)) : Math.min(width * .22, 208);
-    drawHeading(ctx, centerX, headingY, headingSpan, frame.heading ?? 0, compact);
-    drawPitch(ctx, centerX, centerY, compact ? width * .83 : width, height, (frame.pitch ?? 0) * 180 / Math.PI, compact);
+    drawHeading(ctx, centerX, headingY, headingSpan, frame.heading ?? 0, compact, frame.targetBearing, this.threat);
+    drawPitch(ctx, centerX, centerY, compact ? width * .83 : width, height, (frame.pitch ?? 0) * 180 / Math.PI, frame.roll ?? 0, compact);
+    drawThreatCue(ctx, width, headingY + (compact ? 42 : 52), frame.heading ?? 0, this.threat, compact);
     if (compact) {
       drawCompactReadout(ctx, 49, headerBottom + 12, instruments[0].name, frame.agl, "m");
       drawCompactReadout(ctx, width - 49, headerBottom + 12, instruments[1].name, frame.groundSpeed, "m/s");

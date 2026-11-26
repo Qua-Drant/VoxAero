@@ -33,6 +33,7 @@
     <symbol id="icon-focus-route" viewBox="0 0 24 24"><circle cx="12" cy="12" r="6"/><path d="M12 2v4m0 12v4M2 12h4m12 0h4m-11 3 3-5 3-1"/></symbol>
     <symbol id="icon-frame" viewBox="0 0 24 24"><path d="m3 11 9-7 9 7m-2-1.5V20H5V9.5M10 20v-6h4v6"/></symbol>
     <symbol id="icon-arrow-right" viewBox="0 0 24 24"><path d="M5 12h14m-6-6 6 6-6 6"/></symbol>
+    <symbol id="icon-director" viewBox="0 0 24 24"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="m10 9.5 5 2.5-5 2.5v-5ZM3 9h18"/></symbol>
   </svg>
   <header class="brand-bar">
     <div class="brand">
@@ -80,6 +81,14 @@
           <span id="hud-alert" class="status-label" role="status"></span>
         </div>
       </div>
+      <section id="director-banner" class="director-banner cockpit-panel" aria-label="演示导播进度" hidden>
+        <span id="director-step" class="director-step mono">1/5</span>
+        <div class="director-copy">
+          <strong id="director-title">多方案空域调度</strong>
+          <p id="director-caption">对比候选航线净空与耗时，优选三维航道</p>
+        </div>
+        <button id="director-stop" type="button" class="action-button">退出导播</button>
+      </section>
       <span id="ar-landing-label" class="ar-landing-label mono" aria-hidden="true" hidden></span>
       <div id="aircraft-tag" class="aircraft-tag" aria-hidden="true" hidden>
         <span class="status-dot"></span><strong class="mono">VOXAERO-01</strong><span class="aircraft-tag-value mono"></span>
@@ -109,7 +118,7 @@
                 <defs><linearGradient id="profile-fill" x1="0%" y1="0%" x2="0%" y2="100%"><stop stop-color="#38bdf8" stop-opacity=".30"/><stop offset="1" stop-color="#38bdf8" stop-opacity="0"/></linearGradient><clipPath id="profile-flown"><rect id="profile-clip" width="0" height="72"/></clipPath></defs>
                 <path class="profile-grid" d="M8 8H236 M8 36H236 M8 64H236"/>
                 <path id="profile-corridor" class="profile-corridor"/><path id="profile-building" class="profile-building"/>
-                <path id="profile-baseline" class="profile-baseline"/><path id="profile-plan" class="profile-plan"/>
+                <path id="profile-baseline" class="profile-baseline"/><path id="profile-superseded" class="profile-superseded"/><path id="profile-plan" class="profile-plan"/>
                 <g clip-path="url(#profile-flown)"><path id="profile-area" fill="url(#profile-fill)"/><path id="profile-track" class="profile-track"/></g>
                 <line id="profile-cursor" class="profile-cursor" visibility="hidden"/>
                 <line id="profile-clearance-line" class="profile-clearance-line" visibility="hidden"/>
@@ -272,7 +281,10 @@
         </section>
       </template>
       <div class="composer">
-        <h3 class="micro">快捷演示</h3>
+        <div class="composer-header">
+          <h3 class="micro">快捷演示</h3>
+          <button id="director-toggle" type="button" class="director-trigger" disabled><svg class="icon" aria-hidden="true"><use href="#icon-director"/></svg><span id="director-toggle-label">一键导播</span></button>
+        </div>
         <div class="presets" role="group" aria-label="一键演示">
           <button type="button" data-preset="delivery" disabled><svg class="icon" aria-hidden="true"><use href="#icon-package"/></svg>中午配送</button>
           <button type="button" data-preset="inspection" disabled><svg class="icon" aria-hidden="true"><use href="#icon-aircraft"/></svg>夜间巡检</button>

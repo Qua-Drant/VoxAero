@@ -205,6 +205,42 @@ class ObstacleField:
             best = min(best, lower_bound)
         return best
 
+    def capped_clearance(self, start: LocalPoint, end: LocalPoint, cap_m: float) -> float:
+        """Return min(cap_m, physical clearance) using STRtree spatial pruning."""
+        if cap_m <= 0:
+            return 0.0
+        vertical = start[:2] == end[:2]
+        trace = Point(start[:2]) if vertical else LineString([start[:2], end[:2]])
+        candidates = self.index.query(trace, predicate="dwithin", distance=cap_m)
+        if not len(candidates):
+            return cap_m
+        low, high = sorted((start[2], end[2]))
+        samples = heights = None
+        spacing = 0.0
+        if not vertical and low != high:
+            length = dist(start, end)
+            divisions = ceil(length / 2)
+            spacing = length / divisions
+            positions = np.linspace(start, end, divisions + 1)
+            samples = shapely.points(positions[:, :2])
+            heights = positions[:, 2]
+        best = cap_m
+        for index in candidates:
+            obstacle = self.obstacles[index]
+            surface = obstacle.surface_footprint if obstacle.surface_footprint is not None else obstacle.footprint
+            min_alt = obstacle.surface_min_alt if obstacle.surface_min_alt is not None else obstacle.min_alt
+            max_alt = obstacle.surface_max_alt if obstacle.surface_max_alt is not None else obstacle.max_alt
+            lower_bound = hypot(trace.distance(surface), max(min_alt - high, low - max_alt, 0.0))
+            if spacing and lower_bound < best:
+                xy = shapely.distance(samples, surface)
+                z = np.maximum(np.maximum(min_alt - heights, heights - max_alt), 0)
+                lower_bound = max(lower_bound, float(np.hypot(xy, z).min()) - spacing / 2)
+            best = min(best, lower_bound)
+        return best
+
+    def has_clearance(self, start: LocalPoint, end: LocalPoint, minimum_m: float) -> bool:
+        return minimum_m <= 0 or self.capped_clearance(start, end, minimum_m) >= minimum_m
+
 
 @dataclass(frozen=True)
 class Vertiport:

@@ -124,7 +124,7 @@ export class FlightReplay {
     }
     if (changedSegment) {
       this.sim.load(segment.result.waypoints, segment.result.corridor, {
-        battery: segment.battery, target: segment.target, elapsed, batteryOverride: battery,
+        battery: segment.battery, target: segment.target, elapsed, batteryOverride: battery, rerouted: index > 0,
       });
     } else {
       this.sim.seek(elapsed, battery ?? this.sim.projectBattery(segment.battery, elapsed), jumped, delta);

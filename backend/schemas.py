@@ -295,6 +295,7 @@ class SpatialRouteOption(BaseModel):
     route_label: str = "可行航线"
     planning_note: str | None = None
     route_visits: tuple[RouteVisit, ...] = ()
+    highlights: tuple[str, ...] = ()
 
 
 class SpatialChoices(BaseModel):

@@ -87,6 +87,12 @@ function makeTrack(waypoints, corridor, batteryModel) {
   };
 }
 
+function bearingDegrees(from, to) {
+  const dy = to.lat - from.lat;
+  const dx = (to.lon - from.lon) * Math.cos(C.Math.toRadians((from.lat + to.lat) / 2));
+  return (C.Math.toDegrees(Math.atan2(dx, dy)) + 360) % 360;
+}
+
 export class DroneSim {
   constructor(map, onFrame, batteryModel = DEFAULT_BATTERY_MODEL) {
     this.map = map;
@@ -100,13 +106,17 @@ export class DroneSim {
     this.frameRequest = null;
     this.previousFrame = null;
     this.guideTime = -Infinity;
+    this.rerouted = false;
+    this.followBlend = 0;
+    this.cameraFrom = null;
   }
 
-  load(waypoints, corridor, { battery, target, elapsed = 0, batteryOverride }) {
+  load(waypoints, corridor, { battery, target, elapsed = 0, batteryOverride, rerouted = false }) {
     const track = makeTrack(waypoints, corridor, this.batteryModel);
     this.pause(false);
     this.track = track;
     this.targetId = target;
+    this.rerouted = rerouted;
     this.elapsed = Math.min(elapsed, track.duration);
     this.heading = undefined;
     this.bank = 0;
@@ -151,10 +161,18 @@ export class DroneSim {
   }
 
   setView(view) {
+    const previous = this.view;
     this.view = view;
     this.guideTime = -Infinity;
     this.map.viewer.scene.screenSpaceCameraController.enableInputs = view === "overview";
-    if (view === "overview") this.map.resetView();
+    if (view === "follow" && previous !== "follow" && !matchMedia("(prefers-reduced-motion: reduce)").matches) {
+      this.followBlend = .45;
+      this.cameraFrom = C.Cartesian3.clone(this.map.viewer.camera.positionWC);
+    } else {
+      this.followBlend = 0;
+      this.cameraFrom = null;
+    }
+    if (view === "overview") this.map.resetView(previous !== "overview");
     if (this.track) {
       this.map.flightEntity.show = view !== "fpv";
       this.map.flightEntity.point.show = view === "overview";
@@ -196,10 +214,16 @@ export class DroneSim {
     const coordinates = this.elapsed === 0 ? this.track.origin
       : this.elapsed >= this.track.duration ? this.track.target : geographic(position);
     const { lon, lat, alt } = coordinates;
+    const targetWaypoint = this.track.waypoints[leg.waypointIndex] ?? this.track.target;
+    const targetDistanceM = C.Cartesian3.distance(position, world(this.track.target));
+    const targetBearing = horizontalGap(coordinates, targetWaypoint) > 1.5
+      ? bearingDegrees(coordinates, targetWaypoint)
+      : bearingDegrees(coordinates, this.track.target);
     return {
       position, coordinates: { lon, lat, alt }, leg, legIndex, battery: this.battery,
       elapsed: this.elapsed, duration: this.track.duration, playing: this.playing,
       speed: this.playing ? leg.speed : 0, complete: legIndex === -1,
+      roll: this.bank ?? 0, targetDistanceM, targetBearing,
     };
   }
 
@@ -207,12 +231,16 @@ export class DroneSim {
     const frame = this.snapshot();
     this.map.viewer.clock.currentTime = this.track.time(this.elapsed);
     const pose = this.updatePose(frame, delta);
-    if (this.view !== "overview") this.pointCamera(frame, pose);
+    frame.roll = this.bank ?? 0;
+    if (this.view !== "overview") this.pointCamera(frame, pose, delta);
     if (this.view !== "fpv") {
       this.map.showGuides([], null);
     } else if (this.elapsed - this.guideTime >= .18) {
       this.guideTime = this.elapsed;
-      this.map.showGuides(this.gates(), this.track.target, this.targetId);
+      this.map.showGuides(this.gates(), this.track.target, this.targetId, {
+        rerouted: this.rerouted,
+        distanceM: frame.targetDistanceM,
+      });
     }
     this.map.viewer.scene.requestRender();
     this.onFrame(frame);
@@ -227,13 +255,22 @@ export class DroneSim {
     const local = C.Transforms.eastNorthUpToFixedFrame(position);
     const north = C.Matrix4.multiplyByPointAsVector(local, C.Cartesian3.UNIT_Y, new C.Cartesian3());
     const east = C.Matrix4.multiplyByPointAsVector(local, C.Cartesian3.UNIT_X, new C.Cartesian3());
-    const preferred = lookLeg?.direction ?? north;
+    let preferred = lookLeg ? unit(lookLeg.direction) : north;
+    const nextLeg = legIndex >= 0 ? this.track.legs[legIndex + 1] : null;
+    if (leg.phase === "cruise" && nextLeg?.phase === "cruise" && leg.horizontal > 1 && nextLeg.horizontal > 1) {
+      const lead = Math.min(1.25, (leg.end - leg.start) * .45);
+      const remaining = leg.end - this.elapsed;
+      if (lead > .1 && remaining < lead) {
+        const blend = .5 * (1 - Math.max(0, remaining) / lead);
+        preferred = unit(C.Cartesian3.lerp(preferred, unit(nextLeg.direction), blend, new C.Cartesian3()));
+      }
+    }
     const desired = Math.atan2(C.Cartesian3.dot(preferred, east), C.Cartesian3.dot(preferred, north));
     const turn = C.Math.negativePiToPi(desired - (this.heading ?? desired));
-    const smooth = 1 - Math.exp(-delta * 9);
+    const smooth = delta > 0 ? 1 - Math.exp(-delta * 8.5) : 1;
     this.heading = this.heading === undefined ? desired : this.heading + turn * smooth;
     const cruising = leg.phase === "cruise" && !complete;
-    this.bank = cruising ? C.Math.lerp(this.bank, C.Math.clamp(turn * .65, -.23, .23), smooth) : 0;
+    this.bank = cruising ? C.Math.lerp(this.bank, C.Math.clamp(turn * .78, -.28, .28), smooth) : C.Math.lerp(this.bank, 0, smooth);
     const pitch = cruising ? C.Math.clamp(Math.atan2(leg.dz, leg.horizontal), -.12, .12) : 0;
     // Cesium maps the glTF forward axis (+Z) to local +X, which points east at zero heading.
     const attitude = new C.HeadingPitchRoll(this.heading - Math.PI / 2, pitch, this.bank);
@@ -242,7 +279,7 @@ export class DroneSim {
     return { up, forward };
   }
 
-  pointCamera(frame, { up, forward }) {
+  pointCamera(frame, { up, forward }, delta = 0) {
     const { position, leg } = frame;
     const right = unit(cross(forward, up));
     let eye;
@@ -253,7 +290,15 @@ export class DroneSim {
       eye = plus(plus(position, forward, NOSE_OFFSET), up, .47);
       sight = unit(plus(forward, up, Math.tan(pitch)));
     } else {
-      eye = plus(plus(plus(position, forward, -6.4), up, 3.9), right, 2.8);
+      const targetEye = plus(plus(plus(position, forward, -6.4), up, 3.9), right, 2.8);
+      if (this.followBlend > 0 && this.cameraFrom) {
+        this.followBlend = Math.max(0, this.followBlend - Math.max(delta, .016));
+        const t = 1 - (this.followBlend / .45) ** 2;
+        eye = C.Cartesian3.lerp(this.cameraFrom, targetEye, t, new C.Cartesian3());
+      } else {
+        eye = targetEye;
+        this.cameraFrom = null;
+      }
       const aim = plus(plus(position, forward, .65), up, .38);
       sight = unit(C.Cartesian3.subtract(aim, eye, new C.Cartesian3()));
     }
@@ -270,7 +315,7 @@ export class DroneSim {
       .slice(0, 4).map(({ corners }) => corners);
   }
 
-  proposeHazard(activeHazards) {
+  proposeHazard(activeHazards, protectedPoints = []) {
     const { coordinates: current } = this.snapshot();
     const target = this.track.target;
     for (const ahead of [7, 9, 5, 12, 15, 4, 18, 23]) {
@@ -280,6 +325,7 @@ export class DroneSim {
       const margin = Math.min(horizontalGap(center, current), horizontalGap(center, target));
       const radius = Math.min(28, Math.floor(margin * .42));
       if (radius < 14) continue;
+      if (protectedPoints.some((point) => horizontalGap(center, point) < radius + 18)) continue;
       if (activeHazards.some((hazard) => horizontalGap(center, {
         lon: hazard.center_lon, lat: hazard.center_lat,
       }) < hazard.radius_m + radius + 9)) continue;

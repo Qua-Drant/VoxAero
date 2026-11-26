@@ -170,6 +170,27 @@ def test_building_buffers_are_applied_on_both_axes(airspace):
     assert isolated.segment_clear(outside_buffer, outside_buffer)
     assert isolated.segment_clearance(inside_buffer, inside_buffer) == pytest.approx(3.0, abs=1e-6)
     assert isolated.segment_clearance(outside_buffer, outside_buffer) == pytest.approx(7.0, abs=1e-6)
+    assert not isolated.has_clearance(inside_buffer, inside_buffer, 5.0)
+    assert isolated.has_clearance(outside_buffer, outside_buffer, 6.9)
+
+
+def test_clearance_aware_smoothing_avoids_fence_grazing_and_supports_weights(airspace, planner):
+    field, _ = airspace.with_hazards((), ("NFZ01",))
+    default_route = planner.plan_3d_route("VP01", "VP03", "delivery", avoid_zone_ids=("NFZ01",))
+    _verify_route(default_route, airspace, "delivery", "VP03", "VP01", field)
+    cruise_pts = [airspace.frame.to_local(p) for p in default_route.waypoints]
+    cruise_clearance = min(
+        field.segment_clearance(a, b)
+        for (a, b), wp in zip(pairwise(cruise_pts), default_route.waypoints[1:], strict=True)
+        if wp.phase == "cruise"
+    )
+    assert cruise_clearance >= 7.5
+
+    compact = planner.plan_3d_route("VP01", "VP03", "delivery", avoid_zone_ids=("NFZ01",), clearance_weight=0.08)
+    wide = planner.plan_3d_route("VP01", "VP03", "delivery", avoid_zone_ids=("NFZ01",), clearance_weight=1.35)
+    _verify_route(compact, airspace, "delivery", "VP03", "VP01", field)
+    _verify_route(wide, airspace, "delivery", "VP03", "VP01", field)
+    assert wide.distance_m >= compact.distance_m - 1e-6
 
 
 def test_astar_changes_altitude_between_stacked_restrictions(airspace):
@@ -299,7 +320,7 @@ def test_service_metadata_geojson_and_preview_assets(client):
     page = client.get("/")
     assert page.status_code == 200 and "text/html" in page.headers["content-type"]
     assert "VoxAero — 低空三维数字孪生与智能体调度平台" in page.text
-    for path in ("/js/app.js", "/js/map3d.js", "/css/style.css"):
+    for path in ("/js/app.js", "/js/map3d.js", "/js/demo_director.js", "/css/style.css"):
         assert client.get(path).status_code == 200
     model = client.get("/assets/voxaero-01.glb")
     assert model.status_code == 200 and model.content.startswith(b"glTF\x02\x00\x00\x00")

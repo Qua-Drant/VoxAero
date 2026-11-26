@@ -9,9 +9,11 @@ import numpy as np
 from backend.config import (
     CEILING_M,
     CLEARANCE_COST_FACTOR,
+    CORNER_CHAMFER_M,
     GROUND_LAYER,
     LAYER_DEVIATION_COST_FACTOR,
     MISSION_LAYERS,
+    SMOOTH_CLEARANCE_M,
     STUDY_BOUNDS,
     AirspaceLayer,
 )
@@ -44,11 +46,16 @@ class RoutePlanner:
         avoid_zone_ids: tuple[str, ...] = (),
         cruise_limits: CruiseLimits | None = None,
         via: tuple[Position, ...] = (),
+        clearance_weight: float | None = None,
     ) -> RoutePlan:
         """Plan from a registered or validated task pad, or an airborne WGS84 position."""
         if mission_type not in MISSION_LAYERS:
             raise ValueError(f"Unknown mission type: {mission_type}")
         layer = MISSION_LAYERS[mission_type]
+        clearance_factor = CLEARANCE_COST_FACTOR if clearance_weight is None else clearance_weight
+        soft_clearance = SMOOTH_CLEARANCE_M if clearance_weight is None else (
+            12.0 if clearance_weight > CLEARANCE_COST_FACTOR else 4.5
+        )
         end_pad = self._pad(end_id) if isinstance(end_id, str) else end_id
         origin_is_pad = not isinstance(start, Position)
         if origin_is_pad:
@@ -92,11 +99,11 @@ class RoutePlanner:
             if not starts or not goals:
                 raise NoRouteError("No safe connection between a route location and its mission layer")
 
-            voxels = self._search(starts, goals, end_point, levels, blocked, layer)
+            voxels = self._search(starts, goals, end_point, levels, blocked, layer, clearance_factor)
             centers = [self.grid.center(voxel) for voxel in voxels]
             departure = (*start_point[:2], centers[0][2])
             arrival = (*end_point[:2], centers[-1][2])
-            cruise = self._smooth([departure, *centers, arrival], field)
+            cruise = self._smooth([departure, *centers, arrival], field, soft_clearance)
             if first:
                 phase: FlightPhase = "takeoff" if departure_pad else "transition" if start_point != cruise[0] else "cruise"
                 points.append((start_point, phase))
@@ -167,6 +174,7 @@ class RoutePlanner:
         levels: tuple[int, ...],
         blocked: np.ndarray,
         layer: AirspaceLayer,
+        clearance_factor: float = CLEARANCE_COST_FACTOR,
     ) -> list[Voxel]:
         nx, ny, _ = self.grid.shape
         west, south, _, _ = self.grid.bounds
@@ -216,7 +224,7 @@ class RoutePlanner:
                     continue
                 # Adjacent center-to-center edges lie entirely inside their two closed voxels.
                 neighbor = (x, y, z)
-                penalty = altitude_cost[z] + CLEARANCE_COST_FACTOR * near_obstacle[x][y][z]
+                penalty = altitude_cost[z] + clearance_factor * near_obstacle[x][y][z]
                 new_g = g + length * penalty
                 if new_g >= costs.get(neighbor, inf):
                     continue
@@ -231,18 +239,64 @@ class RoutePlanner:
             path.append(parents[path[-1]])
         return path[::-1]
 
-    @staticmethod
-    def _smooth(points: list[LocalPoint], field: ObstacleField) -> list[LocalPoint]:
-        """Retain the farthest continuously visible waypoint at each step."""
+    @classmethod
+    def _smooth(
+        cls, points: list[LocalPoint], field: ObstacleField, soft_clearance_m: float = SMOOTH_CLEARANCE_M
+    ) -> list[LocalPoint]:
+        """Retain the farthest visible waypoint that preserves soft obstacle clearance, then bevel sharp bends."""
+        step_clear = [field.capped_clearance(a, b, soft_clearance_m + 0.5) for a, b in pairwise(points)]
         smoothed = [points[0]]
         i = 0
         while i < len(points) - 1:
             for j in range(len(points) - 1, i, -1):
-                if field.segment_clear(points[i], points[j]):
-                    if points[j] != smoothed[-1]:
-                        smoothed.append(points[j])
-                    i = j
-                    break
+                if not field.segment_clear(points[i], points[j]):
+                    continue
+                if j > i + 1:
+                    required = min(soft_clearance_m, min(step_clear[i:j]) - 0.5)
+                    if not field.has_clearance(points[i], points[j], required):
+                        continue
+                if points[j] != smoothed[-1]:
+                    smoothed.append(points[j])
+                i = j
+                break
             else:
                 raise NoRouteError("Voxel path failed the continuous collision check")
-        return smoothed
+        return cls._bevel_corners(smoothed, field, soft_clearance_m)
+
+    @staticmethod
+    def _bevel_corners(
+        points: list[LocalPoint], field: ObstacleField, soft_clearance_m: float
+    ) -> list[LocalPoint]:
+        if len(points) < 3:
+            return points
+        beveled = [points[0]]
+        for index in range(1, len(points) - 1):
+            a, b, c = points[index - 1], points[index], points[index + 1]
+            len_u, len_v = dist(a, b), dist(b, c)
+            if len_u >= 24.0 and len_v >= 24.0:
+                ux, uy, uz = b[0] - a[0], b[1] - a[1], b[2] - a[2]
+                vx, vy, vz = c[0] - b[0], c[1] - b[1], c[2] - b[2]
+                cos_turn = (ux * vx + uy * vy + uz * vz) / (len_u * len_v)
+                if -0.85 < cos_turn < 0.927:
+                    trim = min(CORNER_CHAMFER_M, 0.28 * len_u, 0.28 * len_v)
+                    b_in = (b[0] - ux * trim / len_u, b[1] - uy * trim / len_u, b[2] - uz * trim / len_u)
+                    b_out = (b[0] + vx * trim / len_v, b[1] + vy * trim / len_v, b[2] + vz * trim / len_v)
+                    local_floor = min(
+                        soft_clearance_m,
+                        field.capped_clearance(a, b, soft_clearance_m),
+                        field.capped_clearance(b, c, soft_clearance_m),
+                    ) - 0.5
+                    if (
+                        field.segment_clear(beveled[-1], b_in)
+                        and field.segment_clear(b_in, b_out)
+                        and field.has_clearance(b_in, b_out, local_floor)
+                    ):
+                        beveled.extend((b_in, b_out))
+                        continue
+            beveled.append(b)
+        if points[-1] != beveled[-1]:
+            if field.segment_clear(beveled[-1], points[-1]):
+                beveled.append(points[-1])
+            else:
+                return points
+        return beveled

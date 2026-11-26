@@ -5,6 +5,7 @@ import { FlightHUD } from "./ar_hud.js";
 import { batteryReading, paintBattery } from "./battery_display.js";
 import { AgentUI, plainDispatchText } from "./agent_ui.js";
 import { VerticalProfile } from "./flight_profile.js";
+import { DemoDirector } from "./demo_director.js";
 
 const element = (id) => document.getElementById(id);
 const layerToggles = [...document.querySelectorAll("[data-layer]")];
@@ -45,8 +46,10 @@ let frame;
 let padNames;
 let zoneNames;
 let clearance = null;
+let activeThreat = null;
 let lastTelemetry = -Infinity;
 let profile;
+let director;
 const timeline = element("flight-timeline");
 const seek = element("dock-seek");
 const clock = new Intl.DateTimeFormat("zh-CN", { hour: "2-digit", minute: "2-digit", second: "2-digit", hourCycle: "h23" });
@@ -56,7 +59,10 @@ setInterval(tickClock, 1000);
 
 const guide = element("user-guide");
 const guideKey = "voxaero.user-guide.v1";
-element("open-user-guide").addEventListener("click", () => guide.showModal());
+element("open-user-guide").addEventListener("click", () => {
+  director?.stop("打开用户指南，已暂停自动导播。");
+  guide.showModal();
+});
 guide.addEventListener("close", () => {
   try { localStorage.setItem(guideKey, "seen"); } catch { /* Storage can be blocked. */ }
 });
@@ -145,6 +151,7 @@ function updateControls() {
     && frame.leg.phase === "cruise" && frame.coordinates.alt >= 30;
   const canPlan = Boolean(sim) && !locked && !isInFlight();
   ui.setAvailable(canPlan, Boolean(draft || proposal));
+  director?.setAvailable(Boolean(sim) && !busy && !review?.active && !guide.open);
   for (const button of pickButtons) button.disabled = !canPlan;
   element("clear-spatial").disabled = !canPlan;
   playButton.disabled = !replaying && (!planned || locked || Boolean(draft || proposal) || frame?.complete || mission?.hold);
@@ -219,7 +226,9 @@ function onFrame(next) {
   if (!next.playing || next.playing !== previous?.playing || next.leg !== previous?.leg
       || now - lastTelemetry >= 120 || next.elapsed < previous?.elapsed) {
     lastTelemetry = now;
-    clearance = next.onGround ? null : map.clearance(next.coordinates, mission.avoid);
+    const report = next.onGround ? { clearance: null, threat: null } : map.clearanceReport(next.coordinates, mission.avoid);
+    clearance = report.clearance;
+    activeThreat = report.threat;
   }
   recordVisits(next.elapsed);
   paintTelemetry(next, sim);
@@ -305,7 +314,7 @@ function paintTelemetry(next, currentSim) {
   if (profile.track === currentSim.track) profile.paint(next);
   const emergencyPhase = !review?.active && !next.onGround && (busy === "replan" || mission?.hold || mission?.rerouted)
     ? flightState() : null;
-  hud.update(currentSim.view === "fpv", next, next.onGround ? null : clearance, emergencyPhase);
+  hud.update(currentSim.view === "fpv", next, next.onGround ? null : clearance, emergencyPhase, activeThreat);
 }
 
 const landingStart = (track) => track.legs.find((leg) => leg.phase === "landing")?.start ?? track.duration;
@@ -356,7 +365,21 @@ function showRouteData(result, target) {
   element("mission-target").title = targetLabel(start) + " → " + targetLabel(target);
 }
 
-function installRoute(result, target, battery = 100, rerouted = false) {
+function missionComparison(priorSegments, incident) {
+  if (!priorSegments?.length) return null;
+  return {
+    priorWaypoints: priorSegments.at(-1)?.result.waypoints ?? null,
+    flownSegments: priorSegments.map(({ flown }, idx) => ({ flown, rerouted: idx > 0 })),
+    ...(incident ?? {}),
+  };
+}
+
+function installRoute(result, target, battery = 100, rerouted = false, incident = null) {
+  const priorSegments = rerouted ? mission.segments.slice() : [];
+  if (incident) mission.lastIncident = incident;
+  else if (!rerouted) mission.lastIncident = null;
+  const comparison = rerouted ? missionComparison(priorSegments, mission.lastIncident) : null;
+  mission.comparison = comparison;
   mission.target = target;
   mission.current = result;
   mission.rerouted = rerouted;
@@ -372,16 +395,16 @@ function installRoute(result, target, battery = 100, rerouted = false) {
   lastTelemetry = -Infinity;
   map.setHazards(mission.volumes);
   map.setRouteTargets(mission.original.intent.start_id, target);
-  map.drawRoute(result.waypoints, rerouted, false, result.route_visits);
+  map.drawRoute(result.waypoints, rerouted, false, result.route_visits, comparison);
   showRouteData(result, target);
   ui.updatePlan(result, target, siteName(target));
   ui.setVisitProgress(mission.completedVisits, mission.diverted);
-  sim.load(result.waypoints, result.corridor, { battery, target });
+  sim.load(result.waypoints, result.corridor, { battery, target, rerouted });
   mission.segmentVisits = (result.route_visits ?? []).flatMap(visit => {
     const leg = sim.track.legs.find(step => step.waypointIndex === visit.waypoint_index);
     return leg ? [{ ...visit, second: leg.end, position: result.waypoints[visit.waypoint_index] }] : [];
   });
-  profile.setTrack(sim.track, result.corridor, rerouted ? "改航点" : mission.original.intent.start_id, target);
+  profile.setTrack(sim.track, result.corridor, rerouted ? "改航点" : mission.original.intent.start_id, target, comparison?.priorWaypoints);
   profile.paint(frame);
   if (!rerouted) {
     mission.climbEnds = sim.track.legs.find((leg) => leg.phase !== "takeoff")?.start ?? sim.track.duration;
@@ -411,9 +434,12 @@ function paintReplay(next, record, segment) {
   const now = performance.now();
   if (!review.playing || now - lastTelemetry >= 120) {
     lastTelemetry = now;
-    clearance = next.onGround ? null : map.clearance(next.coordinates, record.avoid);
+    const report = next.onGround ? { clearance: null, threat: null } : map.clearanceReport(next.coordinates, record.avoid);
+    clearance = report.clearance;
+    activeThreat = report.threat;
     if (profile.track !== review.sim.track) {
-      profile.setTrack(review.sim.track, segment.result.corridor, segment.start ? "改航点" : record.startId, segment.target);
+      const prior = segment.start ? record.segments[0]?.result.waypoints : null;
+      profile.setTrack(review.sim.track, segment.result.corridor, segment.start ? "改航点" : record.startId, segment.target, prior);
     }
   }
   ui.setVisitProgress(record.events.filter(event => event.visit && event.at <= at).length);
@@ -435,11 +461,11 @@ function setReplayMode(active) {
     if (sim.view === "overview") map.resetView();
     map.setTaskSites(mission.original.task_sites);
     map.setHazards(mission.volumes);
-    map.drawRoute(mission.current.waypoints, mission.rerouted, false, mission.current.route_visits);
+    map.drawRoute(mission.current.waypoints, mission.rerouted, false, mission.current.route_visits, mission.comparison);
     ui.setVisitProgress(mission.completedVisits, mission.diverted);
     map.setRouteTargets(mission.original.intent.start_id, mission.target);
     showRouteData(mission.current, mission.target);
-    profile.setTrack(sim.track, mission.current.corridor, mission.rerouted ? "改航点" : mission.original.intent.start_id, mission.target);
+    profile.setTrack(sim.track, mission.current.corridor, mission.rerouted ? "改航点" : mission.original.intent.start_id, mission.target, mission.comparison?.priorWaypoints);
     setMissionTimeline();
     sim.attach();
   }
@@ -480,7 +506,7 @@ function discardDraft() {
   map.setTaskSites(mission?.original.task_sites);
   map.setHazards(mission?.volumes ?? []);
   map.setRouteTargets(mission?.original.intent.start_id, mission?.target);
-  map.drawRoute(mission?.current.waypoints ?? [], mission?.rerouted, false, mission?.current.route_visits);
+  map.drawRoute(mission?.current.waypoints ?? [], mission?.rerouted, false, mission?.current.route_visits, mission?.comparison);
   renderSpatialPicks();
 }
 
@@ -614,6 +640,7 @@ function presentChoices(result, query) {
   element("spatial-input").open = false;
   setView("overview");
   renderSpatialPicks();
+  let framedChoices = false;
   ui.showChoices(result, {
     preview: (option) => {
       proposal.option = option;
@@ -622,8 +649,15 @@ function presentChoices(result, query) {
       showSiteReferences([option.start, option.end]);
       map.setHazards(result.task_zones ?? []);
       map.setRouteTargets(option.start.id, option.end.id);
-      map.drawRoute(option.waypoints, false, true, option.route_visits);
-      focusTaskRoute();
+      if (result.choice_type === "routes" && result.options.length > 1) {
+        map.drawCandidateRoutes(result.options, option.id);
+      } else {
+        map.drawRoute(option.waypoints, false, true, option.route_visits);
+      }
+      if (!framedChoices || result.choice_type !== "routes") {
+        framedChoices = true;
+        focusTaskRoute();
+      }
     },
     confirm: confirmCandidate,
     cancel: () => {
@@ -749,16 +783,20 @@ function beginMapPick(role) {
   });
 }
 
+function remainingVisitPoints() {
+  return (mission?.segmentVisits ?? []).slice(mission?.nextVisit ?? 0).map((visit) => visit.position);
+}
+
 async function replan(type, { automatic = false } = {}) {
   const button = type === "wind_gust" ? windButton : batteryButton;
-  if (button.disabled || busy || !mission) return;
-  const hazard = type === "wind_gust" ? sim.proposeHazard(mission.hazards) : null;
+  if (button.disabled || busy || !mission) return false;
+  const hazard = type === "wind_gust" ? sim.proposeHazard(mission.hazards, remainingVisitPoints()) : null;
   if (type === "wind_gust" && !hazard) {
     if (automatic && !batteryButton.disabled) {
       type = "low_battery";
     } else {
       ui.status("前方巡航航段不足，无法在避开当前位置与目的地的情况下放置禁飞区。", true);
-      return;
+      return false;
     }
   }
 
@@ -807,8 +845,12 @@ async function replan(type, { automatic = false } = {}) {
     mission.elapsedBeforeSegment = elapsed;
     mission.hold = false;
     mission.segments[segmentIndex].flown = sim.flownWaypoints(before);
-    installRoute(result, result.target_id, sim.battery, true);
     const action = type === "low_battery" ? "备降" : "绕飞";
+    installRoute(result, result.target_id, sim.battery, true, {
+      incidentPoint: before.coordinates,
+      incidentLabel: type === "low_battery" ? "备降决策点" : "空中改航点",
+      incidentDetail: `${incident} · 高度 ${format.format(before.coordinates.alt)} m`,
+    });
     const detail = hazard ? `临时禁飞区半径 ${format.format(hazard.radius_m)} 米`
       : `改降 ${targetLabel(result.target_id)}${result.arrival_battery_percent == null
         ? "" : ` · 预计落地电量 ${format.format(result.arrival_battery_percent)}%`}`;
@@ -820,6 +862,7 @@ async function replan(type, { automatic = false } = {}) {
       ? "" : ` · 预计落地电量 ${format.format(result.arrival_battery_percent)}%`}。`);
     if (before.playing || wasHolding) sim.play();
     void ui.revealSteps(exchange, result.thought_steps, zoneNames);
+    return true;
   } catch (error) {
     const detail = plainDispatchText(error.message);
     keepFence(error.temporaryFence);
@@ -829,6 +872,7 @@ async function replan(type, { automatic = false } = {}) {
     saveReview(sim.snapshot(), "仿真悬停 · 应急规划未成功");
     ui.status(`${incident}，已悬停 · ${detail}`, true);
     void ui.revealSteps(exchange, error.steps);
+    return false;
   } finally {
     busy = null;
     refreshFlightState();
@@ -859,6 +903,56 @@ async function launch() {
       },
       onMode: setReplayMode, onOverview: () => setView("overview"), onPlayback: updateControls,
     }, seek);
+    director = new DemoDirector({
+      canStart: () => Boolean(sim && !busy && !review?.active && !guide.open),
+      prepareStart: () => {
+        const saved = automaticEmergency.checked;
+        automaticEmergency.checked = false;
+        if (review?.active) review.close();
+        if (mission) {
+          sim.pause(false);
+          sim.track = null;
+          map.flightEntity.show = false;
+          map.aircraftTag.hidden = true;
+          map.aircraftLeader.show = false;
+          map.showGuides([], null);
+          mission = null;
+          frame = null;
+        }
+        discardDraft();
+        clearClarification();
+        clearSpatialPicks();
+        setView("overview");
+        refreshFlightState();
+        return saved;
+      },
+      restoreAutoEmergency: (saved) => { automaticEmergency.checked = saved; },
+      dispatchDemo: (query) => dispatch(query, { newTask: true }),
+      getProposal: () => proposal,
+      previewCandidate: (index) => {
+        const radios = document.querySelectorAll('.candidate-form input[name="candidate"]');
+        const targetRadio = radios[index];
+        if (targetRadio && !targetRadio.checked) {
+          targetRadio.checked = true;
+          targetRadio.dispatchEvent(new Event("change"));
+        }
+      },
+      confirmCandidate: (optionId) => confirmCandidate(optionId),
+      getDraft: () => draft,
+      confirmDraft: () => confirmDraft(),
+      getState: () => ({ mission, frame, busy, sim }),
+      canInjectWindGust: () => Boolean(mission && !windButton.disabled
+        && sim?.proposeHazard(mission.hazards, remainingVisitPoints())),
+      setView: (view) => setView(view),
+      setRate: (rate) => setPlaybackRate(rate),
+      focusRoute: () => focusTaskRoute(),
+      triggerWindGust: () => replan("wind_gust", { automatic: true }),
+      openReview: () => {
+        const panel = element("flight-review");
+        if (panel && !panel.hidden) panel.open = true;
+      },
+      onStatus: (message) => ui.status(message),
+    });
     for (const toggle of layerToggles) {
       toggle.disabled = toggle.dataset.layer === "roads" && !data.roads;
       toggle.addEventListener("change", () => {
@@ -961,16 +1055,32 @@ function focusTaskRoute() {
   const currentSim = review?.sim ?? sim;
   const waypoints = review?.active
     ? review.record.segments.slice(0, review.segmentIndex + 1).flatMap(({ flown }) => flown)
-    : proposal?.option?.waypoints ?? draft?.result.waypoints ?? mission?.current.waypoints;
+    : proposal?.result?.choice_type === "routes"
+      ? proposal.result.options.flatMap((opt) => opt.waypoints)
+      : proposal?.option?.waypoints ?? draft?.result.waypoints ?? [
+        ...(mission?.comparison?.priorWaypoints ?? []),
+        ...(mission?.current.waypoints ?? []),
+      ];
   if (currentSim.view !== "overview") setView("overview");
   if (waypoints?.length) map.focusRoute(waypoints, document.querySelector(".map-overlay").clientWidth);
-  else map.resetView();
+  else map.resetView(true);
 }
 
-element("reset-view").addEventListener("click", () => setView("overview"));
-focusButton.addEventListener("click", focusTaskRoute);
+function setPlaybackRate(rate) {
+  if (review?.active) review.rate = rate;
+  else sim?.setRate(rate);
+  updateControls();
+}
+
+function manualTakeover() {
+  if (director?.active) director.stop("已切换为手动控制。");
+}
+
+element("reset-view").addEventListener("click", () => { manualTakeover(); setView("overview"); });
+focusButton.addEventListener("click", () => { manualTakeover(); focusTaskRoute(); });
 seek.addEventListener("input", () => {
   if (!review?.active) return;
+  manualTakeover();
   review.pause();
   review.seek(seek.valueAsNumber * review.record.duration);
 });
@@ -980,16 +1090,17 @@ for (const button of fpvPanelButtons) {
     setFpvPanel(document.body.dataset.fpvPanel === panel ? null : panel);
   });
 }
-for (const button of viewButtons) button.addEventListener("click", () => setView(button.dataset.view));
+for (const button of viewButtons) {
+  button.addEventListener("click", () => { manualTakeover(); setView(button.dataset.view); });
+}
 for (const button of rateButtons) {
   button.addEventListener("click", () => {
-    const rate = Number(button.dataset.rate);
-    if (review.active) review.rate = rate;
-    else sim.setRate(rate);
-    updateControls();
+    manualTakeover();
+    setPlaybackRate(Number(button.dataset.rate));
   });
 }
 playButton.addEventListener("click", () => {
+  manualTakeover();
   if (review?.active) {
     if (review.playing) review.pause();
     else review.resume();
@@ -1004,6 +1115,7 @@ playButton.addEventListener("click", () => {
   }
 });
 resetButton.addEventListener("click", async () => {
+  manualTakeover();
   if (!mission || busy) return;
   if (mission.hazards.length && mission.original.mission_token) {
     busy = "reset";
@@ -1032,20 +1144,30 @@ resetButton.addEventListener("click", async () => {
   ui.status("已返回起点。");
   refreshFlightState();
 });
-for (const button of pickButtons) button.addEventListener("click", () => beginMapPick(button.dataset.mapPick));
+for (const button of pickButtons) button.addEventListener("click", () => { manualTakeover(); beginMapPick(button.dataset.mapPick); });
 element("clear-spatial").addEventListener("click", () => {
+  manualTakeover();
   discardDraft();
   clearSpatialPicks();
   refreshFlightState();
   ui.status("已清除地图选点和任务避让区。");
 });
 document.addEventListener("keydown", (event) => {
-  if (event.key === "Escape" && pickRole && !guide.open) {
-    stopMapPick();
-    ui.status("已取消地图点选。");
+  if (event.key === "Escape" && !guide.open) {
+    if (director?.active) {
+      director.stop("已按退出键结束导播，切换为手动控制。");
+      return;
+    }
+    if (pickRole) {
+      stopMapPick();
+      ui.status("已取消地图点选。");
+    }
   }
 });
-windButton.addEventListener("click", () => replan("wind_gust"));
-batteryButton.addEventListener("click", () => replan("low_battery"));
+windButton.addEventListener("click", () => { manualTakeover(); void replan("wind_gust"); });
+batteryButton.addEventListener("click", () => { manualTakeover(); void replan("low_battery"); });
+document.querySelector(".composer")?.addEventListener("pointerdown", (event) => {
+  if (director?.active && !event.target.closest("#director-toggle")) manualTakeover();
+});
 launch();
 api("/api/health").then(({ llm_mode }) => ui.setMode(llm_mode)).catch(() => ui.setMode(null));

@@ -241,6 +241,7 @@ class DispatchAgent:
         avoid_zone_ids: tuple[str, ...] = (),
         cruise_limits: CruiseLimits | None = None,
         via: tuple[RouteReference, ...] = (),
+        clearance_weight: float | None = None,
     ) -> AssessedRoute:
         if via:
             layer = MISSION_LAYERS[mission_type]
@@ -250,8 +251,10 @@ class DispatchAgent:
                 positions = tuple(Position(lon=site.lon, lat=site.lat, alt=altitude) for site in via)
                 limits = CruiseLimits(min_alt=altitude, max_alt=altitude)
                 try:
-                    route = self.planner.plan_3d_route(start, end_id, mission_type, extra_nofly_zones,
-                                                       avoid_zone_ids=avoid_zone_ids, cruise_limits=limits, via=positions)
+                    route = self.planner.plan_3d_route(
+                        start, end_id, mission_type, extra_nofly_zones, avoid_zone_ids=avoid_zone_ids,
+                        cruise_limits=limits, via=positions, clearance_weight=clearance_weight,
+                    )
                     break
                 except NoRouteError:
                     continue
@@ -259,7 +262,8 @@ class DispatchAgent:
                 raise NoRouteError("No route visits all requested locations in order")
         else:
             route = self.planner.plan_3d_route(
-                start, end_id, mission_type, extra_nofly_zones, avoid_zone_ids=avoid_zone_ids, cruise_limits=cruise_limits,
+                start, end_id, mission_type, extra_nofly_zones, avoid_zone_ids=avoid_zone_ids,
+                cruise_limits=cruise_limits, clearance_weight=clearance_weight,
             )
         kpis, flight_seconds = self._metrics(route, mission_type, start, end_id, extra_nofly_zones, avoid_zone_ids)
         return AssessedRoute(**route.model_dump(), kpis=kpis, flight_seconds=flight_seconds)

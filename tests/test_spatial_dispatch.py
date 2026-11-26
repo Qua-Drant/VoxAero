@@ -517,3 +517,15 @@ def test_session_store_prefix_expiry_and_lru_capacity(monkeypatch):
     assert store.get(t2) is None
     assert store.update(t3, lambda value: value) is None
 
+
+def test_multi_route_comparison_populates_objective_highlights(client):
+    offered = suggest(client, "从星空广场起飞，依次途经星湖、星湖南路，最后到信息学部操场巡检，比较多条航线。")
+    assert offered["choice_type"] == "routes" and len(offered["options"]) >= 2
+    all_highlights = {tag for option in offered["options"] for tag in option["highlights"]}
+    assert "最短耗时" in all_highlights
+    for option in offered["options"]:
+        confirmed = confirm(client, offered, option["id"])
+        assert confirmed["status"] == "planned"
+        assert confirmed["waypoints"] == option["waypoints"]
+
+

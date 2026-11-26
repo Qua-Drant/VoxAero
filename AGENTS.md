@@ -105,7 +105,8 @@
     │       ├── flight_replay.js      # 累计仿真时间轴与应急事件回放引擎
     │       ├── battery_display.js    # 电量数值与分段进度条语义状态共享组件
     │       ├── agent_ui.js           # 右侧任务调度台、校验链摘要/详情与预设指令
-    │       └── spatial_ui.js         # 动态候选起降点/航线对比与空域核验回读表单
+    │       ├── spatial_ui.js         # 动态候选起降点/航线对比与空域核验回读表单
+    │       └── demo_director.js      # 五幕工程演示自动导播与随时手动接管编排器
     ├── scripts/
     │   ├── build_whu_scene.py        # OSM + Skadi HGT 实景数据离线构建脚本
     │   ├── build_drone_model.py      # VOXAERO-01 glTF 2.0 模型生成脚本

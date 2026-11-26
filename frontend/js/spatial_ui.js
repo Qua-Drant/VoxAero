@@ -88,20 +88,36 @@ export function spatialCandidateForm(result, callbacks) {
     radio.checked = index === 0;
     radio.addEventListener("change", () => preview(option));
     const content = document.createElement("span");
+    const head = document.createElement("span");
+    head.className = "candidate-head";
     const route = document.createElement("strong");
     const endpoints = `${option.start.name} → ${option.end.name}`;
     route.textContent = compare ? option.route_label : endpoints;
     route.title = endpoints;
+    head.append(route);
+    if (option.highlights?.length) {
+      const badges = document.createElement("span");
+      badges.className = "candidate-badges";
+      for (const tag of option.highlights) {
+        const badge = document.createElement("em");
+        badge.className = "candidate-badge";
+        badge.dataset.kind = tag === "最大净空" ? "safe" : tag === "最短耗时" ? "fast" : "eco";
+        badge.textContent = tag;
+        badges.append(badge);
+      }
+      head.append(badges);
+    }
     const measurements = document.createElement("small");
     const kpis = option.kpis;
-    measurements.textContent = `${number.format(kpis.distance_m)} m · ${kpis.min_clearance_m == null ? "净空待估" : `净空 ${number.format(kpis.min_clearance_m)} m`}`;
+    const clearanceText = kpis.min_clearance_m == null ? "净空待估" : `净空 ≥ ${number.format(kpis.min_clearance_m)} m`;
+    measurements.textContent = `${number.format(kpis.distance_m)} m · 预计 ${number.format(kpis.estimated_seconds)} s · ${clearanceText} · 耗电 ${number.format(kpis.estimated_battery_percent)}%`;
     if (compare) {
       const location = document.createElement("small");
       location.className = "candidate-endpoints";
       location.textContent = endpoints;
       location.title = endpoints;
-      content.append(route, location, measurements);
-    } else content.append(route, measurements);
+      content.append(head, location, measurements);
+    } else content.append(head, measurements);
     label.append(radio, content);
     fieldset.append(label);
   });

@@ -11,13 +11,13 @@ export class VerticalProfile {
   constructor(map) {
     this.map = map;
     this.nodes = Object.fromEntries([
-      "band", "start", "end", "corridor", "building", "baseline", "plan",
+      "band", "start", "end", "corridor", "building", "baseline", "superseded", "plan",
       "area", "track", "clip", "position", "cursor", "clearance-line", "altitude",
     ].map((key) => [key, element(key)]));
     this.ticks = document.querySelectorAll(".profile-ticks span");
   }
 
-  setTrack(track, corridor, start, end) {
+  setTrack(track, corridor, start, end, priorWaypoints = null) {
     const nodes = this.nodes;
     const [floor, ceiling] = CORRIDORS[corridor];
     nodes.band.textContent = `场景航层 ${floor}–${ceiling} m`;
@@ -34,7 +34,25 @@ export class VerticalProfile {
       const surface = this.map.profileSurface(Cesium.Math.toDegrees(longitude), Cesium.Math.toDegrees(latitude));
       return { x: this.x(time), alt: height, ...surface };
     });
-    const max = Math.max(...this.samples.map(({ alt, roof, ground }) => Math.max(alt, roof, ceiling) - ground));
+    let priorSamples = null;
+    if (priorWaypoints?.length > 1) {
+      let total = 0;
+      const cumulative = [0];
+      for (let i = 1; i < priorWaypoints.length; i += 1) {
+        const a = Cesium.Cartesian3.fromDegrees(priorWaypoints[i - 1].lon, priorWaypoints[i - 1].lat, priorWaypoints[i - 1].alt);
+        const b = Cesium.Cartesian3.fromDegrees(priorWaypoints[i].lon, priorWaypoints[i].lat, priorWaypoints[i].alt);
+        total += Cesium.Cartesian3.distance(a, b);
+        cumulative.push(total);
+      }
+      if (total > 0) {
+        priorSamples = priorWaypoints.map((point, index) => {
+          const surface = this.map.profileSurface(point.lon, point.lat);
+          return { x: LEFT + (RIGHT - LEFT) * (cumulative[index] / total), alt: point.alt, ...surface };
+        });
+      }
+    }
+    const maxPrior = priorSamples ? Math.max(...priorSamples.map(({ alt, ground }) => alt - ground)) : 0;
+    const max = Math.max(maxPrior, ...this.samples.map(({ alt, roof, ground }) => Math.max(alt, roof, ceiling) - ground));
     this.limit = Math.max(50, Math.ceil((max + 4) / 20) * 20);
     [this.limit, this.limit / 2, 0].forEach((value, index) => { this.ticks[index].textContent = value; });
     const upper = this.samples.map(({ x, ground }) => [x, this.y(ceiling - ground)]);
@@ -44,6 +62,7 @@ export class VerticalProfile {
     nodes.corridor.setAttribute("d", path([...upper, ...lower.slice().reverse()]) + "Z");
     nodes.baseline.setAttribute("d", path(lower));
     nodes.building.setAttribute("d", path([[LEFT, BOTTOM], ...silhouette, [RIGHT, BOTTOM]]) + "Z");
+    nodes.superseded.setAttribute("d", priorSamples ? path(priorSamples.map(({ x, alt, ground }) => [x, this.y(alt - ground)])) : "");
     nodes.plan.setAttribute("d", path(flight));
     nodes.track.setAttribute("d", path(flight));
     nodes.area.setAttribute("d", path([[LEFT, BOTTOM], ...flight, [RIGHT, BOTTOM]]) + "Z");

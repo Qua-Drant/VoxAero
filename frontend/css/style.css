@@ -8,8 +8,11 @@ h1, h2, h3, p, ol, dl, dd, figure { margin: 0; }
 :where(svg, canvas) { display: block; }
 button, input, textarea { margin: 0; color: inherit; font: inherit; font-variant-numeric: inherit; }
 button, summary { -webkit-tap-highlight-color: transparent; }
-button { appearance: none; border: 1px solid var(--border-hairline); border-radius: var(--radius-control); background: var(--surface-control); color: inherit; height: 30px; padding: 0 9px; display: inline-flex; align-items: center; justify-content: center; gap: 6px; white-space: nowrap; cursor: pointer; }
+button { appearance: none; border: 1px solid var(--border-hairline); border-radius: var(--radius-control); background: var(--surface-control); color: inherit; height: 30px; padding: 0 9px; display: inline-flex; align-items: center; justify-content: center; gap: 6px; white-space: nowrap; cursor: pointer; transition-property: scale, background-color, border-color, color; transition-duration: 140ms; transition-timing-function: ease-out; }
 button:enabled:hover { background: var(--surface-control-hover); }
+@media (prefers-reduced-motion: no-preference) {
+  button:enabled:active:not(.plan-location):not(.review-event) { scale: .96; }
+}
 button:disabled { cursor: default; color: var(--text-muted); }
 :focus-visible { outline: 2px solid var(--accent-vector); outline-offset: 2px; }
 summary { list-style: none; cursor: pointer; }
@@ -113,6 +116,51 @@ body[data-view="fpv"] .scene-vignette {
   color: #b7e8ce; background: #0e211b; box-shadow: 0 0 0 1px #5a9c7b6b; border-radius: 3px; font-size: var(--font-label);
 }
 .ar-landing-label[data-below]::before { content: "↓"; margin-inline-end: 5px; }
+.director-banner {
+  position: absolute;
+  z-index: 3;
+  inset: 14px calc(var(--edge) + var(--dispatch-width) + 14px) auto calc(var(--edge) + var(--telemetry-width) + 14px);
+  margin-inline: auto;
+  width: min(33rem, 100%);
+  padding: 7px 10px 7px 11px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  border-color: rgb(56 189 248 / .36);
+  opacity: 1;
+  translate: 0 0;
+  transition: display .22s, opacity .22s ease-out, translate .22s ease-out;
+  transition-behavior: allow-discrete;
+}
+@starting-style {
+  .director-banner {
+    opacity: 0;
+    translate: 0 -10px;
+  }
+}
+.director-banner:where([hidden], [data-closing]) {
+  opacity: 0;
+  translate: 0 -8px;
+}
+.director-step {
+  flex: none;
+  padding: 2px 6px;
+  border-radius: var(--radius-badge);
+  background: rgb(56 189 248 / .16);
+  border: 1px solid rgb(56 189 248 / .42);
+  color: var(--accent-vector);
+  font-size: var(--font-label);
+  font-weight: 700;
+}
+.director-copy { min-width: 0; flex: 1; }
+.director-copy strong { display: block; font-size: var(--font-small); font-weight: 700; color: var(--text-primary); }
+.director-copy p { font-size: var(--font-label); color: var(--text-secondary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#director-stop { flex: none; min-height: 28px; padding: 3px 9px; border-color: rgb(255 255 255 / .18); }
+body[data-view="fpv"] .director-banner {
+  inset: auto var(--edge) var(--dock-bottom) auto;
+  margin-inline: 0;
+  width: min(23.5rem, calc(100% - 2 * var(--edge)));
+}
 .aircraft-tag { position: absolute; top: 0; left: 0; z-index: 1; display: flex; align-items: center; gap: 7px; width: max-content; min-height: 26px; padding: 3px 8px; pointer-events: none; color: #e5edf6; background: #0d141d; border: 1px solid #3a566d; border-radius: 4px; box-shadow: 0 3px 12px #0009; font-size: var(--font-label); }
 .aircraft-tag .status-dot { color: var(--text-muted); }
 .aircraft-tag[data-tone="normal"] .status-dot { color: var(--accent-nominal); }
@@ -160,8 +208,9 @@ body[data-view="fpv"] .scene-vignette {
 .profile-grid { stroke: #2d3a4b; fill: none; stroke-width: .65; vector-effect: non-scaling-stroke; }
 .profile-corridor { fill: rgb(52 211 153 / .10); }
 .profile-building { fill: #2b3541; }
-.profile-baseline, .profile-plan, .profile-track, .profile-cursor, .profile-clearance-line { fill: none; vector-effect: non-scaling-stroke; }
+.profile-baseline, .profile-superseded, .profile-plan, .profile-track, .profile-cursor, .profile-clearance-line { fill: none; vector-effect: non-scaling-stroke; }
 .profile-baseline { stroke: #41b79877; stroke-dasharray: 2 3; }
+.profile-superseded { stroke: rgb(248 113 113 / .58); stroke-dasharray: 4 3; stroke-width: 1.1px; }
 .profile-plan { stroke: #7d8b9f; stroke-dasharray: 3 3; }
 .profile-track { stroke: var(--accent-vector); stroke-width: 1.5px; }
 .profile-cursor { stroke: #698197; stroke-dasharray: 2 3; }
@@ -218,7 +267,7 @@ body[data-view="fpv"] .scene-vignette {
 .user-guide-header h2 { font-size: 25px; font-weight: 700; line-height: 1.25; margin: 5px 0 6px; }
 .user-guide-header p:last-child { color: var(--text-secondary); }
 .user-guide-header .icon-button { width: 32px; height: 32px; font-size: 20px; }
-.user-guide-header h2:focus { outline: none; }
+.user-guide-header h2:focus, .candidate-form h3:focus, #clarification-heading:focus { outline: none; }
 .user-guide-header .icon-button:focus-visible { outline: 1px solid var(--text-secondary); }
 .user-guide-grid {
   display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px 22px;
@@ -332,6 +381,11 @@ body[data-view="fpv"] .scene-vignette {
 .trace-summary::-webkit-scrollbar, .trace-list::-webkit-scrollbar, #query::-webkit-scrollbar, .review-content::-webkit-scrollbar { width: 4px; }
 .trace-summary::-webkit-scrollbar-thumb, .trace-list::-webkit-scrollbar-thumb, #query::-webkit-scrollbar-thumb, .review-content::-webkit-scrollbar-thumb { background: #374151; border-radius: 3px; }
 .composer { display: grid; gap: 5px; }
+.composer-header { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.director-trigger { height: 26px; padding: 0 8px; gap: 5px; font-size: var(--font-label); font-weight: 640; color: #bae6fd; background: rgb(56 189 248 / .11); border-color: rgb(56 189 248 / .42); }
+.director-trigger:enabled:hover { background: rgb(56 189 248 / .20); }
+.director-trigger[data-running] { color: #fde68a; background: rgb(245 158 11 / .16); border-color: rgb(245 158 11 / .55); }
+.director-trigger .icon { width: 13px; height: 13px; }
 .dispatch:has(.trace-details:not([hidden])) .composer { display: none; }
 .presets { display: grid; grid-template-columns: repeat(3,minmax(0,1fr)); gap: 5px; }
 .presets button { min-width: 0; height: 32px; gap: 4px; padding: 0 4px; font-size: var(--font-small); }
@@ -428,15 +482,20 @@ body[data-replay] .flight-timeline { color: var(--text-secondary); }
 .candidate-form { padding: 11px 13px; border-bottom: 1px solid var(--border-hairline); }
 
 .dispatch:has(.candidate-form) .trace-body:has(.trace-details[hidden]) { display: none; }
-.dispatch:has(.candidate-form) .composer > :is(.micro, .presets) { display: none; }
+.dispatch:has(.candidate-form) .composer > :is(.composer-header, .presets) { display: none; }
 .candidate-form h3 { font-size: var(--font-title); font-weight: 720; }
 .candidate-form fieldset { min-inline-size: 0; margin: 4px 0 6px; border: 0; padding: 0; }
 .candidate-form legend { margin-bottom: 4px; color: var(--text-muted); font-size: var(--font-label); }
-.candidate-form label { display: flex; align-items: center; gap: 7px; min-height: 40px; padding: 5px 6px; border-top: 1px solid var(--border-hairline); cursor: pointer; }
+.candidate-form label { display: flex; align-items: center; gap: 7px; min-height: 42px; padding: 6px; border-top: 1px solid var(--border-hairline); cursor: pointer; }
 .candidate-form label:has(:checked) { background: var(--surface-control-active); }
 .candidate-form input { flex: none; margin: 0; accent-color: var(--accent-vector); appearance: auto; }
-.candidate-form label strong { display: block; color: var(--text-primary); font-size: var(--font-small); font-weight: 620; }
-.candidate-form label > span { min-width: 0; }
+.candidate-head { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 4px 6px; }
+.candidate-form label strong { color: var(--text-primary); font-size: var(--font-small); font-weight: 620; }
+.candidate-badges { display: inline-flex; flex-wrap: wrap; gap: 4px; }
+.candidate-badge { font-style: normal; font-size: .625rem; font-weight: 650; line-height: 1.3; padding: 1px 5px; border-radius: var(--radius-badge); border: 1px solid rgb(56 189 248 / .38); color: #7dd3fc; background: rgb(56 189 248 / .10); }
+.candidate-badge[data-kind="safe"] { border-color: rgb(52 211 153 / .42); color: #6ee7b7; background: rgb(52 211 153 / .10); }
+.candidate-badge[data-kind="eco"] { border-color: rgb(167 139 250 / .42); color: #c4b5fd; background: rgb(167 139 250 / .10); }
+.candidate-form label > span { min-width: 0; flex: 1; }
 .candidate-endpoints { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .candidate-itinerary { margin-top: 4px; color: var(--accent-route-end); font-size: var(--font-label); overflow-wrap: anywhere; }
 .candidate-form label small, .candidate-reason { color: var(--text-secondary); font-size: var(--font-label); font-variant-numeric: tabular-nums; }
@@ -456,6 +515,7 @@ body[data-replay] .flight-timeline { color: var(--text-secondary); }
 }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation: none !important; transition: none !important; }
+  .director-banner, .director-banner:where([hidden], [data-closing]) { translate: none; }
 }
 @media (min-width: 1021px) {
   .workspace {
@@ -509,6 +569,10 @@ body[data-replay] .flight-timeline { color: var(--text-secondary); }
   .flight-dock { width: min(calc(100% - 2 * var(--edge)), 560px); }
   .orientation-readout { font-size: .625rem; }
   .hud-overlay { inset-inline: 0; width: 100%; }
+  .director-banner { inset: 8px 10px auto; width: auto; max-width: calc(100% - 20px); }
+  body[data-view="fpv"] .director-banner { inset: auto 10px 62px auto; width: max-content; max-width: calc(100% - 20px); }
+  .workspace:has(#director-banner:not([hidden])) .orientation { display: none; }
+  .director-copy p { display: none; }
   body[data-view="fpv"] .scene-vignette { --scene-dock-gap: 10px; }
   .hud-header { top: 8px; }
   body[data-view="fpv"] .workspace { padding-top: calc(var(--map-height) + 68px); }

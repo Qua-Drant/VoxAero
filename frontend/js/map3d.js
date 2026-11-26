@@ -236,9 +236,16 @@ export class CampusMap {
     for (const node of [hud, hudHeader, hudReadouts, dock, dock.parentElement]) fpvLayout.observe(node);
     window.addEventListener("resize", measureFpv);
     this.viewer.scene.postRender.addEventListener(() => this.positionLabels());
+    const gateAlphas = [.92, .66, .44, .28];
+    const gateWidths = [2.3, 1.85, 1.5, 1.2];
+    this.guideRerouted = false;
     this.guideLines = Array.from({ length: 6 }, (_, index) => this.viewer.entities.add({
       show: false,
-      polyline: { width: index < 4 ? 1.5 : 2, material: color("#8ae3b6", index < 4 ? .58 : .86), arcType: Cesium.ArcType.NONE },
+      polyline: {
+        width: index < 4 ? gateWidths[index] : 2.1,
+        material: color(index < 4 ? "#5eead4" : "#8ae3b6", index < 4 ? gateAlphas[index] : .88),
+        arcType: Cesium.ArcType.NONE,
+      },
     }));
     this.tooltip = document.getElementById("map-tooltip");
     this.viewer.screenSpaceEventHandler.setInputAction(({ endPosition }) => {
@@ -545,16 +552,23 @@ export class CampusMap {
     this.viewer.scene.requestRender();
   }
 
-  resetView() {
+  resetView(animate = false) {
     this.viewer.camera.cancelFlight();
     this.clearPadFocus();
     const [west, south, east, north] = this.bounds;
     const target = degrees([(west + east) / 2, (south + north) / 2], this.terrain ? 35 : 20);
     const extent = Cesium.Cartesian3.distance(degrees([west, south]), degrees([east, north]));
-    const aspect = this.viewer.canvas.clientWidth / this.viewer.canvas.clientHeight;
+    const aspect = this.viewer.canvas.clientWidth / Math.max(1, this.viewer.canvas.clientHeight);
     const range = extent * Math.max(.78, .92 / Math.max(.55, aspect));
-    this.viewer.camera.lookAt(target, new Cesium.HeadingPitchRange(-0.30, -0.80, range));
-    this.viewer.camera.lookAtTransform(Cesium.Matrix4.IDENTITY);
+    if (animate && !matchMedia("(prefers-reduced-motion: reduce)").matches) {
+      this.viewer.camera.flyToBoundingSphere(new Cesium.BoundingSphere(target, 1), {
+        offset: new Cesium.HeadingPitchRange(-0.30, -0.80, range),
+        duration: .65,
+      });
+    } else {
+      this.viewer.camera.lookAt(target, new Cesium.HeadingPitchRange(-0.30, -0.80, range));
+      this.viewer.camera.lookAtTransform(Cesium.Matrix4.IDENTITY);
+    }
     this.viewer.scene.requestRender();
   }
 
@@ -601,12 +615,84 @@ export class CampusMap {
     this.viewer.scene.requestRender();
   }
 
-  drawRoute(waypoints, rerouted, preview = false, visits = []) {
+  drawRoute(waypoints, rerouted, preview = false, visits = [], comparison = null) {
     const entities = this.layers.get("route").entities;
     entities.removeAll();
+    const extraLabels = [];
+    if (comparison?.priorWaypoints?.length > 1) {
+      this.addRoute(entities, comparison.priorWaypoints, false, "#64748b", 3.2);
+    }
+    if (comparison?.flownSegments?.length) {
+      for (const { flown, rerouted: wasRerouted } of comparison.flownSegments) {
+        if (flown?.length > 1) this.addRoute(entities, flown, wasRerouted, null, 4);
+      }
+    }
+    if (comparison?.incidentPoint) {
+      const { lon, lat, alt } = comparison.incidentPoint;
+      const ground = this.elevation(lon, lat);
+      const position = degrees([lon, lat], alt);
+      entities.add({
+        polyline: {
+          positions: [degrees([lon, lat], ground + .5), position],
+          width: 1.5,
+          arcType: Cesium.ArcType.NONE,
+          material: new Cesium.PolylineDashMaterialProperty({ color: color("#fbbf24", .72), dashLength: 9 }),
+        },
+      });
+      const { label } = entities.add({
+        position,
+        properties: { hoverText: comparison.incidentDetail || comparison.incidentLabel || "空中改航点" },
+        point: {
+          pixelSize: 10, color: color("#fbbf24"), outlineColor: color("#291a04"), outlineWidth: 2.5,
+          disableDepthTestDistance: Number.POSITIVE_INFINITY,
+        },
+        label: {
+          text: comparison.incidentLabel || "改航点", font: `680 11px ${labelFont}`, fillColor: color("#fde68a"),
+          showBackground: true, backgroundColor: color("#241807", .94),
+          backgroundPadding: new Cesium.Cartesian2(6, 3), pixelOffset: new Cesium.Cartesian2(0, -16),
+          disableDepthTestDistance: Number.POSITIVE_INFINITY,
+        },
+      });
+      extraLabels.push({ position, label, width: 72, offsets: [[0, -16], [28, -28], [-30, -16], [28, 18]] });
+    }
     this.addRoute(entities, waypoints, rerouted, preview ? "#7dd3fc" : null);
     this.addRouteDepth(entities, waypoints, rerouted);
-    this.routeVisitLabels = this.addVisitMarkers(entities, waypoints, visits);
+    this.routeVisitLabels = [...extraLabels, ...this.addVisitMarkers(entities, waypoints, visits)];
+    this.viewer.scene.requestRender();
+  }
+
+  drawCandidateRoutes(options, selectedId) {
+    const entities = this.layers.get("route").entities;
+    entities.removeAll();
+    const extraLabels = [];
+    const selected = options.find(({ id }) => id === selectedId) ?? options[0];
+    options.forEach((option, index) => {
+      if (option.id === selected.id || option.waypoints.length < 2) return;
+      this.addRoute(entities, option.waypoints, false, index === 0 ? "#7dd3fc88" : "#818cf885", 2.8);
+      const cruise = option.waypoints.filter(({ phase }) => phase === "cruise");
+      const mid = cruise[Math.floor(cruise.length / 2)] ?? option.waypoints[Math.floor(option.waypoints.length / 2)];
+      if (mid) {
+        const position = degrees([mid.lon, mid.lat], mid.alt);
+        const { label } = entities.add({
+          position,
+          properties: { hoverText: option.route_label },
+          label: {
+            text: `方案 ${index + 1}`, font: `620 10.5px ${labelFont}`, fillColor: color("#cbd5e1", .88),
+            showBackground: true, backgroundColor: color("#0f172a", .86),
+            backgroundPadding: new Cesium.Cartesian2(5, 2), pixelOffset: new Cesium.Cartesian2(0, 16),
+            disableDepthTestDistance: Number.POSITIVE_INFINITY,
+          },
+        });
+        extraLabels.push({ position, label, width: 52, offsets: [[0, 16], [-26, 16], [26, -16], [0, -28]] });
+      }
+    });
+    if (selected) {
+      this.addRoute(entities, selected.waypoints, false, "#38bdf8");
+      this.addRouteDepth(entities, selected.waypoints, false);
+      this.routeVisitLabels = [...extraLabels, ...this.addVisitMarkers(entities, selected.waypoints, selected.route_visits)];
+    } else {
+      this.routeVisitLabels = extraLabels;
+    }
     this.viewer.scene.requestRender();
   }
 
@@ -645,7 +731,7 @@ export class CampusMap {
     });
   }
 
-  addRoute(entities, waypoints, rerouted, dashedTint = null) {
+  addRoute(entities, waypoints, rerouted, dashedTint = null, widthOverride = null) {
     const tints = { takeoff: "#38bdf8", cruise: "#42cbdc", landing: "#2dd4bf", transition: "#818cf8" };
     for (let i = 1; i < waypoints.length; i += 1) {
       const phase = waypoints[i].phase;
@@ -653,8 +739,8 @@ export class CampusMap {
       entities.add({
         polyline: {
           positions: waypoints.slice(i - 1, i + 1).map(({ lon, lat, alt }) => degrees([lon, lat], alt)),
-          width: dashedTint ? 4 : 5,
-          material: dashedTint ? new Cesium.PolylineDashMaterialProperty({ color: color(dashedTint) })
+          width: widthOverride ?? (dashedTint ? 4 : 5),
+          material: dashedTint ? new Cesium.PolylineDashMaterialProperty({ color: color(dashedTint), dashLength: 13 })
             : new Cesium.PolylineGlowMaterialProperty({ color: color(hex), glowPower: .2 }),
           arcType: Cesium.ArcType.NONE,
         },
@@ -762,24 +848,66 @@ export class CampusMap {
     const rings = feature.geometry.coordinates.map((ring) => ring.map(([lon, lat]) => this.project(lon, lat)));
     const x = rings[0].map((point) => point[0]);
     const y = rings[0].map((point) => point[1]);
-    return { rings, bounds: [Math.min(...x), Math.min(...y), Math.max(...x), Math.max(...y)], id: feature.properties.id, bottom, top };
+    const minX = Math.min(...x);
+    const minY = Math.min(...y);
+    const maxX = Math.max(...x);
+    const maxY = Math.max(...y);
+    return {
+      rings,
+      bounds: [minX, minY, maxX, maxY],
+      center: [(minX + maxX) / 2, (minY + maxY) / 2],
+      id: feature.properties.id,
+      name: feature.properties.name,
+      reason: feature.properties.reason,
+      bottom,
+      top,
+    };
   }
 
-  clearance({ lon, lat, alt }, avoidedZones) {
+  clearanceReport({ lon, lat, alt }, avoidedZones) {
     const [x, y] = this.project(lon, lat);
     let nearest = Infinity;
+    let dynamicThreat = null;
+    let staticThreat = null;
     for (const volume of [...this.staticVolumes, ...this.dynamicVolumes]) {
       const extended = avoidedZones.has(volume.id);
       const top = extended ? Math.max(volume.top, 100) : volume.top;
       const height = Math.max(0, (extended ? 0 : volume.bottom) - alt, alt - top);
-      if (height < nearest) nearest = Math.min(nearest, Math.hypot(height, footprintDistance(volume.rings, x, y)));
+      const isDynamic = Boolean(volume.reason && volume.reason !== "task_avoidance" && String(volume.id).startsWith("dynamic-"));
+      const dxBox = Math.max(volume.bounds[0] - x, 0, x - volume.bounds[2]);
+      const dyBox = Math.max(volume.bounds[1] - y, 0, y - volume.bounds[3]);
+      const boxLower = Math.hypot(height, dxBox, dyBox);
+      if (boxLower >= nearest && (!isDynamic || boxLower >= 95)) continue;
+      const distance = Math.hypot(height, footprintDistance(volume.rings, x, y));
+      if (distance < nearest) nearest = distance;
+      const bearingDeg = (Cesium.Math.toDegrees(Math.atan2(volume.center[0] - x, volume.center[1] - y)) + 360) % 360;
+      if (isDynamic && distance < (dynamicThreat?.distance ?? 95)) {
+        dynamicThreat = { distance, bearingDeg, name: volume.name || "临时禁飞区", isDynamic: true };
+      } else if (!isDynamic && distance < (staticThreat?.distance ?? 15)) {
+        staticThreat = { distance, bearingDeg, name: volume.name || "近距障碍", isDynamic: false };
+      }
     }
-    return Number.isFinite(nearest) ? nearest : null;
+    return {
+      clearance: Number.isFinite(nearest) ? nearest : null,
+      threat: dynamicThreat ?? staticThreat,
+    };
   }
 
-  showGuides(gates, target, targetId) {
+  clearance(coordinates, avoidedZones) {
+    return this.clearanceReport(coordinates, avoidedZones).clearance;
+  }
+
+  showGuides(gates, target, targetId, { rerouted = false, distanceM = null } = {}) {
     const lines = [...gates];
     this.guidePosition = null;
+    if (this.guideRerouted !== Boolean(rerouted)) {
+      this.guideRerouted = Boolean(rerouted);
+      const alphas = [.92, .66, .44, .28];
+      const gateHex = this.guideRerouted ? "#fbbf24" : "#5eead4";
+      for (let i = 0; i < 4; i += 1) {
+        this.guideLines[i].polyline.material = color(gateHex, alphas[i]);
+      }
+    }
     if (target) {
       const anchor = degrees([target.lon, target.lat], target.alt + .45);
       const localFrame = Cesium.Transforms.eastNorthUpToFixedFrame(anchor);
@@ -788,7 +916,8 @@ export class CampusMap {
       );
       lines.push([offset(-8, 0), offset(8, 0)], [offset(0, -8), offset(0, 8)]);
       this.guidePosition = offset(0, 0, 2);
-      const text = "降落靶标 · " + targetId;
+      const rangeText = Number.isFinite(distanceM) ? ` · ${Math.round(distanceM)} m` : "";
+      const text = `降落靶标 · ${targetId}${rangeText}`;
       if (this.landingLabel.textContent !== text) this.landingLabel.textContent = text;
     }
     this.guideLines.forEach((line, index) => {
