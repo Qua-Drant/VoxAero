@@ -36,7 +36,7 @@
    - 支持通过环境变量 `LLM_API_KEY`、`LLM_BASE_URL`、`LLM_MODEL` 调用真实大模型执行 Function Calling。
    - **必须内置 Deterministic Fallback（确定性规则兜底引擎）**：当未配置 `LLM_API_KEY` 或网络请求超时失败时，自动降级到本地关键词+正则意图解析器，完整输出与真实 Agent 相同格式的推理步骤（`thought_steps`）和工具调用结果，确保演示永不崩溃。
 4. **Git 版本管理规范**：
-   - 使用本地 Git 管理代码（当前主开发分支 `codex/tactical-obsidian`），遵循 Conventional Commits 风格（如 `feat:`、`fix:`、`docs:`、`chore:`）。
+   - 使用本地 Git 管理代码（默认主分支 `main`），遵循 Conventional Commits 风格（如 `feat:`、`fix:`、`docs:`、`chore:`）。
    - 每轮修改完成并验证通过后，自动在当前分支执行本地 `git commit`，附上清晰的改动说明，方便查看和回滚。
    - **严禁**提交 `.env`、个人 API Key、缓存文件（`__pycache__/`、`.pytest_cache/`）或未授权执行 `git push`、`git reset --hard`。
 
@@ -63,10 +63,14 @@
 
     VoxAero/
     ├── AGENTS.md                     # 本开发规范文档
-    ├── README.md                     # VoxAero 启动说明、环境变量配置与数据替换指南
-    ├── Test.md                       # 自动化回归与浏览器交互验收清单
+    ├── LICENSE                       # MIT 开源许可证
+    ├── README.md                     # 中文项目首页、系统架构图、快速开始与数据替换指南
+    ├── README_EN.md                  # 英文项目首页（与 README.md 互链）
     ├── requirements.txt              # Python 依赖清单
     ├── .env.example                  # LLM_API_KEY / LLM_BASE_URL / LLM_MODEL 示例
+    ├── docs/                         # 文档与演示素材目录
+    │   ├── TEST_PLAN.md              # 自动化回归、性能基准与浏览器交互验收清单
+    │   └── media/                    # 项目标志、界面截图与仿真动图
     ├── data/                         # 武大信息学部实景空间数据目录（支持独立目录替换）
     │   ├── README.md                 # 数据来源、高程基准与外部空域快照规范
     │   ├── whu_buildings.geojson     # OSM 建筑轮廓与高度/包络属性

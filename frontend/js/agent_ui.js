@@ -140,10 +140,14 @@ export class AgentUI {
       button.addEventListener("click", () => {
         this.clear.click();
         this.setInput(PRESETS[button.dataset.welcomeExample]);
-        this.guide.hidden = true;
+        this.showGuide(false);
         this.input.focus();
       });
     }
+  }
+
+  showGuide(visible = true) {
+    this.guide.hidden = !visible;
   }
 
   setInput(value) {
@@ -151,7 +155,7 @@ export class AgentUI {
   }
 
   beginExchange() {
-    this.guide.hidden = true;
+    this.showGuide(false);
     const element = this.exchangeTemplate.content.cloneNode(true).firstElementChild;
     const part = (name) => element.querySelector(`[data-exchange="${name}"]`);
     const exchange = { element, part, body: null, ok: false };
@@ -346,6 +350,10 @@ export class AgentUI {
 
   setMode(mode) {
     this.mode.textContent = { live_llm: "模型模式", fallback_mock: "本地规则" }[mode] ?? "服务离线";
+    this.mode.title = {
+      live_llm: "已接入 OpenAI 兼容模型执行函数调用，异常或校验失败时自动降级本地规则。",
+      fallback_mock: "免 API Key 本地确定性规则已就绪，支持完整多轮消歧、3D A* 避障与应急重规划；配置 .env 可启用大模型语义模式。",
+    }[mode] ?? "未能连接本机服务，请确认后端已启动。";
     this.mode.dataset.tone = mode ? "normal" : "error";
   }
 

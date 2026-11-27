@@ -123,13 +123,27 @@ def evaluate(settings):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--output", type=Path, required=True, help="Path for the JSON report")
+    parser.add_argument("--output", type=Path, help="Optional path for the JSON report")
+    parser.add_argument(
+        "--local-only",
+        action="store_true",
+        help="Evaluate only the deterministic local rule engine without calling an external LLM",
+    )
     args = parser.parse_args()
+    local = evaluate(LLMSettings())
+    if args.local_only:
+        if args.output:
+            args.output.write_text(json.dumps({"local": local}, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        print(f"Local {local['passed']}/{len(CASES)} (deterministic fallback_mock)")
+        return
+
     settings = LLMSettings.from_environment()
     if settings.mode != "live_llm":
-        parser.error("Configure the live model via the project's LLM environment settings first")
+        parser.error(
+            "Configure the live model via the project's LLM environment settings first, "
+            "or pass --local-only to evaluate deterministic local rules without an API key"
+        )
 
-    local = evaluate(LLMSettings())
     live = evaluate(settings)
     comparison = {"live_only": [], "local_only": [], "both_pass": [], "both_fail": []}
     for a, b in zip(local["cases"], live["cases"], strict=True):
@@ -137,8 +151,9 @@ def main():
         key = {(False, True): "live_only", (True, False): "local_only",
                (True, True): "both_pass", (False, False): "both_fail"}[pair]
         comparison[key].append(a["name"])
-    args.output.write_text(json.dumps({"local": local, "live": live, "comparison": comparison},
-                                      ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    if args.output:
+        args.output.write_text(json.dumps({"local": local, "live": live, "comparison": comparison},
+                                          ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     print(f"Local {local['passed']}/{len(CASES)}, {settings.model} {live['passed']}/{len(CASES)}, "
           f"model cases {live['with_model_call']}, fallback {live['with_fallback']}, "
           f"mean model case {live['mean_model_case_ms']} ms")
